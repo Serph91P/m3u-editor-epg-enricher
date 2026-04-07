@@ -2,7 +2,9 @@
 
 namespace AppLocalPlugins\EpgEnricher;
 
+use App\Models\Channel;
 use App\Models\Epg;
+use App\Models\EpgChannel;
 use App\Plugins\Contracts\EpgProcessorPluginInterface;
 use App\Plugins\Contracts\HookablePluginInterface;
 use App\Plugins\Support\PluginActionResult;
@@ -42,14 +44,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         $epgId = $payload['epg_id'] ?? null;
         $userId = $payload['user_id'] ?? null;
+        $playlistIds = $payload['playlist_ids'] ?? [];
 
         if (! $epgId || ! $userId) {
             return PluginActionResult::failure('Missing epg_id or user_id in hook payload.');
         }
 
-        $context->info("EPG cache generated (ID: {$epgId}). Running enrichment.");
+        $context->info("EPG cache generated (ID: {$epgId}). Running enrichment for playlist channels.");
 
-        return $this->doEnrich($epgId, $context);
+        return $this->doEnrich($epgId, $playlistIds, $context);
     }
 
     /**
@@ -68,15 +71,34 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return PluginActionResult::failure("EPG [{$epgId}] not found.");
         }
 
-        $context->info("Starting manual EPG enrichment for '{$epg->name}'.");
+        // Optional playlist filter - if set, only enrich channels from that playlist
+        $selectedPlaylistId = $payload['playlist_id'] ?? null;
 
-        return $this->doEnrich($epgId, $context);
+        if ($selectedPlaylistId) {
+            $playlistIds = [(int) $selectedPlaylistId];
+            $context->info("Starting manual EPG enrichment for '{$epg->name}' (filtered to playlist #{$selectedPlaylistId}, {$this->countTargetChannels($epgId, $playlistIds)} channels).");
+        } else {
+            // Resolve all playlist IDs that reference EpgChannels belonging to this EPG
+            $playlistIds = Channel::query()
+                ->whereNotNull('epg_channel_id')
+                ->whereHas('epgChannel', fn ($q) => $q->where('epg_id', $epgId))
+                ->distinct()
+                ->pluck('playlist_id')
+                ->all();
+
+            $context->info("Starting manual EPG enrichment for '{$epg->name}' (all playlists, {$this->countTargetChannels($epgId, $playlistIds)} channels).");
+        }
+
+        return $this->doEnrich($epgId, $playlistIds, $context);
     }
 
     /**
-     * Core enrichment logic. Reads cached JSONL, enriches with TMDB, fills gaps, writes back.
+     * Core enrichment logic. Reads cached JSONL, enriches with TMDB, writes back.
+     * Only processes channels that are mapped in the given playlists.
+     *
+     * @param  array<int>  $playlistIds  Playlist IDs to scope enrichment to
      */
-    private function doEnrich(int $epgId, PluginExecutionContext $context): PluginActionResult
+    private function doEnrich(int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
     {
         $epg = Epg::find($epgId);
         if (! $epg) {
@@ -88,11 +110,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return PluginActionResult::failure("EPG cache for '{$epg->name}' is not valid. Sync the EPG first.");
         }
 
+        // Resolve which EPG channel IDs (strings) are actually used in playlists
+        $targetChannelIds = $this->resolveTargetChannelIds($epgId, $playlistIds);
+
+        if (empty($targetChannelIds)) {
+            return PluginActionResult::success('No playlist channels are mapped to this EPG - nothing to enrich.');
+        }
+
         $settings = $context->settings;
         $enrichTmdb = $settings['enrich_from_tmdb'] ?? true;
-        $fillGaps = $settings['fill_gaps'] ?? false;
-        $minGapMinutes = max(1, (int) ($settings['min_gap_minutes'] ?? 30));
-        $gapTitle = $settings['gap_placeholder_title'] ?? 'No programme data';
         $overwrite = $settings['overwrite_existing'] ?? false;
         $enrichCategories = $settings['enrich_categories'] ?? true;
         $enrichDescriptions = $settings['enrich_descriptions'] ?? true;
@@ -108,8 +134,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
-        if (! $enrichTmdb && ! $fillGaps) {
-            return PluginActionResult::success('Both TMDB enrichment and gap filling are disabled - nothing to do.');
+        if (! $enrichTmdb) {
+            return PluginActionResult::success('TMDB enrichment is disabled - nothing to do.');
         }
 
         // Load TMDB lookup cache from disk
@@ -135,11 +161,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         $stats = [
             'programmes_enriched' => 0,
+            'programmes_skipped' => 0,
             'posters_added' => 0,
             'categories_added' => 0,
             'descriptions_added' => 0,
-            'gaps_filled' => 0,
             'days_processed' => 0,
+            'channels_targeted' => count($targetChannelIds),
             'tmdb_lookups' => 0,
             'tmdb_cache_hits' => 0,
         ];
@@ -163,12 +190,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             if (Storage::disk('local')->exists($jsonlFile)) {
                 $result = $this->processDateFile(
                     $jsonlFile,
+                    $targetChannelIds,
                     $tmdb,
                     $tmdbCache,
-                    $enrichTmdb,
-                    $fillGaps,
-                    $minGapMinutes,
-                    $gapTitle,
                     $overwrite,
                     $enrichCategories,
                     $enrichDescriptions,
@@ -176,10 +200,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 );
 
                 $stats['programmes_enriched'] += $result['enriched'];
+                $stats['programmes_skipped'] += $result['skipped'];
                 $stats['posters_added'] += $result['posters'];
                 $stats['categories_added'] += $result['categories'];
                 $stats['descriptions_added'] += $result['descriptions'];
-                $stats['gaps_filled'] += $result['gaps'];
                 $stats['tmdb_lookups'] += $result['lookups'];
                 $stats['tmdb_cache_hits'] += $result['cache_hits'];
             }
@@ -192,8 +216,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $this->saveTmdbCache($tmdbCache);
 
         $summary = "Enrichment complete for '{$epg->name}': "
-            ."{$stats['programmes_enriched']} programmes enriched, "
-            ."{$stats['gaps_filled']} gaps filled.";
+            ."{$stats['programmes_enriched']} programmes enriched "
+            ."across {$stats['channels_targeted']} playlist channels.";
 
         $context->info($summary, $stats);
 
@@ -201,18 +225,64 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
-     * Process a single date's JSONL file: enrich programmes and fill gaps.
+     * Resolve EPG channel_id strings that are mapped in the given playlists.
      *
-     * @return array{enriched: int, posters: int, categories: int, descriptions: int, gaps: int, lookups: int, cache_hits: int}
+     * @param  array<int>  $playlistIds
+     * @return array<string> EPG channel_id strings used in JSONL files
+     */
+    private function resolveTargetChannelIds(int $epgId, array $playlistIds): array
+    {
+        if (empty($playlistIds)) {
+            return [];
+        }
+
+        // Get EpgChannel IDs referenced by channels in these playlists
+        $epgChannelDbIds = Channel::query()
+            ->whereIn('playlist_id', $playlistIds)
+            ->whereNotNull('epg_channel_id')
+            ->distinct()
+            ->pluck('epg_channel_id');
+
+        // Map to the string channel_id used in JSONL, filtered to this EPG
+        return EpgChannel::query()
+            ->where('epg_id', $epgId)
+            ->whereIn('id', $epgChannelDbIds)
+            ->pluck('channel_id')
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    /**
+     * Count how many playlist channels target this EPG.
+     *
+     * @param  array<int>  $playlistIds
+     */
+    private function countTargetChannels(int $epgId, array $playlistIds): int
+    {
+        if (empty($playlistIds)) {
+            return 0;
+        }
+
+        return Channel::query()
+            ->whereIn('playlist_id', $playlistIds)
+            ->whereNotNull('epg_channel_id')
+            ->whereHas('epgChannel', fn ($q) => $q->where('epg_id', $epgId))
+            ->count();
+    }
+
+    /**
+     * Process a single date's JSONL file: enrich only targeted playlist channels.
+     *
+     * @param  array<string>  $targetChannelIds  EPG channel_id strings to enrich
+     * @return array{enriched: int, skipped: int, posters: int, categories: int, descriptions: int, lookups: int, cache_hits: int}
      */
     private function processDateFile(
         string $jsonlFile,
-        ?TmdbService $tmdb,
+        array $targetChannelIds,
+        TmdbService $tmdb,
         array &$tmdbCache,
-        bool $enrichTmdb,
-        bool $fillGaps,
-        int $minGapMinutes,
-        string $gapTitle,
         bool $overwrite,
         bool $enrichCategories,
         bool $enrichDescriptions,
@@ -220,18 +290,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     ): array {
         $result = [
             'enriched' => 0,
+            'skipped' => 0,
             'posters' => 0,
             'categories' => 0,
             'descriptions' => 0,
-            'gaps' => 0,
             'lookups' => 0,
             'cache_hits' => 0,
         ];
 
         $fullPath = Storage::disk('local')->path($jsonlFile);
+        $targetSet = array_flip($targetChannelIds);
 
-        // Read all records grouped by channel
-        $channelProgrammes = [];
+        // Read all records, enrich only targeted channels
+        $enrichedLines = [];
         if (($handle = fopen($fullPath, 'r')) !== false) {
             while (($line = fgets($handle)) !== false) {
                 $line = trim($line);
@@ -241,67 +312,53 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
                 $record = json_decode($line, true);
                 if (! $record || ! isset($record['channel'], $record['programme'])) {
+                    $enrichedLines[] = $line;
+
                     continue;
                 }
 
-                $channelProgrammes[$record['channel']][] = $record['programme'];
-            }
-            fclose($handle);
-        }
+                // Only enrich channels that are mapped in playlists
+                if (! isset($targetSet[$record['channel']])) {
+                    $enrichedLines[] = $line;
+                    $result['skipped']++;
 
-        if (empty($channelProgrammes)) {
-            return $result;
-        }
-
-        $enrichedRecords = [];
-
-        foreach ($channelProgrammes as $channelId => $programmes) {
-            // Sort by start time
-            usort($programmes, fn ($a, $b) => strcmp($a['start'] ?? '', $b['start'] ?? ''));
-
-            // Enrich each programme with TMDB data
-            if ($enrichTmdb && $tmdb) {
-                foreach ($programmes as &$programme) {
-                    $enrichResult = $this->enrichProgrammeFromTmdb(
-                        $programme,
-                        $tmdb,
-                        $tmdbCache,
-                        $overwrite,
-                        $enrichCategories,
-                        $enrichDescriptions,
-                    );
-
-                    $result['enriched'] += $enrichResult['changed'] ? 1 : 0;
-                    $result['posters'] += $enrichResult['poster'] ? 1 : 0;
-                    $result['categories'] += $enrichResult['category'] ? 1 : 0;
-                    $result['descriptions'] += $enrichResult['description'] ? 1 : 0;
-                    $result['lookups'] += $enrichResult['lookup'] ? 1 : 0;
-                    $result['cache_hits'] += $enrichResult['cache_hit'] ? 1 : 0;
-
-                    if ($context->cancellationRequested()) {
-                        break 2;
-                    }
+                    continue;
                 }
-                unset($programme);
-            }
 
-            // Fill gaps between programmes
-            if ($fillGaps) {
-                $programmes = $this->fillGapsForChannel($programmes, $minGapMinutes, $gapTitle, $result);
-            }
+                $programme = $record['programme'];
 
-            foreach ($programmes as $programme) {
-                $enrichedRecords[] = json_encode([
-                    'channel' => $channelId,
+                $enrichResult = $this->enrichProgrammeFromTmdb(
+                    $programme,
+                    $tmdb,
+                    $tmdbCache,
+                    $overwrite,
+                    $enrichCategories,
+                    $enrichDescriptions,
+                );
+
+                $result['enriched'] += $enrichResult['changed'] ? 1 : 0;
+                $result['posters'] += $enrichResult['poster'] ? 1 : 0;
+                $result['categories'] += $enrichResult['category'] ? 1 : 0;
+                $result['descriptions'] += $enrichResult['description'] ? 1 : 0;
+                $result['lookups'] += $enrichResult['lookup'] ? 1 : 0;
+                $result['cache_hits'] += $enrichResult['cache_hit'] ? 1 : 0;
+
+                $enrichedLines[] = json_encode([
+                    'channel' => $record['channel'],
                     'programme' => $programme,
                 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+                if ($context->cancellationRequested()) {
+                    break;
+                }
             }
+            fclose($handle);
         }
 
         // Write the enriched file back (atomic: write to temp, then rename)
         $tempPath = $fullPath.'.enriching';
         if (($handle = fopen($tempPath, 'w')) !== false) {
-            foreach ($enrichedRecords as $line) {
+            foreach ($enrichedLines as $line) {
                 fwrite($handle, $line."\n");
             }
             fclose($handle);
@@ -313,6 +370,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
     /**
      * Enrich a single programme with TMDB data.
+     * Skips programmes that already have artwork/descriptions (e.g. from Schedules Direct / Gracenote).
      *
      * @return array{changed: bool, poster: bool, category: bool, description: bool, lookup: bool, cache_hit: bool}
      */
@@ -339,6 +397,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         // Check if programme already has all data we'd enrich
+        // (e.g. from Schedules Direct / Gracenote during EPG cache generation)
         $hasIcon = ! empty($programme['icon']);
         $hasCategory = ! empty($programme['category']);
         $hasDesc = ! empty($programme['desc']);
@@ -445,65 +504,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return $result;
-    }
-
-    /**
-     * Fill gaps between sorted programmes for one channel.
-     *
-     * @param  array<int, array>  $programmes  Sorted by start time
-     * @param  array  $result  Stats counter (passed by reference)
-     * @return array<int, array> Programmes with gaps inserted
-     */
-    private function fillGapsForChannel(array $programmes, int $minGapMinutes, string $gapTitle, array &$result): array
-    {
-        if (count($programmes) < 2) {
-            return $programmes;
-        }
-
-        $filled = [];
-
-        for ($i = 0; $i < count($programmes); $i++) {
-            $filled[] = $programmes[$i];
-
-            // Check gap to next programme
-            if ($i < count($programmes) - 1) {
-                $currentStop = $programmes[$i]['stop'] ?? null;
-                $nextStart = $programmes[$i + 1]['start'] ?? null;
-
-                if (! $currentStop || ! $nextStart) {
-                    continue;
-                }
-
-                try {
-                    $stopTime = Carbon::parse($currentStop);
-                    $startTime = Carbon::parse($nextStart);
-                    $gapMinutes = $stopTime->diffInMinutes($startTime, false);
-
-                    if ($gapMinutes >= $minGapMinutes) {
-                        $filled[] = [
-                            'channel' => $programmes[$i]['channel'] ?? '',
-                            'start' => $stopTime->toISOString(),
-                            'stop' => $startTime->toISOString(),
-                            'title' => $gapTitle,
-                            'subtitle' => '',
-                            'desc' => '',
-                            'category' => '',
-                            'episode_num' => '',
-                            'rating' => '',
-                            'icon' => '',
-                            'images' => [],
-                            'new' => false,
-                        ];
-                        $result['gaps']++;
-                    }
-                } catch (\Exception $e) {
-                    // Skip malformed timestamps
-                    continue;
-                }
-            }
-        }
-
-        return $filled;
     }
 
     /**

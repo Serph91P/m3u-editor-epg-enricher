@@ -1,9 +1,9 @@
 {
     "id": "epg-enricher",
     "name": "EPG Enricher",
-    "version": "1.0.2",
+    "version": "1.1.0",
     "api_version": "1.0.0",
-    "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Detects gaps in programme schedules and fills them with placeholder entries.",
+    "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Only processes channels that are mapped in your playlists, complementing existing Schedules Direct / Gracenote metadata where data is missing.",
     "entrypoint": "Plugin.php",
     "class": "AppLocalPlugins\\EpgEnricher\\Plugin",
     "capabilities": [
@@ -29,32 +29,11 @@
             "helper_text": "Fetch posters, backdrops, genres and descriptions from TMDB for programmes that are missing artwork."
         },
         {
-            "id": "fill_gaps",
-            "type": "boolean",
-            "label": "Fill EPG gaps with placeholders",
-            "default": false,
-            "helper_text": "Insert placeholder programme entries into gaps longer than the configured minimum duration."
-        },
-        {
-            "id": "min_gap_minutes",
-            "type": "number",
-            "label": "Minimum gap duration (minutes)",
-            "default": 30,
-            "helper_text": "Gaps shorter than this are ignored. Only applies when gap filling is enabled."
-        },
-        {
-            "id": "gap_placeholder_title",
-            "type": "text",
-            "label": "Gap placeholder title",
-            "default": "No programme data",
-            "helper_text": "Title shown for placeholder entries inserted into gaps."
-        },
-        {
             "id": "overwrite_existing",
             "type": "boolean",
-            "label": "Overwrite existing artwork",
+            "label": "Overwrite existing metadata",
             "default": false,
-            "helper_text": "Replace existing poster/backdrop URLs even if the programme already has artwork."
+            "helper_text": "Replace existing artwork and descriptions even if the programme already has data (e.g. from Schedules Direct)."
         },
         {
             "id": "enrich_categories",
@@ -92,6 +71,14 @@
                     "model": "App\\Models\\Epg",
                     "scope": "owned",
                     "required": true
+                },
+                {
+                    "id": "playlist_id",
+                    "type": "model_select",
+                    "label": "Playlist (optional - leave empty for all)",
+                    "model": "App\\Models\\Playlist",
+                    "scope": "owned",
+                    "required": false
                 }
             ]
         },
