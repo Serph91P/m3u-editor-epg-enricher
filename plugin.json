@@ -1,7 +1,7 @@
 {
     "id": "epg-enricher",
     "name": "EPG Enricher",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "api_version": "1.0.0",
     "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Detects gaps in programme schedules and fills them with placeholder entries.",
     "entrypoint": "Plugin.php",
@@ -17,7 +17,8 @@
         "filesystem_read",
         "filesystem_write",
         "network_egress",
-        "hook_subscriptions"
+        "hook_subscriptions",
+        "queue_jobs"
     ],
     "cleanup": "preserve",
     "settings": [
