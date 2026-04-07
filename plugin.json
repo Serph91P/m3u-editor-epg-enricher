@@ -1,7 +1,7 @@
 {
     "id": "epg-enricher",
     "name": "EPG Enricher",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "api_version": "1.0.0",
     "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Detects gaps in programme schedules and fills them with placeholder entries.",
     "entrypoint": "Plugin.php",
@@ -20,59 +20,58 @@
         "hook_subscriptions",
         "queue_jobs"
     ],
-    "cleanup": "preserve",
     "settings": [
         {
-            "key": "enrich_from_tmdb",
+            "id": "enrich_from_tmdb",
             "type": "boolean",
             "label": "Enrich programmes with TMDB data",
             "default": true,
             "helper_text": "Fetch posters, backdrops, genres and descriptions from TMDB for programmes that are missing artwork."
         },
         {
-            "key": "fill_gaps",
+            "id": "fill_gaps",
             "type": "boolean",
             "label": "Fill EPG gaps with placeholders",
             "default": false,
             "helper_text": "Insert placeholder programme entries into gaps longer than the configured minimum duration."
         },
         {
-            "key": "min_gap_minutes",
+            "id": "min_gap_minutes",
             "type": "number",
             "label": "Minimum gap duration (minutes)",
             "default": 30,
             "helper_text": "Gaps shorter than this are ignored. Only applies when gap filling is enabled."
         },
         {
-            "key": "gap_placeholder_title",
+            "id": "gap_placeholder_title",
             "type": "text",
             "label": "Gap placeholder title",
             "default": "No programme data",
             "helper_text": "Title shown for placeholder entries inserted into gaps."
         },
         {
-            "key": "overwrite_existing",
+            "id": "overwrite_existing",
             "type": "boolean",
             "label": "Overwrite existing artwork",
             "default": false,
             "helper_text": "Replace existing poster/backdrop URLs even if the programme already has artwork."
         },
         {
-            "key": "enrich_categories",
+            "id": "enrich_categories",
             "type": "boolean",
             "label": "Enrich missing categories/genres",
             "default": true,
             "helper_text": "Fill in missing genre/category from TMDB when the programme has none."
         },
         {
-            "key": "enrich_descriptions",
+            "id": "enrich_descriptions",
             "type": "boolean",
             "label": "Enrich missing descriptions",
             "default": true,
             "helper_text": "Fill in missing programme descriptions from TMDB."
         },
         {
-            "key": "auto_run_on_cache",
+            "id": "auto_run_on_cache",
             "type": "boolean",
             "label": "Auto-run after EPG cache generation",
             "default": true,
@@ -87,7 +86,7 @@
             "requires_confirmation": true,
             "fields": [
                 {
-                    "key": "epg_id",
+                    "id": "epg_id",
                     "type": "model_select",
                     "label": "EPG Source",
                     "model": "App\\Models\\Epg",
@@ -105,9 +104,11 @@
         }
     ],
     "data_ownership": {
-        "storage_roots": [
+        "directories": [
             "plugin-data/epg-enricher"
         ],
-        "tables": []
+        "tables": [],
+        "files": [],
+        "default_cleanup_policy": "preserve"
     }
 }
