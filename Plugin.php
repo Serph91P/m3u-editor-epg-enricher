@@ -5,6 +5,7 @@ namespace AppLocalPlugins\EpgEnricher;
 use App\Models\Channel;
 use App\Models\Epg;
 use App\Models\EpgChannel;
+use App\Models\Playlist;
 use App\Plugins\Contracts\EpgProcessorPluginInterface;
 use App\Plugins\Contracts\HookablePluginInterface;
 use App\Plugins\Support\PluginActionResult;
@@ -60,36 +61,66 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      */
     private function enrichEpg(array $payload, PluginExecutionContext $context): PluginActionResult
     {
-        $epgId = $payload['epg_id'] ?? null;
+        $playlistId = $payload['playlist_id'] ?? null;
 
-        if (! $epgId) {
-            return PluginActionResult::failure('EPG source is required.');
+        if (! $playlistId) {
+            return PluginActionResult::failure('Playlist is required.');
         }
 
-        $epg = Epg::find($epgId);
-        if (! $epg) {
-            return PluginActionResult::failure("EPG [{$epgId}] not found.");
+        $playlist = Playlist::find($playlistId);
+        if (! $playlist) {
+            return PluginActionResult::failure("Playlist [{$playlistId}] not found.");
         }
 
-        // Optional playlist filter - if set, only enrich channels from that playlist
-        $selectedPlaylistId = $payload['playlist_id'] ?? null;
+        // Resolve distinct EPG IDs from the playlist's enabled channels
+        $epgIds = Channel::query()
+            ->where('playlist_id', $playlist->id)
+            ->where('enabled', true)
+            ->whereNotNull('epg_channel_id')
+            ->whereHas('epgChannel')
+            ->join('epg_channels', 'channels.epg_channel_id', '=', 'epg_channels.id')
+            ->distinct()
+            ->pluck('epg_channels.epg_id')
+            ->all();
 
-        if ($selectedPlaylistId) {
-            $playlistIds = [(int) $selectedPlaylistId];
-            $context->info("Starting manual EPG enrichment for '{$epg->name}' (filtered to playlist #{$selectedPlaylistId}, {$this->countTargetChannels($epgId, $playlistIds)} channels).");
-        } else {
-            // Resolve all playlist IDs that reference EpgChannels belonging to this EPG
-            $playlistIds = Channel::query()
-                ->whereNotNull('epg_channel_id')
-                ->whereHas('epgChannel', fn ($q) => $q->where('epg_id', $epgId))
-                ->distinct()
-                ->pluck('playlist_id')
-                ->all();
-
-            $context->info("Starting manual EPG enrichment for '{$epg->name}' (all playlists, {$this->countTargetChannels($epgId, $playlistIds)} channels).");
+        if (empty($epgIds)) {
+            return PluginActionResult::success("No active channels with EPG mappings in '{$playlist->name}' - nothing to enrich.");
         }
 
-        return $this->doEnrich($epgId, $playlistIds, $context);
+        $playlistIds = [$playlist->id];
+        $totalChannels = $this->countTargetChannels($epgIds, $playlistIds);
+        $context->info("Starting EPG enrichment for playlist '{$playlist->name}' ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
+
+        // Enrich each EPG source referenced by this playlist
+        $combinedStats = [];
+        $lastResult = null;
+
+        foreach ($epgIds as $epgId) {
+            $lastResult = $this->doEnrich($epgId, $playlistIds, $context);
+
+            if (! $lastResult->success) {
+                return $lastResult;
+            }
+
+            // If doEnrich returned early (e.g. TMDB disabled), propagate directly
+            if (empty($lastResult->data)) {
+                return $lastResult;
+            }
+
+            foreach ($lastResult->data as $key => $value) {
+                if (is_int($value)) {
+                    $combinedStats[$key] = ($combinedStats[$key] ?? 0) + $value;
+                } else {
+                    $combinedStats[$key] = $value;
+                }
+            }
+        }
+
+        $summary = "Enrichment complete for playlist '{$playlist->name}': "
+            .($combinedStats['programmes_enriched'] ?? 0).' programmes enriched '
+            ."across {$totalChannels} active channels.";
+
+        return PluginActionResult::success($summary, $combinedStats);
     }
 
     /**
@@ -236,9 +267,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return [];
         }
 
-        // Get EpgChannel IDs referenced by channels in these playlists
+        // Get EpgChannel IDs referenced by enabled channels in these playlists
         $epgChannelDbIds = Channel::query()
             ->whereIn('playlist_id', $playlistIds)
+            ->where('enabled', true)
             ->whereNotNull('epg_channel_id')
             ->distinct()
             ->pluck('epg_channel_id');
@@ -255,20 +287,24 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
-     * Count how many playlist channels target this EPG.
+     * Count how many enabled playlist channels target the given EPG(s).
      *
+     * @param  array<int>|int  $epgIds
      * @param  array<int>  $playlistIds
      */
-    private function countTargetChannels(int $epgId, array $playlistIds): int
+    private function countTargetChannels(array|int $epgIds, array $playlistIds): int
     {
         if (empty($playlistIds)) {
             return 0;
         }
 
+        $epgIds = (array) $epgIds;
+
         return Channel::query()
             ->whereIn('playlist_id', $playlistIds)
+            ->where('enabled', true)
             ->whereNotNull('epg_channel_id')
-            ->whereHas('epgChannel', fn ($q) => $q->where('epg_id', $epgId))
+            ->whereHas('epgChannel', fn ($q) => $q->whereIn('epg_id', $epgIds))
             ->count();
     }
 
