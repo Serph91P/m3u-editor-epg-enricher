@@ -414,19 +414,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $result['cache_hit'] = true;
             $tmdbData = $cache[$cacheKey];
         } else {
-            // Try movie search first, then TV
+            // Search TV series first (EPG data is primarily TV content), then fall back to movies
             $result['lookup'] = true;
 
-            $tmdbData = $tmdb->searchMovie($title, tryFallback: true);
+            $tmdbData = $tmdb->searchTvSeries($title);
             if ($tmdbData && ($tmdbData['tmdb_id'] ?? null)) {
-                $details = $tmdb->getMovieDetails($tmdbData['tmdb_id']);
+                $details = $tmdb->getTvSeriesDetails($tmdbData['tmdb_id']);
                 if ($details) {
                     $tmdbData = array_merge($tmdbData, $details);
                 }
             } else {
-                $tmdbData = $tmdb->searchTvSeries($title);
+                $tmdbData = $tmdb->searchMovie($title, tryFallback: true);
                 if ($tmdbData && ($tmdbData['tmdb_id'] ?? null)) {
-                    $details = $tmdb->getTvSeriesDetails($tmdbData['tmdb_id']);
+                    $details = $tmdb->getMovieDetails($tmdbData['tmdb_id']);
                     if ($details) {
                         $tmdbData = array_merge($tmdbData, $details);
                     }
