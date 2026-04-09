@@ -25,6 +25,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         return match ($action) {
             'enrich_epg' => $this->enrichEpg($payload, $context),
             'health_check' => $this->healthCheck($context),
+            'clear_state' => $this->clearEnrichmentState($context),
             default => PluginActionResult::failure("Unsupported action [{$action}]."),
         };
     }
@@ -184,6 +185,26 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return PluginActionResult::failure('EPG cache has no programme date range.');
         }
 
+        // Load enrichment state and check for invalidation
+        $enrichmentState = $this->loadEnrichmentState();
+        $stateKey = "epg_{$epgId}";
+        $settingsHash = $this->computeSettingsHash($settings);
+        $channelsHash = $this->computeChannelsHash($targetChannelIds);
+
+        $epgState = $enrichmentState[$stateKey] ?? [];
+        $storedSettingsHash = $epgState['settings_hash'] ?? null;
+        $storedChannelsHash = $epgState['channels_hash'] ?? null;
+        $fileStates = $epgState['files'] ?? [];
+
+        // Invalidate all file states if settings or channels changed
+        if ($storedSettingsHash !== null && $storedSettingsHash !== $settingsHash) {
+            $context->info('Settings changed since last enrichment - re-processing all files.');
+            $fileStates = [];
+        } elseif ($storedChannelsHash !== null && $storedChannelsHash !== $channelsHash) {
+            $context->info('Channel mappings changed since last enrichment - re-processing all files.');
+            $fileStates = [];
+        }
+
         $cacheDir = "epg-cache/{$epg->uuid}/v1";
         $currentDate = Carbon::parse($minDate);
         $endDate = Carbon::parse($maxDate);
@@ -197,47 +218,110 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'categories_added' => 0,
             'descriptions_added' => 0,
             'days_processed' => 0,
+            'days_skipped' => 0,
+            'days_unchanged' => 0,
             'channels_targeted' => count($targetChannelIds),
             'tmdb_lookups' => 0,
             'tmdb_cache_hits' => 0,
         ];
 
+        $newFileStates = [];
+
         while ($currentDate->lte($endDate)) {
             $dayIndex++;
             $dateStr = $currentDate->format('Y-m-d');
             $jsonlFile = "{$cacheDir}/programmes-{$dateStr}.jsonl";
+            $fileName = "programmes-{$dateStr}.jsonl";
+
+            if ($context->cancellationRequested()) {
+                $this->saveTmdbCache($tmdbCache);
+                // Merge new file states with existing ones before saving
+                $enrichmentState[$stateKey] = [
+                    'settings_hash' => $settingsHash,
+                    'channels_hash' => $channelsHash,
+                    'files' => array_merge($fileStates, $newFileStates),
+                ];
+                $this->saveEnrichmentState($enrichmentState);
+
+                return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
+            }
+
+            if (! Storage::disk('local')->exists($jsonlFile)) {
+                $context->heartbeat(
+                    "Skipping {$dateStr} ({$dayIndex}/{$totalDays}) - file missing",
+                    progress: (int) (($dayIndex / $totalDays) * 100)
+                );
+                $stats['days_processed']++;
+                $currentDate->addDay();
+
+                continue;
+            }
+
+            // Compute source content hash to check if file data changed
+            $fullPath = Storage::disk('local')->path($jsonlFile);
+            $currentHash = md5_file($fullPath);
+            $storedSourceHash = $fileStates[$fileName]['source_hash'] ?? null;
+            $storedEnrichedHash = $fileStates[$fileName]['enriched_hash'] ?? null;
+
+            // Skip if current file matches either the original source or the enriched version
+            if ($storedSourceHash !== null && ($currentHash === $storedSourceHash || $currentHash === $storedEnrichedHash)) {
+                // Source data unchanged since last enrichment - skip
+                $context->heartbeat(
+                    "Skipping {$dateStr} ({$dayIndex}/{$totalDays}) - unchanged source data",
+                    progress: (int) (($dayIndex / $totalDays) * 100)
+                );
+                $newFileStates[$fileName] = $fileStates[$fileName];
+                $stats['days_skipped']++;
+                $stats['days_processed']++;
+                $currentDate->addDay();
+
+                continue;
+            }
 
             $context->heartbeat(
                 "Processing {$dateStr} ({$dayIndex}/{$totalDays})...",
                 progress: (int) (($dayIndex / $totalDays) * 100)
             );
 
-            if ($context->cancellationRequested()) {
-                $this->saveTmdbCache($tmdbCache);
+            $result = $this->processDateFile(
+                $jsonlFile,
+                $targetChannelIds,
+                $tmdb,
+                $tmdbCache,
+                $overwrite,
+                $enrichCategories,
+                $enrichDescriptions,
+                $context,
+            );
 
-                return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
+            $stats['programmes_enriched'] += $result['enriched'];
+            $stats['programmes_skipped'] += $result['skipped'];
+            $stats['posters_added'] += $result['posters'];
+            $stats['categories_added'] += $result['categories'];
+            $stats['descriptions_added'] += $result['descriptions'];
+            $stats['tmdb_lookups'] += $result['lookups'];
+            $stats['tmdb_cache_hits'] += $result['cache_hits'];
+
+            if (! $result['modified']) {
+                $stats['days_unchanged']++;
             }
 
-            if (Storage::disk('local')->exists($jsonlFile)) {
-                $result = $this->processDateFile(
-                    $jsonlFile,
-                    $targetChannelIds,
-                    $tmdb,
-                    $tmdbCache,
-                    $overwrite,
-                    $enrichCategories,
-                    $enrichDescriptions,
-                    $context,
-                );
+            // Store the source hash of the un-enriched file. On the next run after
+            // an EPG sync, the freshly generated file will be compared against this hash.
+            // If the EPG source data for this day hasn't changed, the hash will match
+            // and the file will be skipped.
+            // If the file was enriched (modified), also store the enriched file's hash
+            // so that manual re-runs without an EPG sync in between are also skipped.
+            $enrichedHash = $result['modified']
+                ? md5_file(Storage::disk('local')->path($jsonlFile))
+                : $currentHash;
 
-                $stats['programmes_enriched'] += $result['enriched'];
-                $stats['programmes_skipped'] += $result['skipped'];
-                $stats['posters_added'] += $result['posters'];
-                $stats['categories_added'] += $result['categories'];
-                $stats['descriptions_added'] += $result['descriptions'];
-                $stats['tmdb_lookups'] += $result['lookups'];
-                $stats['tmdb_cache_hits'] += $result['cache_hits'];
-            }
+            $newFileStates[$fileName] = [
+                'source_hash' => $currentHash,
+                'enriched_hash' => $enrichedHash,
+                'enriched_at' => now()->toIso8601String(),
+                'programmes_enriched' => $result['enriched'],
+            ];
 
             $stats['days_processed']++;
             $currentDate->addDay();
@@ -246,9 +330,21 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Persist TMDB lookup cache
         $this->saveTmdbCache($tmdbCache);
 
+        // Persist enrichment state
+        $enrichmentState[$stateKey] = [
+            'settings_hash' => $settingsHash,
+            'channels_hash' => $channelsHash,
+            'files' => $newFileStates,
+        ];
+        $this->saveEnrichmentState($enrichmentState);
+
+        $skippedInfo = $stats['days_skipped'] > 0
+            ? " ({$stats['days_skipped']} day(s) skipped - unchanged source data)"
+            : '';
+
         $summary = "Enrichment complete for '{$epg->name}': "
             ."{$stats['programmes_enriched']} programmes enriched "
-            ."across {$stats['channels_targeted']} playlist channels.";
+            ."across {$stats['channels_targeted']} playlist channels{$skippedInfo}.";
 
         $context->info($summary, $stats);
 
@@ -312,7 +408,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * Process a single date's JSONL file: enrich only targeted playlist channels.
      *
      * @param  array<string>  $targetChannelIds  EPG channel_id strings to enrich
-     * @return array{enriched: int, skipped: int, posters: int, categories: int, descriptions: int, lookups: int, cache_hits: int}
+     * @return array{enriched: int, skipped: int, posters: int, categories: int, descriptions: int, lookups: int, cache_hits: int, modified: bool}
      */
     private function processDateFile(
         string $jsonlFile,
@@ -332,6 +428,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'descriptions' => 0,
             'lookups' => 0,
             'cache_hits' => 0,
+            'modified' => false,
         ];
 
         $fullPath = Storage::disk('local')->path($jsonlFile);
@@ -372,6 +469,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $enrichDescriptions,
                 );
 
+                if ($enrichResult['changed']) {
+                    $result['modified'] = true;
+                }
+
                 $result['enriched'] += $enrichResult['changed'] ? 1 : 0;
                 $result['posters'] += $enrichResult['poster'] ? 1 : 0;
                 $result['categories'] += $enrichResult['category'] ? 1 : 0;
@@ -391,14 +492,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             fclose($handle);
         }
 
-        // Write the enriched file back (atomic: write to temp, then rename)
-        $tempPath = $fullPath.'.enriching';
-        if (($handle = fopen($tempPath, 'w')) !== false) {
-            foreach ($enrichedLines as $line) {
-                fwrite($handle, $line."\n");
+        // Only write the file back if at least one programme was enriched
+        if ($result['modified']) {
+            $tempPath = $fullPath.'.enriching';
+            if (($handle = fopen($tempPath, 'w')) !== false) {
+                foreach ($enrichedLines as $line) {
+                    fwrite($handle, $line."\n");
+                }
+                fclose($handle);
+                rename($tempPath, $fullPath);
             }
-            fclose($handle);
-            rename($tempPath, $fullPath);
         }
 
         return $result;
@@ -557,10 +660,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $cacheEntries = is_array($data) ? count($data) : 0;
         }
 
+        // Enrichment state stats
+        $enrichmentState = $this->loadEnrichmentState();
+        $trackedEpgs = count($enrichmentState);
+        $trackedFiles = 0;
+        $lastEnrichedAt = null;
+        foreach ($enrichmentState as $epgState) {
+            foreach ($epgState['files'] ?? [] as $fileState) {
+                $trackedFiles++;
+                $enrichedAt = $fileState['enriched_at'] ?? null;
+                if ($enrichedAt && ($lastEnrichedAt === null || $enrichedAt > $lastEnrichedAt)) {
+                    $lastEnrichedAt = $enrichedAt;
+                }
+            }
+        }
+
         return PluginActionResult::success('EPG Enricher plugin is healthy.', [
             'plugin_id' => 'epg-enricher',
             'tmdb_configured' => $tmdbConfigured,
             'tmdb_cache_entries' => $cacheEntries,
+            'enrichment_state_epgs' => $trackedEpgs,
+            'enrichment_state_files' => $trackedFiles,
+            'last_enriched_at' => $lastEnrichedAt,
             'timestamp' => now()->toIso8601String(),
         ]);
     }
@@ -621,5 +742,92 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $key = preg_replace('/\s+/', ' ', $key);
 
         return $key;
+    }
+
+    /**
+     * Load enrichment state manifest from disk.
+     *
+     * @return array<string, array>
+     */
+    private function loadEnrichmentState(): array
+    {
+        $path = 'plugin-data/epg-enricher/enrichment-state.json';
+        if (! Storage::disk('local')->exists($path)) {
+            return [];
+        }
+
+        $data = json_decode(Storage::disk('local')->get($path), true);
+
+        return is_array($data) ? $data : [];
+    }
+
+    /**
+     * Save enrichment state manifest to disk.
+     *
+     * @param  array<string, array>  $state
+     */
+    private function saveEnrichmentState(array $state): void
+    {
+        Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
+        Storage::disk('local')->put(
+            'plugin-data/epg-enricher/enrichment-state.json',
+            json_encode($state, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
+        );
+    }
+
+    /**
+     * Compute a hash over enrichment-relevant settings to detect config changes.
+     */
+    private function computeSettingsHash(array $settings): string
+    {
+        $relevant = [
+            'enrich_from_tmdb' => $settings['enrich_from_tmdb'] ?? true,
+            'overwrite_existing' => $settings['overwrite_existing'] ?? false,
+            'enrich_categories' => $settings['enrich_categories'] ?? true,
+            'enrich_descriptions' => $settings['enrich_descriptions'] ?? true,
+        ];
+
+        return md5(json_encode($relevant));
+    }
+
+    /**
+     * Compute a hash over sorted target channel IDs to detect mapping changes.
+     *
+     * @param  array<string>  $channelIds
+     */
+    private function computeChannelsHash(array $channelIds): string
+    {
+        $sorted = $channelIds;
+        sort($sorted);
+
+        return md5(json_encode($sorted));
+    }
+
+    /**
+     * Clear the enrichment state file, forcing full re-enrichment on next run.
+     */
+    private function clearEnrichmentState(PluginExecutionContext $context): PluginActionResult
+    {
+        $path = 'plugin-data/epg-enricher/enrichment-state.json';
+
+        if (! Storage::disk('local')->exists($path)) {
+            return PluginActionResult::success('No enrichment state to clear.');
+        }
+
+        $state = $this->loadEnrichmentState();
+        $epgCount = count($state);
+        $fileCount = 0;
+        foreach ($state as $epgState) {
+            $fileCount += count($epgState['files'] ?? []);
+        }
+
+        Storage::disk('local')->delete($path);
+
+        $context->info("Cleared enrichment state: {$epgCount} EPG(s), {$fileCount} tracked file(s).");
+
+        return PluginActionResult::success(
+            "Enrichment state cleared. Next run will re-process all files ({$epgCount} EPG(s), {$fileCount} tracked file(s)).",
+            ['epgs_cleared' => $epgCount, 'files_cleared' => $fileCount]
+        );
     }
 }

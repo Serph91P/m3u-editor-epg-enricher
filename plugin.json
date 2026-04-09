@@ -1,7 +1,7 @@
 {
     "id": "epg-enricher",
     "name": "EPG Enricher",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "api_version": "1.0.0",
     "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Only processes channels that are mapped in your playlists, complementing existing Schedules Direct / Gracenote metadata where data is missing.",
     "entrypoint": "Plugin.php",
@@ -80,6 +80,13 @@
             "icon": "heroicon-o-heart",
             "dry_run": true,
             "fields": []
+        },
+        {
+            "id": "clear_state",
+            "label": "Clear Enrichment Cache",
+            "icon": "heroicon-o-trash",
+            "requires_confirmation": true,
+            "fields": []
         }
     ],
     "data_ownership": {
@@ -87,7 +94,9 @@
             "plugin-data/epg-enricher"
         ],
         "tables": [],
-        "files": [],
+        "files": [
+            "plugin-data/epg-enricher/enrichment-state.json"
+        ],
         "default_cleanup_policy": "preserve"
     }
 }
