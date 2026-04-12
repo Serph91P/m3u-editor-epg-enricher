@@ -50,6 +50,13 @@
             "helper_text": "Fill in missing programme descriptions from TMDB."
         },
         {
+            "id": "map_emby_genres",
+            "type": "boolean",
+            "label": "Map genres to Emby EPG colors",
+            "default": false,
+            "helper_text": "Normalize TMDB genres to Emby-compatible category names (e.g. Movie, News, Sports, Kids) so Emby can color-code programmes in its guide."
+        },
+        {
             "id": "auto_run_on_cache",
             "type": "boolean",
             "label": "Auto-run after EPG cache generation",
