@@ -14,6 +14,7 @@ use App\Services\EpgCacheService;
 use App\Services\TmdbService;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Storage;
+use ReflectionProperty;
 
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 {
@@ -240,12 +241,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
+        // Override TMDB search language if configured in plugin settings
+        $tmdbLanguage = trim($settings['tmdb_language'] ?? '');
+        if ($tmdb && $tmdbLanguage !== '') {
+            $this->setTmdbLanguage($tmdb, $tmdbLanguage);
+            $context->info("Using TMDB search language: {$tmdbLanguage}");
+        }
+
         if (! $enrichTmdb) {
             return PluginActionResult::success('TMDB enrichment is disabled - nothing to do.');
         }
 
         // Load TMDB lookup cache from disk
         $tmdbCache = $this->loadTmdbCache();
+
+        // If language changed, the TMDB lookup cache contains results in the old
+        // language. Clear it so titles are re-searched with the new language.
+        $storedLanguage = $tmdbCache['__language'] ?? null;
+        $currentLanguage = $tmdbLanguage !== '' ? $tmdbLanguage : '__global';
+        if ($storedLanguage !== null && $storedLanguage !== $currentLanguage) {
+            $context->info('TMDB language changed - clearing lookup cache for fresh results.');
+            $tmdbCache = [];
+        }
+        $tmdbCache['__language'] = $currentLanguage;
 
         // Read metadata to find date range
         $metadata = $this->readMetadata($epg);
@@ -846,6 +864,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Override the TmdbService's protected language property via reflection.
+     */
+    private function setTmdbLanguage(TmdbService $tmdb, string $language): void
+    {
+        $property = new ReflectionProperty($tmdb, 'language');
+        $property->setValue($tmdb, $language);
+    }
+
+    /**
      * Load enrichment state manifest from disk.
      *
      * @return array<string, array>
@@ -887,6 +914,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'enrich_categories' => $settings['enrich_categories'] ?? true,
             'enrich_descriptions' => $settings['enrich_descriptions'] ?? true,
             'map_emby_genres' => $settings['map_emby_genres'] ?? false,
+            'tmdb_language' => $settings['tmdb_language'] ?? '',
         ];
 
         return md5(json_encode($relevant));
