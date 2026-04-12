@@ -44,6 +44,9 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 
 ## Version History
 
+### 1.5.1
+- Fixed invalid setting type for TMDB language (use `text` instead of `string`)
+
 ### 1.5.0
 - Added TMDB search language setting to improve matching for non-English programmes (e.g. German shows like "Galileo Stories", "GRIP - Das Motormagazin")
 - Set to `de-DE` for German EPG sources, `fr-FR` for French, etc. Leave empty to use the global setting.
