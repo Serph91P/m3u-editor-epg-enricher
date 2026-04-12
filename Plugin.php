@@ -18,6 +18,79 @@ use Illuminate\Support\Facades\Storage;
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 {
     /**
+     * Mapping of TMDB genre names (English + German) to Emby-compatible
+     * EPG category strings that trigger guide color coding.
+     *
+     * @var array<string, string>
+     */
+    private const array EMBY_GENRE_MAP = [
+        // News
+        'news' => 'News',
+        'nachrichten' => 'News',
+        'war & politics' => 'News',
+        'krieg & politik' => 'News',
+
+        // Sports
+        'sport' => 'Sports',
+        'sports' => 'Sports',
+
+        // Kids / Children
+        'kids' => 'Kids',
+        'kinder' => 'Kids',
+        'children' => 'Kids',
+        'family' => 'Kids',
+        'familie' => 'Kids',
+        'animation' => 'Kids',
+
+        // Documentary
+        'documentary' => 'Documentary',
+        'dokumentarfilm' => 'Documentary',
+        'dokumentation' => 'Documentary',
+        'history' => 'Documentary',
+        'historie' => 'Documentary',
+
+        // Movie (film genres)
+        'action' => 'Movie',
+        'adventure' => 'Movie',
+        'abenteuer' => 'Movie',
+        'horror' => 'Movie',
+        'thriller' => 'Movie',
+        'science fiction' => 'Movie',
+        'fantasy' => 'Movie',
+        'war' => 'Movie',
+        'kriegsfilm' => 'Movie',
+        'western' => 'Movie',
+        'tv movie' => 'Movie',
+        'tv-film' => 'Movie',
+        'romance' => 'Movie',
+        'liebesfilm' => 'Movie',
+
+        // Series (TV drama / serial genres)
+        'drama' => 'Series',
+        'comedy' => 'Movie',
+        'komödie' => 'Movie',
+        'crime' => 'Series',
+        'krimi' => 'Series',
+        'mystery' => 'Series',
+        'soap' => 'Series',
+        'reality' => 'Series',
+        'talk' => 'Series',
+
+        // Combined / multi-word TMDB TV genres
+        'action & adventure' => 'Movie',
+        'action & abenteuer' => 'Movie',
+        'sci-fi & fantasy' => 'Series',
+
+        // Music
+        'music' => 'Music',
+        'musik' => 'Music',
+
+        // Education
+        'education' => 'Education',
+        'bildung' => 'Education',
+    ];
+
+    /**
      * Handle manual actions triggered from the plugin UI.
      */
     public function runAction(string $action, array $payload, PluginExecutionContext $context): PluginActionResult
@@ -154,6 +227,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $overwrite = $settings['overwrite_existing'] ?? false;
         $enrichCategories = $settings['enrich_categories'] ?? true;
         $enrichDescriptions = $settings['enrich_descriptions'] ?? true;
+        $mapEmbyGenres = $settings['map_emby_genres'] ?? false;
 
         // Load TMDB service if enrichment enabled
         $tmdb = null;
@@ -291,6 +365,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $overwrite,
                 $enrichCategories,
                 $enrichDescriptions,
+                $mapEmbyGenres,
                 $context,
             );
 
@@ -418,6 +493,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $overwrite,
         bool $enrichCategories,
         bool $enrichDescriptions,
+        bool $mapEmbyGenres,
         PluginExecutionContext $context,
     ): array {
         $result = [
@@ -467,6 +543,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $overwrite,
                     $enrichCategories,
                     $enrichDescriptions,
+                    $mapEmbyGenres,
                 );
 
                 if ($enrichResult['changed']) {
@@ -520,6 +597,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $overwrite,
         bool $enrichCategories,
         bool $enrichDescriptions,
+        bool $mapEmbyGenres,
     ): array {
         $result = [
             'changed' => false,
@@ -628,7 +706,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             // Take the first genre if comma-separated
             $firstGenre = trim(explode(',', $genres)[0]);
             if ($firstGenre !== '') {
+                // Map to Emby-compatible genre name for EPG guide coloring
+                if ($mapEmbyGenres) {
+                    $firstGenre = $this->mapToEmbyGenre($firstGenre);
+                }
                 $programme['category'] = $firstGenre;
+                $result['category'] = true;
+                $result['changed'] = true;
+            }
+        } elseif ($mapEmbyGenres && $hasCategory) {
+            // Map existing category to Emby genre even if not enriching from TMDB
+            $mapped = $this->mapToEmbyGenre($programme['category']);
+            if ($mapped !== $programme['category']) {
+                $programme['category'] = $mapped;
                 $result['category'] = true;
                 $result['changed'] = true;
             }
@@ -745,6 +835,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Map a genre string to an Emby-compatible category for EPG guide coloring.
+     * Falls back to the original genre if no mapping is found.
+     */
+    private function mapToEmbyGenre(string $genre): string
+    {
+        $key = mb_strtolower(trim($genre));
+
+        return self::EMBY_GENRE_MAP[$key] ?? $genre;
+    }
+
+    /**
      * Load enrichment state manifest from disk.
      *
      * @return array<string, array>
@@ -785,6 +886,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'overwrite_existing' => $settings['overwrite_existing'] ?? false,
             'enrich_categories' => $settings['enrich_categories'] ?? true,
             'enrich_descriptions' => $settings['enrich_descriptions'] ?? true,
+            'map_emby_genres' => $settings['map_emby_genres'] ?? false,
         ];
 
         return md5(json_encode($relevant));
