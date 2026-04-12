@@ -44,6 +44,9 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 
 ## Version History
 
+### 1.4.1
+- Added `repository` field to plugin.json for automatic update checking
+
 ### 1.4.0
 - Added Emby EPG genre color mapping: normalizes TMDB genres (English + German) to Emby-compatible categories (News, Sports, Kids, Movie, Series, Documentary, Music, Education)
 - New setting "Map Emby genres" (off by default) - also remaps existing categories from other sources
