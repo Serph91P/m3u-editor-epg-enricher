@@ -126,6 +126,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return PluginActionResult::failure('Missing epg_id or user_id in hook payload.');
         }
 
+        // Filter playlists if the user restricted auto-run to specific ones
+        $allowedPlaylistIds = $context->settings['auto_run_playlists'] ?? [];
+        if (! empty($allowedPlaylistIds)) {
+            $playlistIds = array_values(array_intersect($playlistIds, $allowedPlaylistIds));
+            if (empty($playlistIds)) {
+                return PluginActionResult::success('No matching playlists for auto-run - skipping.');
+            }
+        }
+
         $context->info("EPG cache generated (ID: {$epgId}). Running enrichment for playlist channels.");
 
         return $this->doEnrich($epgId, $playlistIds, $context);
