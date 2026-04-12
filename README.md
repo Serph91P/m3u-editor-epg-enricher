@@ -8,6 +8,7 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 - **TMDB Artwork** - Adds poster and backdrop images to programmes missing artwork
 - **Genre/Category** - Fills in missing programme genres from TMDB data
 - **Descriptions** - Adds missing programme descriptions/overviews from TMDB
+- **Emby EPG Colors** - Maps genres to Emby-compatible categories (News, Sports, Kids, Movie, etc.) for color-coded EPG guides
 - **Gracenote-aware** - Respects existing Schedules Direct / Gracenote metadata and only fills gaps
 - **Title Cache** - Caches TMDB lookups to disk to avoid redundant API calls across runs
 
@@ -25,6 +26,7 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 | Overwrite existing | Off | Replace existing metadata even if already present (e.g. from Schedules Direct) |
 | Enrich categories | On | Fill missing genre/category from TMDB |
 | Enrich descriptions | On | Fill missing descriptions from TMDB |
+| Map Emby genres | Off | Normalize genres to Emby-compatible categories for EPG guide color coding |
 | Auto-run on cache | On | Run automatically after EPG cache generation |
 
 ## How It Works
@@ -41,6 +43,10 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 6. The enriched data is used the next time EPG output is generated
 
 ## Version History
+
+### 1.4.0
+- Added Emby EPG genre color mapping: normalizes TMDB genres (English + German) to Emby-compatible categories (News, Sports, Kids, Movie, Series, Documentary, Music, Education)
+- New setting "Map Emby genres" (off by default) - also remaps existing categories from other sources
 
 ### 1.1.0
 - **Breaking**: Removed gap filling feature (use the built-in "Enable dummy EPG" in playlist settings instead)
