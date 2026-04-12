@@ -44,6 +44,9 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 
 ## Version History
 
+### 1.6.0
+- Added playlist filter for auto-run: choose which playlists should be enriched automatically (leave empty for all)
+
 ### 1.5.1
 - Fixed invalid setting type for TMDB language (use `text` instead of `string`)
 
