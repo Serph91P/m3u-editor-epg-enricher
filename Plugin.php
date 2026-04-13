@@ -293,7 +293,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         $summary = "Enrichment complete for playlist '{$playlist->name}': "
-            .($combinedStats['programmes_enriched'] ?? 0).' programmes enriched '
+            .($combinedStats['programmes_updated'] ?? 0).'/'
+            .($combinedStats['programmes_processed'] ?? 0).' programmes updated '
             ."across {$totalChannels} active channels.";
 
         return PluginActionResult::success($summary, $combinedStats);
@@ -411,8 +412,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $dayIndex = 0;
 
         $stats = [
-            'programmes_enriched' => 0,
-            'programmes_skipped' => 0,
+            'programmes_processed' => 0,
+            'programmes_updated' => 0,
+            'programmes_already_enriched' => 0,
             'posters_added' => 0,
             'categories_added' => 0,
             'descriptions_added' => 0,
@@ -505,8 +507,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $context,
             );
 
-            $stats['programmes_enriched'] += $result['enriched'];
-            $stats['programmes_skipped'] += $result['skipped'];
+            $stats['programmes_processed'] += $result['processed'];
+            $stats['programmes_updated'] += $result['updated'];
+            $stats['programmes_already_enriched'] += $result['already_enriched'];
             $stats['posters_added'] += $result['posters'];
             $stats['categories_added'] += $result['categories'];
             $stats['descriptions_added'] += $result['descriptions'];
@@ -533,7 +536,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 'source_hash' => $currentHash,
                 'enriched_hash' => $enrichedHash,
                 'enriched_at' => now()->toIso8601String(),
-                'programmes_enriched' => $result['enriched'],
+                'programmes_updated' => $result['updated'],
             ];
 
             $stats['days_processed']++;
@@ -556,10 +559,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             : '';
 
         $summary = "Enrichment complete for '{$epg->name}': "
-            ."{$stats['programmes_enriched']} programmes enriched "
-            ."across {$stats['channels_targeted']} playlist channels{$skippedInfo}.";
-
-        $context->info($summary, $stats);
+            ."{$stats['programmes_updated']}/{$stats['programmes_processed']} programmes updated "
+            ."across {$stats['channels_targeted']} channels, {$stats['days_processed']} day(s){$skippedInfo}.";
 
         return PluginActionResult::success($summary, $stats);
     }
@@ -642,8 +643,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         PluginExecutionContext $context,
     ): array {
         $result = [
-            'enriched' => 0,
-            'skipped' => 0,
+            'processed' => 0,
+            'updated' => 0,
+            'already_enriched' => 0,
             'posters' => 0,
             'categories' => 0,
             'descriptions' => 0,
@@ -685,10 +687,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 // Only enrich channels that are mapped in playlists
                 if (! isset($targetSet[$record['channel']])) {
                     $enrichedLines[] = $line;
-                    $result['skipped']++;
 
                     continue;
                 }
+
+                $result['processed']++;
 
                 $programme = $record['programme'];
 
@@ -707,9 +710,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
                 if ($enrichResult['changed']) {
                     $result['modified'] = true;
+                    $result['updated']++;
+                } else {
+                    $result['already_enriched']++;
                 }
 
-                $result['enriched'] += $enrichResult['changed'] ? 1 : 0;
                 $result['posters'] += $enrichResult['poster'] ? 1 : 0;
                 $result['categories'] += $enrichResult['category'] ? 1 : 0;
                 $result['descriptions'] += $enrichResult['description'] ? 1 : 0;
@@ -758,7 +763,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     fwrite($handle, $line."\n");
                 }
                 fclose($handle);
-                rename($tempPath, $fullPath);
+
+                // The original file or directory may have been removed by a cache refresh
+                if (is_dir(dirname($fullPath))) {
+                    rename($tempPath, $fullPath);
+                } else {
+                    @unlink($tempPath);
+                }
             }
         }
 
