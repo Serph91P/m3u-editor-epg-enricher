@@ -58,11 +58,53 @@
             "helper_text": "Fill in missing programme descriptions from TMDB."
         },
         {
+            "id": "enrich_posters",
+            "type": "boolean",
+            "label": "Enrich poster/icon artwork",
+            "default": true,
+            "helper_text": "Fetch poster images from TMDB and set them as the programme icon."
+        },
+        {
+            "id": "enrich_backdrops",
+            "type": "boolean",
+            "label": "Enrich backdrop images",
+            "default": true,
+            "helper_text": "Fetch backdrop (landscape) images from TMDB and add them to the programme images array."
+        },
+        {
             "id": "map_emby_genres",
             "type": "boolean",
             "label": "Map genres to Emby EPG colors",
             "default": false,
             "helper_text": "Normalize TMDB genres to Emby-compatible category names (e.g. Movie, News, Sports, Kids) so Emby can color-code programmes in its guide."
+        },
+        {
+            "id": "keyword_category_detection",
+            "type": "boolean",
+            "label": "Detect categories from title keywords",
+            "default": true,
+            "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to Emby EPG colors' is also enabled."
+        },
+        {
+            "id": "enrich_sports_events",
+            "type": "boolean",
+            "label": "Enrich sport events from TheSportsDB",
+            "default": false,
+            "helper_text": "Fetch artwork and event details from TheSportsDB for programmes detected as sports content. Requires an internet connection."
+        },
+        {
+            "id": "sportsdb_api_key",
+            "type": "text",
+            "label": "TheSportsDB API key",
+            "default": "",
+            "helper_text": "Your TheSportsDB premium API key for full TV schedule matching. Leave empty to use the free tier (limited to event-by-date matching)."
+        },
+        {
+            "id": "sportsdb_country",
+            "type": "text",
+            "label": "TheSportsDB country filter",
+            "default": "",
+            "helper_text": "Filter TheSportsDB TV schedule by country (e.g. 'Germany', 'United Kingdom'). Leave empty for all countries. Only used with a premium API key."
         },
         {
             "id": "auto_run_on_cache",

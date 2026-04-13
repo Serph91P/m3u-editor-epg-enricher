@@ -19,38 +19,44 @@ use ReflectionProperty;
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 {
     /**
-     * Mapping of TMDB genre names (English + German) to Emby-compatible
-     * EPG category strings that trigger guide color coding.
+     * Mapping of TMDB genre names (English + German) to Emby EPG categories.
+     *
+     * Emby supports 4 color-coded categories in the guide:
+     *   Movie, News, Kids, Sports
+     * Other categories (Series, Documentary, Music, Education) are valid
+     * but receive no color highlighting.
+     *
+     * For ambiguous genres (e.g. "Action" can be a movie or TV series),
+     * the TMDB media type overrides the mapping in {@see mapToEmbyCategory()}.
+     *
+     * Covers every official TMDB genre for both Movies and TV shows.
      *
      * @var array<string, string>
      */
     private const array EMBY_GENRE_MAP = [
-        // News
+        // ── News (color-coded) ──────────────────────────────────────
         'news' => 'News',
         'nachrichten' => 'News',
-        'war & politics' => 'News',
-        'krieg & politik' => 'News',
+        'journalism' => 'News',
+        'journalismus' => 'News',
+        'current affairs' => 'News',
 
-        // Sports
+        // ── Sports (color-coded) ────────────────────────────────────
         'sport' => 'Sports',
         'sports' => 'Sports',
+        'basketball' => 'Sports',
+        'baseball' => 'Sports',
+        'football' => 'Sports',
 
-        // Kids / Children
+        // ── Kids / Children (color-coded) ───────────────────────────
         'kids' => 'Kids',
         'kinder' => 'Kids',
         'children' => 'Kids',
-        'family' => 'Kids',
-        'familie' => 'Kids',
-        'animation' => 'Kids',
+        'childrens' => 'Kids',
+        'disney' => 'Kids',
 
-        // Documentary
-        'documentary' => 'Documentary',
-        'dokumentarfilm' => 'Documentary',
-        'dokumentation' => 'Documentary',
-        'history' => 'Documentary',
-        'historie' => 'Documentary',
-
-        // Movie (film genres)
+        // ── Movie (color-coded) ─────────────────────────────────────
+        // TMDB Movie-only genres
         'action' => 'Movie',
         'adventure' => 'Movie',
         'abenteuer' => 'Movie',
@@ -58,37 +64,123 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'thriller' => 'Movie',
         'science fiction' => 'Movie',
         'fantasy' => 'Movie',
-        'war' => 'Movie',
-        'kriegsfilm' => 'Movie',
-        'western' => 'Movie',
-        'tv movie' => 'Movie',
-        'tv-film' => 'Movie',
         'romance' => 'Movie',
         'liebesfilm' => 'Movie',
+        'war' => 'Movie',
+        'kriegsfilm' => 'Movie',
+        'tv movie' => 'Movie',
+        'tv-film' => 'Movie',
 
-        // Series (TV drama / serial genres)
-        'drama' => 'Series',
+        // Shared genres — mapped to Movie, overridden to Series by media type
         'comedy' => 'Movie',
         'komödie' => 'Movie',
-        'crime' => 'Series',
-        'krimi' => 'Series',
-        'mystery' => 'Series',
+        'crime' => 'Movie',
+        'krimi' => 'Movie',
+        'mystery' => 'Movie',
+        'drama' => 'Movie',
+        'western' => 'Movie',
+        'animation' => 'Movie',
+        'family' => 'Movie',
+        'familie' => 'Movie',
+
+        // ── Series (no color — TV-exclusive TMDB genres) ────────────
+        'action & adventure' => 'Series',
+        'action & abenteuer' => 'Series',
+        'sci-fi & fantasy' => 'Series',
+        'war & politics' => 'Series',
+        'krieg & politik' => 'Series',
         'soap' => 'Series',
         'reality' => 'Series',
         'talk' => 'Series',
 
-        // Combined / multi-word TMDB TV genres
-        'action & adventure' => 'Movie',
-        'action & abenteuer' => 'Movie',
-        'sci-fi & fantasy' => 'Series',
+        // ── Documentary (no color) ──────────────────────────────────
+        'documentary' => 'Documentary',
+        'dokumentarfilm' => 'Documentary',
+        'dokumentation' => 'Documentary',
+        'history' => 'Documentary',
+        'historie' => 'Documentary',
 
-        // Music
+        // ── Music (no color) ────────────────────────────────────────
         'music' => 'Music',
         'musik' => 'Music',
 
-        // Education
+        // ── Education (no color) ────────────────────────────────────
         'education' => 'Education',
         'bildung' => 'Education',
+    ];
+
+    /**
+     * Keyword patterns for title-based category detection.
+     *
+     * Used as a fallback when TMDB cannot find a match (live sports, news
+     * broadcasts, kids channels, etc.). Keywords are matched with word
+     * boundaries to prevent false positives.
+     *
+     * @var array<string, list<string>>
+     */
+    private const array TITLE_KEYWORD_CATEGORIES = [
+        'Sports' => [
+            // Motorsport
+            'formel 1', 'formula 1', 'f1', 'motogp', 'nascar', 'dtm',
+            'formel e', 'formula e', 'indycar', 'rallye', 'rally',
+            // Football / Soccer
+            'bundesliga', 'champions league', 'europa league', 'conference league',
+            'premier league', 'la liga', 'serie a', 'ligue 1', 'eredivisie',
+            'dfb-pokal', 'dfb pokal', 'copa america', 'euro 2024', 'em 2024',
+            'world cup', 'weltmeisterschaft', 'copa del rey',
+            'fifa', 'uefa', 'fußball', 'fussball', 'soccer',
+            // US Sports
+            'nfl', 'nba', 'nhl', 'mlb', 'mls', 'super bowl',
+            // Tennis
+            'wimbledon', 'roland garros', 'us open tennis', 'australian open',
+            'atp', 'wta',
+            // Winter Sports
+            'biathlon', 'ski alpin', 'skispringen', 'ski jumping',
+            'langlauf', 'cross-country skiing', 'bob', 'rodeln', 'luge',
+            // Cycling
+            'tour de france', 'giro d\'italia', 'vuelta',
+            // Boxing / MMA
+            'boxen', 'boxing', 'ufc', 'mma',
+            // Other Sports
+            'olympia', 'olympics', 'olympische spiele',
+            'leichtathletik', 'athletics', 'handball', 'volleyball',
+            'eishockey', 'ice hockey', 'golf', 'rugby', 'cricket',
+            'darts', 'snooker', 'sportschau', 'sport1',
+            'ringen', 'wrestling', 'schwimmen', 'swimming',
+        ],
+        'News' => [
+            'tagesschau', 'tagesthemen', 'heute', 'heute journal',
+            'rtl aktuell', 'sat.1 nachrichten', 'newstime',
+            'cnn', 'bbc news', 'sky news', 'euronews', 'al jazeera',
+            'ntv', 'n-tv', 'welt news', 'ard extra', 'zdf spezial',
+            'nachrichten', 'news', 'breaking news',
+            'morgenmagazin', 'moma', 'frühstücksfernsehen',
+            'presseclub', 'anne will', 'hart aber fair',
+            'markus lanz', 'maischberger', 'sandra maischberger',
+            'wetter', 'weather',
+        ],
+        'Kids' => [
+            'kika', 'kinder', 'kids', 'junior',
+            'nick', 'nickelodeon', 'nicktoons',
+            'cartoon network', 'disney channel', 'disney junior',
+            'super rtl', 'toggo',
+            'sesamstraße', 'sesame street',
+            'peppa pig', 'peppa wutz', 'paw patrol',
+            'spongebob', 'bluey', 'bob der baumeister',
+            'bob the builder', 'feuerwehrmann sam', 'fireman sam',
+            'bibi blocksberg', 'bibi und tina', 'benjamin blümchen',
+            'die sendung mit der maus', 'löwenzahn', 'wickie',
+        ],
+        'Documentary' => [
+            'terra x', 'planet erde', 'planet earth',
+            'national geographic', 'nat geo', 'discovery',
+            'arte doku', 'zdf doku', 'ard doku',
+            'dokumentation', 'documentary', 'doku',
+            'history channel', 'history',
+            'galileo', 'abenteuer leben', 'wissen',
+            'quarks', 'nano', 'scobel', 'leschs kosmos',
+            'woher wissen wir das', '37 grad', 'reportage',
+        ],
     ];
 
     /**
@@ -237,7 +329,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $overwrite = $settings['overwrite_existing'] ?? false;
         $enrichCategories = $settings['enrich_categories'] ?? true;
         $enrichDescriptions = $settings['enrich_descriptions'] ?? true;
+        $enrichPosters = $settings['enrich_posters'] ?? true;
+        $enrichBackdrops = $settings['enrich_backdrops'] ?? true;
         $mapEmbyGenres = $settings['map_emby_genres'] ?? false;
+        $keywordDetection = $settings['keyword_category_detection'] ?? true;
+        $enrichSportsEvents = $settings['enrich_sports_events'] ?? false;
+        $sportsDbApiKey = $settings['sportsdb_api_key'] ?? '';
+        $sportsDbCountry = $settings['sportsdb_country'] ?? '';
 
         // Load TMDB service if enrichment enabled
         $tmdb = null;
@@ -324,7 +422,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'channels_targeted' => count($targetChannelIds),
             'tmdb_lookups' => 0,
             'tmdb_cache_hits' => 0,
+            'sportsdb_matches' => 0,
+            'sportsdb_posters' => 0,
         ];
+
+        $sportsDbCache = [];
 
         $newFileStates = [];
 
@@ -392,7 +494,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $overwrite,
                 $enrichCategories,
                 $enrichDescriptions,
+                $enrichPosters,
+                $enrichBackdrops,
                 $mapEmbyGenres,
+                $keywordDetection,
+                $enrichSportsEvents,
+                $sportsDbApiKey,
+                $sportsDbCountry,
+                $sportsDbCache,
                 $context,
             );
 
@@ -403,6 +512,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $stats['descriptions_added'] += $result['descriptions'];
             $stats['tmdb_lookups'] += $result['lookups'];
             $stats['tmdb_cache_hits'] += $result['cache_hits'];
+            $stats['sportsdb_matches'] += $result['sportsdb_matches'];
+            $stats['sportsdb_posters'] += $result['sportsdb_posters'];
 
             if (! $result['modified']) {
                 $stats['days_unchanged']++;
@@ -520,7 +631,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $overwrite,
         bool $enrichCategories,
         bool $enrichDescriptions,
+        bool $enrichPosters,
+        bool $enrichBackdrops,
         bool $mapEmbyGenres,
+        bool $keywordDetection,
+        bool $enrichSportsEvents,
+        string $sportsDbApiKey,
+        string $sportsDbCountry,
+        array &$sportsDbCache,
         PluginExecutionContext $context,
     ): array {
         $result = [
@@ -531,8 +649,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'descriptions' => 0,
             'lookups' => 0,
             'cache_hits' => 0,
+            'sportsdb_matches' => 0,
+            'sportsdb_posters' => 0,
             'modified' => false,
         ];
+
+        // Pre-fetch TheSportsDB events for this date if sports enrichment is enabled
+        $sportsEvents = [];
+        if ($enrichSportsEvents) {
+            // Extract date from filename (programmes-YYYY-MM-DD.jsonl)
+            if (preg_match('/programmes-(\d{4}-\d{2}-\d{2})\.jsonl$/', $jsonlFile, $m)) {
+                $sportsEvents = $this->fetchSportsDbEventsForDate($m[1], $sportsDbApiKey, $sportsDbCountry, $sportsDbCache);
+            }
+        }
 
         $fullPath = Storage::disk('local')->path($jsonlFile);
         $targetSet = array_flip($targetChannelIds);
@@ -570,7 +699,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $overwrite,
                     $enrichCategories,
                     $enrichDescriptions,
+                    $enrichPosters,
+                    $enrichBackdrops,
                     $mapEmbyGenres,
+                    $keywordDetection,
                 );
 
                 if ($enrichResult['changed']) {
@@ -583,6 +715,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $result['descriptions'] += $enrichResult['description'] ? 1 : 0;
                 $result['lookups'] += $enrichResult['lookup'] ? 1 : 0;
                 $result['cache_hits'] += $enrichResult['cache_hit'] ? 1 : 0;
+
+                // TheSportsDB enrichment for sport programmes
+                if (! empty($sportsEvents) && ($programme['category'] ?? '') === 'Sports') {
+                    $matchedEvent = $this->matchSportsEvent($programme, $sportsEvents);
+                    if ($matchedEvent) {
+                        $sportsResult = $this->enrichFromSportsDb(
+                            $programme,
+                            $matchedEvent,
+                            $overwrite,
+                            $enrichPosters,
+                            $enrichBackdrops,
+                            $enrichDescriptions,
+                        );
+                        if ($sportsResult['changed']) {
+                            $result['modified'] = true;
+                            $result['sportsdb_matches']++;
+                            if ($sportsResult['poster']) {
+                                $result['sportsdb_posters']++;
+                            }
+                        }
+                    }
+                }
 
                 $enrichedLines[] = json_encode([
                     'channel' => $record['channel'],
@@ -624,7 +778,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $overwrite,
         bool $enrichCategories,
         bool $enrichDescriptions,
+        bool $enrichPosters,
+        bool $enrichBackdrops,
         bool $mapEmbyGenres,
+        bool $keywordDetection,
     ): array {
         $result = [
             'changed' => false,
@@ -646,7 +803,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $hasCategory = ! empty($programme['category']);
         $hasDesc = ! empty($programme['desc']);
 
-        if (! $overwrite && $hasIcon && ($hasCategory || ! $enrichCategories) && ($hasDesc || ! $enrichDescriptions)) {
+        $wantsArtwork = $enrichPosters || $enrichBackdrops;
+
+        if (! $overwrite && (! $wantsArtwork || $hasIcon) && ($hasCategory || ! $enrichCategories) && ($hasDesc || ! $enrichDescriptions)) {
             return $result;
         }
 
@@ -667,6 +826,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 if ($details) {
                     $tmdbData = array_merge($tmdbData, $details);
                 }
+                $tmdbData['_media_type'] = 'tv';
             } else {
                 $tmdbData = $tmdb->searchMovie($title, tryFallback: true);
                 if ($tmdbData && ($tmdbData['tmdb_id'] ?? null)) {
@@ -674,6 +834,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     if ($details) {
                         $tmdbData = array_merge($tmdbData, $details);
                     }
+                    $tmdbData['_media_type'] = 'movie';
                 }
             }
 
@@ -682,6 +843,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         if (! $tmdbData) {
+            // TMDB lookup failed — try keyword-based category detection from the title
+            if ($keywordDetection && $mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory)) {
+                $keywordCategory = $this->detectCategoryFromTitle($title);
+                if ($keywordCategory !== null) {
+                    $programme['category'] = $keywordCategory;
+                    $result['category'] = true;
+                    $result['changed'] = true;
+                }
+            }
+
             return $result;
         }
 
@@ -689,14 +860,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $posterUrl = $tmdbData['poster_url'] ?? null;
         $backdropUrl = $tmdbData['backdrop_url'] ?? null;
 
-        if ($posterUrl && ($overwrite || ! $hasIcon)) {
+        if ($enrichPosters && $posterUrl && ($overwrite || ! $hasIcon)) {
             $programme['icon'] = $posterUrl;
             $result['poster'] = true;
             $result['changed'] = true;
         }
 
         // Add backdrop to images array
-        if ($backdropUrl) {
+        if ($enrichBackdrops && $backdropUrl) {
             $existingUrls = array_column($programme['images'] ?? [], 'url');
             if (! in_array($backdropUrl, $existingUrls, true)) {
                 $programme['images'][] = [
@@ -712,7 +883,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         // Add poster to images array if not already the icon
-        if ($posterUrl) {
+        if ($enrichPosters && $posterUrl) {
             $existingUrls = array_column($programme['images'] ?? [], 'url');
             if (! in_array($posterUrl, $existingUrls, true)) {
                 $programme['images'][] = [
@@ -729,21 +900,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         // Enrich category/genre
         $genres = $tmdbData['genres'] ?? '';
+        $mediaType = $tmdbData['_media_type'] ?? null;
         if ($enrichCategories && $genres !== '' && ($overwrite || ! $hasCategory)) {
-            // Take the first genre if comma-separated
-            $firstGenre = trim(explode(',', $genres)[0]);
-            if ($firstGenre !== '') {
-                // Map to Emby-compatible genre name for EPG guide coloring
-                if ($mapEmbyGenres) {
-                    $firstGenre = $this->mapToEmbyGenre($firstGenre);
-                }
-                $programme['category'] = $firstGenre;
+            if ($mapEmbyGenres) {
+                $category = $this->mapToEmbyCategory($genres, $mediaType);
+            } else {
+                // Take the first genre if comma-separated
+                $category = trim(explode(',', $genres)[0]);
+            }
+            if ($category !== '') {
+                $programme['category'] = $category;
                 $result['category'] = true;
                 $result['changed'] = true;
             }
         } elseif ($mapEmbyGenres && $hasCategory) {
             // Map existing category to Emby genre even if not enriching from TMDB
-            $mapped = $this->mapToEmbyGenre($programme['category']);
+            $mapped = $this->mapToEmbyCategory($programme['category'], $mediaType);
             if ($mapped !== $programme['category']) {
                 $programme['category'] = $mapped;
                 $result['category'] = true;
@@ -792,10 +964,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
+        // TheSportsDB status
+        $settings = $context->settings;
+        $sportsEnabled = $settings['enrich_sports_events'] ?? false;
+        $sportsApiKey = $settings['sportsdb_api_key'] ?? '';
+        $sportsTier = $sportsEnabled
+            ? ($sportsApiKey !== '' ? 'premium' : 'free')
+            : 'disabled';
+
         return PluginActionResult::success('EPG Enricher plugin is healthy.', [
             'plugin_id' => 'epg-enricher',
             'tmdb_configured' => $tmdbConfigured,
             'tmdb_cache_entries' => $cacheEntries,
+            'sportsdb_status' => $sportsTier,
             'enrichment_state_epgs' => $trackedEpgs,
             'enrichment_state_files' => $trackedFiles,
             'last_enriched_at' => $lastEnrichedAt,
@@ -862,14 +1043,355 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
-     * Map a genre string to an Emby-compatible category for EPG guide coloring.
-     * Falls back to the original genre if no mapping is found.
+     * Map genre string(s) + TMDB media type to an Emby EPG category that
+     * triggers guide color coding.
+     *
+     * Priority: scan ALL genres for specific categories (News, Sports, Kids)
+     * first, then fall back to Movie/Series based on the TMDB media type.
+     * This prevents e.g. M*A*S*H (Comedy, War & Politics, Drama) from being
+     * labelled "News" just because "War & Politics" appears in its genres.
+     *
+     * @param  string  $genres  Comma-separated genre string
+     * @param  string|null  $mediaType  'tv' or 'movie' from TMDB lookup
      */
-    private function mapToEmbyGenre(string $genre): string
+    private function mapToEmbyCategory(string $genres, ?string $mediaType): string
     {
-        $key = mb_strtolower(trim($genre));
+        $genreList = array_map('trim', explode(',', $genres));
+        $genreKeys = array_map('mb_strtolower', $genreList);
 
-        return self::EMBY_GENRE_MAP[$key] ?? $genre;
+        // Collect all mapped categories across every genre
+        $mapped = [];
+        foreach ($genreKeys as $key) {
+            if (isset(self::EMBY_GENRE_MAP[$key])) {
+                $mapped[self::EMBY_GENRE_MAP[$key]] = true;
+            }
+        }
+
+        // Priority 1: Sports — always unambiguous
+        if (isset($mapped['Sports'])) {
+            return 'Sports';
+        }
+
+        // Priority 2: Kids — check explicit "Kids" mapping OR the kids-adjacent
+        // genres (animation, family) which are mapped to Movie in the generic map
+        // but should become Kids when the TMDB content is a TV show for children.
+        if (isset($mapped['Kids'])) {
+            return 'Kids';
+        }
+        // Animation + Family on TV are almost always kids content
+        $kidsAdjacentGenres = ['animation', 'family', 'familie'];
+        if ($mediaType === 'tv' && ! empty(array_intersect($genreKeys, $kidsAdjacentGenres))) {
+            return 'Kids';
+        }
+
+        // Priority 3: News — but only when it's actually news/journalism content.
+        // TV series that merely touch political themes (e.g. M*A*S*H with
+        // "War & Politics") should NOT be tagged as News.
+        if (isset($mapped['News']) && $mediaType !== 'tv') {
+            return 'News';
+        }
+
+        // Priority 4: Documentary — before the generic media type fallback
+        if (isset($mapped['Documentary'])) {
+            return 'Documentary';
+        }
+
+        // Priority 5: trust the TMDB media type over genre labels.
+        // A TV series with genre "Action" should become Series, not Movie.
+        if ($mediaType === 'movie') {
+            return 'Movie';
+        }
+        if ($mediaType === 'tv') {
+            return 'Series';
+        }
+
+        // Priority 6: no media type available — use the first mapped category
+        foreach (['Movie', 'Series', 'Music', 'Education', 'News'] as $cat) {
+            if (isset($mapped[$cat])) {
+                return $cat;
+            }
+        }
+
+        // Last resort: return the first genre as-is
+        return $genreList[0] ?? $genres;
+    }
+
+    /**
+     * Detect an Emby category from keywords found in the programme title.
+     * Used as a fallback when TMDB lookup fails (live sports, news, etc.).
+     *
+     * @return string|null  The matched category, or null if no keywords match
+     */
+    private function detectCategoryFromTitle(string $title): ?string
+    {
+        $titleLower = mb_strtolower($title);
+
+        foreach (self::TITLE_KEYWORD_CATEGORIES as $category => $keywords) {
+            foreach ($keywords as $keyword) {
+                // Use word boundary matching to avoid false positives
+                // e.g. "art" should not match inside "Karting"
+                $pattern = '/(?:^|[\s\-\/\|:.,;!?\(\[])' . preg_quote($keyword, '/') . '(?:$|[\s\-\/\|:.,;!?\)\]])/u';
+                if (preg_match($pattern, $titleLower)) {
+                    return $category;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Fetch sport events from TheSportsDB for a given date.
+     * Results are cached per date in the sports-events cache file.
+     *
+     * For premium API keys, uses eventstv.php (returns channel info + up to 500 results).
+     * For free tier, uses eventsday.php (no channel info, limited results).
+     *
+     * @param  string  $date  Date in Y-m-d format
+     * @param  string  $apiKey  API key (empty = free tier key '123')
+     * @param  string  $country  Optional country filter for premium TV schedule
+     * @param  array<string, array>  $cache  Reference to in-memory cache
+     * @return list<array>  Array of event data
+     */
+    private function fetchSportsDbEventsForDate(
+        string $date,
+        string $apiKey,
+        string $country,
+        array &$cache,
+    ): array {
+        if (isset($cache[$date])) {
+            return $cache[$date];
+        }
+
+        $key = $apiKey !== '' ? $apiKey : '123';
+        $isPremium = $apiKey !== '';
+        $events = [];
+
+        try {
+            if ($isPremium) {
+                // Premium: use TV schedule endpoint (includes channel info)
+                $url = "https://www.thesportsdb.com/api/v1/json/{$key}/eventstv.php?d={$date}";
+                if ($country !== '') {
+                    $url .= '&a=' . urlencode(str_replace(' ', '_', $country));
+                }
+            } else {
+                // Free: use events-by-day endpoint (no channel info, 15 results)
+                $url = "https://www.thesportsdb.com/api/v1/json/{$key}/eventsday.php?d={$date}";
+            }
+
+            $response = @file_get_contents($url, false, stream_context_create([
+                'http' => [
+                    'timeout' => 10,
+                    'ignore_errors' => true,
+                    'header' => "Accept: application/json\r\n",
+                ],
+            ]));
+
+            if ($response !== false) {
+                $data = json_decode($response, true);
+                $eventList = $isPremium
+                    ? ($data['tvevents'] ?? [])
+                    : ($data['events'] ?? []);
+
+                if (is_array($eventList)) {
+                    $events = $eventList;
+                }
+            }
+        } catch (\Throwable) {
+            // Silently fail — sports enrichment is best-effort
+        }
+
+        $cache[$date] = $events;
+
+        return $events;
+    }
+
+    /**
+     * Match a sports programme to a TheSportsDB event.
+     *
+     * Uses fuzzy title matching combined with time-window overlap (±60 min).
+     * For premium users with channel data, also considers channel name similarity.
+     *
+     * @param  array  $programme  The EPG programme data
+     * @param  list<array>  $events  TheSportsDB events for the day
+     * @return array|null  The best matching event, or null
+     */
+    private function matchSportsEvent(array $programme, array $events): ?array
+    {
+        if (empty($events)) {
+            return null;
+        }
+
+        $progTitle = mb_strtolower($programme['title'] ?? '');
+        $progStart = $programme['start'] ?? null;
+
+        if ($progTitle === '') {
+            return null;
+        }
+
+        $bestMatch = null;
+        $bestScore = 0;
+
+        foreach ($events as $event) {
+            $eventName = mb_strtolower($event['strEvent'] ?? '');
+            if ($eventName === '') {
+                continue;
+            }
+
+            $score = 0;
+
+            // Token-based title matching: check how many words of the event name
+            // appear in the programme title (or vice versa)
+            $eventTokens = preg_split('/[\s\-_vs\.]+/', $eventName, -1, PREG_SPLIT_NO_EMPTY);
+            $matchedTokens = 0;
+            foreach ($eventTokens as $token) {
+                if (mb_strlen($token) >= 3 && str_contains($progTitle, $token)) {
+                    $matchedTokens++;
+                }
+            }
+
+            if (count($eventTokens) > 0) {
+                $tokenScore = $matchedTokens / count($eventTokens);
+            } else {
+                $tokenScore = 0;
+            }
+
+            // Require at least 40% token overlap to consider this a possible match
+            if ($tokenScore < 0.4) {
+                continue;
+            }
+            $score += $tokenScore * 60;  // Up to 60 points for title match
+
+            // Time proximity scoring (if both have timestamps)
+            $eventTimestamp = $event['strTimestamp'] ?? $event['strTimeStamp'] ?? null;
+            $eventDate = $event['dateEvent'] ?? null;
+            $eventTime = $event['strTime'] ?? null;
+            if (! $eventTimestamp && $eventDate && $eventTime) {
+                $eventTimestamp = $eventDate . ' ' . $eventTime;
+            }
+
+            if ($progStart && $eventTimestamp) {
+                try {
+                    $progTime = Carbon::parse($progStart);
+                    $eventTimeCarbon = Carbon::parse($eventTimestamp);
+                    $diffMinutes = abs($progTime->diffInMinutes($eventTimeCarbon));
+
+                    if ($diffMinutes <= 60) {
+                        // Within 60 min window: 40 points at exact match, down to 0 at 60 min
+                        $score += 40 * (1 - $diffMinutes / 60);
+                    } else {
+                        // Too far apart — penalize heavily
+                        $score -= 20;
+                    }
+                } catch (\Throwable) {
+                    // Ignore parse errors
+                }
+            }
+
+            // Sport type bonus: if the event sport matches a keyword in the title
+            $sport = mb_strtolower($event['strSport'] ?? '');
+            if ($sport !== '' && str_contains($progTitle, $sport)) {
+                $score += 5;
+            }
+
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestMatch = $event;
+            }
+        }
+
+        // Only return if we have a reasonable confidence score
+        return $bestScore >= 50 ? $bestMatch : null;
+    }
+
+    /**
+     * Enrich a programme with TheSportsDB event data.
+     *
+     * @return array{changed: bool, poster: bool, description: bool}
+     */
+    private function enrichFromSportsDb(
+        array &$programme,
+        array $event,
+        bool $overwrite,
+        bool $enrichPosters,
+        bool $enrichBackdrops,
+        bool $enrichDescriptions,
+    ): array {
+        $result = ['changed' => false, 'poster' => false, 'description' => false];
+
+        // Artwork enrichment
+        $posterUrl = $event['strEventThumb'] ?? $event['strEventPoster'] ?? $event['strThumb'] ?? null;
+        $bannerUrl = $event['strEventBanner'] ?? null;
+
+        $hasIcon = ! empty($programme['icon']);
+
+        if ($enrichPosters && $posterUrl && ($overwrite || ! $hasIcon)) {
+            $programme['icon'] = $posterUrl;
+            $result['poster'] = true;
+            $result['changed'] = true;
+        }
+
+        if ($enrichBackdrops && $bannerUrl) {
+            $existingUrls = array_column($programme['images'] ?? [], 'url');
+            if (! in_array($bannerUrl, $existingUrls, true)) {
+                $programme['images'][] = [
+                    'url' => $bannerUrl,
+                    'type' => 'backdrop',
+                    'width' => 1920,
+                    'height' => 1080,
+                    'orient' => 'L',
+                    'size' => 3,
+                ];
+                $result['changed'] = true;
+            }
+        }
+
+        if ($enrichPosters && $posterUrl) {
+            $existingUrls = array_column($programme['images'] ?? [], 'url');
+            if (! in_array($posterUrl, $existingUrls, true)) {
+                $programme['images'][] = [
+                    'url' => $posterUrl,
+                    'type' => 'poster',
+                    'width' => 500,
+                    'height' => 750,
+                    'orient' => 'P',
+                    'size' => 2,
+                ];
+                $result['changed'] = true;
+            }
+        }
+
+        // Description enrichment — build from event metadata
+        $hasDesc = ! empty($programme['desc']);
+        if ($enrichDescriptions && ($overwrite || ! $hasDesc)) {
+            $parts = [];
+            $eventName = $event['strEvent'] ?? '';
+            $sport = $event['strSport'] ?? '';
+            $league = $event['strLeague'] ?? '';
+            $season = $event['strSeason'] ?? '';
+            $venue = $event['strVenue'] ?? '';
+
+            if ($sport !== '') {
+                $parts[] = $sport;
+            }
+            if ($league !== '') {
+                $parts[] = $league;
+            }
+            if ($season !== '') {
+                $parts[] = "Season {$season}";
+            }
+            if ($venue !== '') {
+                $parts[] = $venue;
+            }
+
+            if (! empty($parts)) {
+                $programme['desc'] = implode(' · ', $parts);
+                $result['description'] = true;
+                $result['changed'] = true;
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -922,7 +1444,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'overwrite_existing' => $settings['overwrite_existing'] ?? false,
             'enrich_categories' => $settings['enrich_categories'] ?? true,
             'enrich_descriptions' => $settings['enrich_descriptions'] ?? true,
+            'enrich_posters' => $settings['enrich_posters'] ?? true,
+            'enrich_backdrops' => $settings['enrich_backdrops'] ?? true,
             'map_emby_genres' => $settings['map_emby_genres'] ?? false,
+            'keyword_category_detection' => $settings['keyword_category_detection'] ?? true,
+            'enrich_sports_events' => $settings['enrich_sports_events'] ?? false,
+            'sportsdb_api_key' => $settings['sportsdb_api_key'] ?? '',
+            'sportsdb_country' => $settings['sportsdb_country'] ?? '',
             'tmdb_language' => $settings['tmdb_language'] ?? '',
         ];
 
