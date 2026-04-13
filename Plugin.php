@@ -809,50 +809,67 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return $result;
         }
 
-        // Normalize title for cache key
-        $cacheKey = $this->normalizeCacheKey($title);
+        // ── Keyword detection BEFORE TMDB ──────────────────────────────
+        // Detect category from title keywords first (Sports, News, Kids, Documentary).
+        // This prevents unnecessary TMDB lookups for live sports, news, etc. and avoids
+        // wrong matches like "ALL IN - Die Bundesliga Highlight Show" → film "All In".
+        $keywordCategory = null;
+        if ($keywordDetection && $mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory)) {
+            $keywordCategory = $this->detectCategoryFromTitle($title);
+            if ($keywordCategory !== null) {
+                $programme['category'] = $keywordCategory;
+                $result['category'] = true;
+                $result['changed'] = true;
+            }
+        }
 
-        // Check TMDB lookup cache
-        if (isset($cache[$cacheKey])) {
+        // If keyword detection identified a non-media category (Sports, News),
+        // skip TMDB lookup entirely — these are live broadcasts, not TMDB content.
+        if ($keywordCategory !== null && in_array($keywordCategory, ['Sports', 'News'], true)) {
+            return $result;
+        }
+
+        // ── Extract base title ─────────────────────────────────────────
+        // EPG titles are often "Series Name - Episode Title" or "Show: Subtitle".
+        // Extract the base show name for fallback TMDB search.
+        $baseTitle = $this->extractBaseTitle($title);
+        $fullCacheKey = $this->normalizeCacheKey($title);
+        $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle) : null;
+
+        // Check TMDB lookup cache — try full title first, then base title
+        if (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
-            $tmdbData = $cache[$cacheKey];
+            $tmdbData = $cache[$fullCacheKey];
+        } elseif ($baseCacheKey !== null && isset($cache[$baseCacheKey])) {
+            $result['cache_hit'] = true;
+            $tmdbData = $cache[$baseCacheKey];
+            $cache[$fullCacheKey] = $tmdbData; // Promote to full key for faster hits
         } else {
-            // Search TV series first (EPG data is primarily TV content), then fall back to movies
             $result['lookup'] = true;
 
-            $tmdbData = $tmdb->searchTvSeries($title);
-            if ($tmdbData && ($tmdbData['tmdb_id'] ?? null)) {
-                $details = $tmdb->getTvSeriesDetails($tmdbData['tmdb_id']);
-                if ($details) {
-                    $tmdbData = array_merge($tmdbData, $details);
-                }
-                $tmdbData['_media_type'] = 'tv';
-            } else {
-                $tmdbData = $tmdb->searchMovie($title, tryFallback: true);
-                if ($tmdbData && ($tmdbData['tmdb_id'] ?? null)) {
-                    $details = $tmdb->getMovieDetails($tmdbData['tmdb_id']);
-                    if ($details) {
-                        $tmdbData = array_merge($tmdbData, $details);
-                    }
-                    $tmdbData['_media_type'] = 'movie';
-                }
+            // Strategy: try full title first (handles compound names like "CSI: Miami",
+            // "NCIS: Los Angeles"), then fall back to base title if validation fails.
+            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title);
+            $matchedViaBase = false;
+
+            if (! $tmdbData && $baseTitle !== $title) {
+                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle);
+                $matchedViaBase = $tmdbData !== null;
             }
 
-            // Cache the result (even if null - avoids re-lookups)
-            $cache[$cacheKey] = $tmdbData;
+            // Cache under full title key
+            $cache[$fullCacheKey] = $tmdbData;
+
+            // If the match came via the base title, also cache under base key
+            // so other episodes of the same show benefit from the cache.
+            // e.g. "Sturm der Liebe - Ep A" and "Sturm der Liebe - Ep B"
+            // both share the "sturm der liebe" base cache entry.
+            if ($matchedViaBase && $baseCacheKey !== null) {
+                $cache[$baseCacheKey] = $tmdbData;
+            }
         }
 
         if (! $tmdbData) {
-            // TMDB lookup failed — try keyword-based category detection from the title
-            if ($keywordDetection && $mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory)) {
-                $keywordCategory = $this->detectCategoryFromTitle($title);
-                if ($keywordCategory !== null) {
-                    $programme['category'] = $keywordCategory;
-                    $result['category'] = true;
-                    $result['changed'] = true;
-                }
-            }
-
             return $result;
         }
 
@@ -1036,10 +1053,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $key = mb_strtolower(trim($title));
         // Strip common suffixes like "(2024)", year patterns
         $key = preg_replace('/\s*\(\d{4}\)\s*$/', '', $key);
+        // Strip episode numbers like "S01E03", "(12)", "Folge 5"
+        $key = preg_replace('/\s*s\d{1,2}e\d{1,2}\s*/i', '', $key);
+        $key = preg_replace('/\s*\(\d{1,4}\)\s*/', '', $key);
+        $key = preg_replace('/\s*(?:folge|episode|ep\.?)\s*\d+\s*/i', '', $key);
         // Collapse whitespace
         $key = preg_replace('/\s+/', ' ', $key);
 
-        return $key;
+        return trim($key);
     }
 
     /**
@@ -1114,6 +1135,201 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         // Last resort: return the first genre as-is
         return $genreList[0] ?? $genres;
+    }
+
+    /**
+     * Extract the base series/show name from an EPG title.
+     *
+     * EPG titles commonly include episode information after a separator:
+     *   "Sturm der Liebe - Mysteriöse Botschaft"  → "Sturm der Liebe"
+     *   "Grand Hotel - Aufgeflogen"                → "Grand Hotel"
+     *   "Tatort: Schwarze Stunden"                 → "Tatort"
+     *   "Familie Dr. Kleist - Folge 42"            → "Familie Dr. Kleist"
+     *
+     * Compound show names like "CSI: Miami" or "NCIS: Los Angeles" are handled
+     * by the caller: the full title is searched at TMDB first and only if
+     * validation fails does the base title get tried.
+     */
+    private function extractBaseTitle(string $title): string
+    {
+        $title = trim($title);
+
+        // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
+        $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', $title);
+        $cleaned = preg_replace('/\s*S\d{1,2}E\d{1,2}\s*$/i', '', $cleaned);
+        $cleaned = preg_replace('/\s*[-–—]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
+        $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
+        $cleaned = rtrim(trim($cleaned), '-–— ');
+
+        // Split at " - " / " – " / " — " (most common EPG episode separator)
+        if (preg_match('/^(.{2,}?)\s+[-–—]\s+(.+)$/u', $cleaned, $m)) {
+            return trim($m[1]);
+        }
+
+        // Split at ": " when right part is long (episode subtitle, not abbreviation like "LA")
+        if (preg_match('/^(.{2,}?):\s+(.{8,})$/u', $cleaned, $m)) {
+            return trim($m[1]);
+        }
+
+        return $cleaned;
+    }
+
+    /**
+     * Search TMDB for a title with result validation.
+     *
+     * Searches TV series first, then movies. Validates that the returned title
+     * actually matches what we searched for (prevents "Sturm der Liebe" → "Fanaa").
+     *
+     * @return array|null  TMDB data with '_media_type' set, or null if no good match
+     */
+    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle): ?array
+    {
+        $searchNorm = mb_strtolower(trim($searchTitle));
+
+        // Try TV series first (EPG = primarily TV content)
+        $tvResult = $tmdb->searchTvSeries($searchTitle);
+        if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
+            $tmdbTitle = $tvResult['title'] ?? $tvResult['name'] ?? '';
+            if ($this->titleMatchScore($searchNorm, $tmdbTitle) >= 0.5) {
+                $details = $tmdb->getTvSeriesDetails($tvResult['tmdb_id']);
+                if ($details) {
+                    $tvResult = array_merge($tvResult, $details);
+                }
+                $tvResult['_media_type'] = 'tv';
+
+                return $tvResult;
+            }
+        }
+
+        // Try movie search
+        $movieResult = $tmdb->searchMovie($searchTitle, tryFallback: true);
+        if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
+            $tmdbTitle = $movieResult['title'] ?? $movieResult['name'] ?? '';
+            if ($this->titleMatchScore($searchNorm, $tmdbTitle) >= 0.5) {
+                $details = $tmdb->getMovieDetails($movieResult['tmdb_id']);
+                if ($details) {
+                    $movieResult = array_merge($movieResult, $details);
+                }
+                $movieResult['_media_type'] = 'movie';
+
+                return $movieResult;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Compute a similarity score (0.0–1.0) between an EPG search title and a TMDB result title.
+     *
+     * Uses multiple strategies to handle real-world mismatches:
+     *   - Exact match (after normalization)
+     *   - Containment (one title contains the other)
+     *   - Token overlap (word-by-word matching)
+     *   - Levenshtein distance for short titles
+     *
+     * Examples:
+     *   "sturm der liebe"  vs "Sturm der Liebe"  → 1.0  (exact)
+     *   "grand hotel"      vs "Gran Hotel"        → ~0.8 (levenshtein)
+     *   "sturm der liebe"  vs "Fanaa"             → ~0.0 (no match)
+     *   "tatort"           vs "Tatort"             → 1.0  (exact)
+     */
+    private function titleMatchScore(string $searchNorm, string $tmdbTitle): float
+    {
+        $tmdbNorm = mb_strtolower(trim($tmdbTitle));
+
+        if ($searchNorm === '' || $tmdbNorm === '') {
+            return 0.0;
+        }
+
+        // Exact match
+        if ($searchNorm === $tmdbNorm) {
+            return 1.0;
+        }
+
+        // Containment: one title fully contains the other as a substring.
+        // Only boost if the shorter string is a substantial portion of the longer one.
+        // This prevents "All In" (6 chars) matching inside "All In - Die Bundesliga Show" (38 chars)
+        // while allowing "Sturm der Liebe" (16) inside "Sturm der Liebe - Mysteriöse Botschaft" (39).
+        if (str_contains($tmdbNorm, $searchNorm) || str_contains($searchNorm, $tmdbNorm)) {
+            $ratio = min(mb_strlen($searchNorm), mb_strlen($tmdbNorm)) / max(mb_strlen($searchNorm), mb_strlen($tmdbNorm));
+            if ($ratio >= 0.3) {
+                return max(0.6, $ratio);
+            }
+            // Very short substring in very long title — fall through to token matching
+        }
+
+        // Bidirectional token overlap scoring.
+        // Forward: how many search tokens appear in the TMDB result?
+        // Reverse: how many TMDB tokens appear in the search title?
+        // Use the minimum — both sides must have reasonable coverage.
+        $searchTokens = preg_split('/[\s\-:.,]+/u', $searchNorm, -1, PREG_SPLIT_NO_EMPTY);
+        $tmdbTokens = preg_split('/[\s\-:.,]+/u', $tmdbNorm, -1, PREG_SPLIT_NO_EMPTY);
+
+        if (empty($searchTokens) || empty($tmdbTokens)) {
+            return 0.0;
+        }
+
+        $significantSearch = array_values(array_filter($searchTokens, fn ($t) => mb_strlen($t) >= 2));
+        $significantTmdb = array_values(array_filter($tmdbTokens, fn ($t) => mb_strlen($t) >= 2));
+
+        if (empty($significantSearch) || empty($significantTmdb)) {
+            return 0.0;
+        }
+
+        // Forward: search → TMDB
+        $forwardMatches = $this->countTokenMatches($significantSearch, $significantTmdb);
+        $forwardScore = $forwardMatches / count($significantSearch);
+
+        // Reverse: TMDB → search
+        $reverseMatches = $this->countTokenMatches($significantTmdb, $significantSearch);
+        $reverseScore = $reverseMatches / count($significantTmdb);
+
+        // The final score is the minimum of both directions.
+        // "grand hotel aufgeflogen" vs "The Grand Budapest Hotel":
+        //   forward 2/3=0.67, reverse 2/3=0.67 → 0.67 (but "budapest" unmatched in BOTH → suspicious)
+        //   We penalize further by also considering the ratio of total significant tokens.
+        $tokenScore = min($forwardScore, $reverseScore);
+
+        // For very short titles (1-2 words), also check overall Levenshtein
+        if (count($significantSearch) <= 2 && mb_strlen($searchNorm) <= 20 && mb_strlen($tmdbNorm) <= 30) {
+            $maxLen = max(mb_strlen($searchNorm), mb_strlen($tmdbNorm));
+            $dist = levenshtein($searchNorm, $tmdbNorm);
+            $levScore = 1.0 - ($dist / $maxLen);
+
+            return max($tokenScore, $levScore);
+        }
+
+        return $tokenScore;
+    }
+
+    /**
+     * Count how many tokens from $source have a match in $target (exact or fuzzy).
+     */
+    private function countTokenMatches(array $source, array $target): int
+    {
+        $matches = 0;
+        foreach ($source as $token) {
+            foreach ($target as $candidate) {
+                if ($token === $candidate) {
+                    $matches++;
+
+                    break;
+                }
+                // Fuzzy match for minor spelling differences across languages
+                // e.g. "grand" vs "gran", "hotel" vs "hôtel"
+                if (mb_strlen($token) >= 4 && mb_strlen($candidate) >= 4) {
+                    $maxLen = max(mb_strlen($token), mb_strlen($candidate));
+                    if (levenshtein($token, $candidate) <= max(1, (int) ($maxLen * 0.2))) {
+                        $matches++;
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $matches;
     }
 
     /**
