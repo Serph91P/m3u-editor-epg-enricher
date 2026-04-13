@@ -1,7 +1,7 @@
 {
     "id": "epg-enricher",
     "name": "EPG Enricher",
-    "version": "1.6.0",
+    "version": "1.7.1",
     "api_version": "1.0.0",
     "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Only processes channels that are mapped in your playlists, complementing existing Schedules Direct / Gracenote metadata where data is missing.",
     "repository": "Serph91P/m3u-editor-epg-enricher",

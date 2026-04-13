@@ -227,7 +227,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
-        $context->info("EPG cache generated (ID: {$epgId}). Running enrichment for playlist channels.");
+        $context->heartbeat("EPG cache generated (ID: {$epgId}). Running enrichment for playlist channels.");
 
         return $this->doEnrich($epgId, $playlistIds, $context);
     }
@@ -265,7 +265,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         $playlistIds = [$playlist->id];
         $totalChannels = $this->countTargetChannels($epgIds, $playlistIds);
-        $context->info("Starting EPG enrichment for playlist '{$playlist->name}' ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
+        $context->heartbeat("Starting EPG enrichment for playlist '{$playlist->name}' ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
 
         // Enrich each EPG source referenced by this playlist
         $combinedStats = [];
@@ -352,7 +352,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $tmdbLanguage = trim($settings['tmdb_language'] ?? '');
         if ($tmdb && $tmdbLanguage !== '') {
             $this->setTmdbLanguage($tmdb, $tmdbLanguage);
-            $context->info("Using TMDB search language: {$tmdbLanguage}");
+            $context->heartbeat("Using TMDB search language: {$tmdbLanguage}");
         }
 
         if (! $enrichTmdb) {
@@ -367,7 +367,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $storedLanguage = $tmdbCache['__language'] ?? null;
         $currentLanguage = $tmdbLanguage !== '' ? $tmdbLanguage : '__global';
         if ($storedLanguage !== null && $storedLanguage !== $currentLanguage) {
-            $context->info('TMDB language changed - clearing lookup cache for fresh results.');
+            $context->heartbeat('TMDB language changed - clearing lookup cache for fresh results.');
             $tmdbCache = [];
         }
         $tmdbCache['__language'] = $currentLanguage;
@@ -397,10 +397,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         // Invalidate all file states if settings or channels changed
         if ($storedSettingsHash !== null && $storedSettingsHash !== $settingsHash) {
-            $context->info('Settings changed since last enrichment - re-processing all files.');
+            $context->heartbeat('Settings changed since last enrichment - re-processing all files.');
             $fileStates = [];
         } elseif ($storedChannelsHash !== null && $storedChannelsHash !== $channelsHash) {
-            $context->info('Channel mappings changed since last enrichment - re-processing all files.');
+            $context->heartbeat('Channel mappings changed since last enrichment - re-processing all files.');
             $fileStates = [];
         }
 
