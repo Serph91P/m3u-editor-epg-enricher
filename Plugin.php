@@ -445,6 +445,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
 
             if (! Storage::disk('local')->exists($jsonlFile)) {
+                $context->info("Skipping {$dateStr} ({$dayIndex}/{$totalDays}) - file missing");
                 $context->heartbeat(
                     "Skipping {$dateStr} ({$dayIndex}/{$totalDays}) - file missing",
                     progress: (int) (($dayIndex / $totalDays) * 100)
@@ -464,6 +465,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             // Skip if current file matches either the original source or the enriched version
             if ($storedSourceHash !== null && ($currentHash === $storedSourceHash || $currentHash === $storedEnrichedHash)) {
                 // Source data unchanged since last enrichment - skip
+                $context->info("Skipping {$dateStr} ({$dayIndex}/{$totalDays}) - unchanged source data");
                 $context->heartbeat(
                     "Skipping {$dateStr} ({$dayIndex}/{$totalDays}) - unchanged source data",
                     progress: (int) (($dayIndex / $totalDays) * 100)
@@ -476,6 +478,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 continue;
             }
 
+            $context->info("Processing {$dateStr} ({$dayIndex}/{$totalDays})...");
             $context->heartbeat(
                 "Processing {$dateStr} ({$dayIndex}/{$totalDays})...",
                 progress: (int) (($dayIndex / $totalDays) * 100)
