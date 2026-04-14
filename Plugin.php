@@ -1144,8 +1144,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Try TV series first (EPG = primarily TV content)
         $tvResult = $tmdb->searchTvSeries($searchTitle);
         if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
-            $tmdbTitle = $tvResult['title'] ?? $tvResult['name'] ?? '';
-            if ($this->titleMatchScore($searchNorm, $tmdbTitle) >= 0.5) {
+            // Check against both the localized display name AND the original language name.
+            // When TMDB is configured with a non-English language (e.g. de-DE), the returned
+            // `name` may be the local title ("Typisch Familie" for "The Middle"), causing the
+            // match to fail even though TMDB correctly identified the TV show. Checking the
+            // `original_name` (always the show's native English title) prevents TV series from
+            // falling through to the movie search and being mislabelled as "Movie".
+            $tmdbLocalTitle = $tvResult['name'] ?? '';
+            $tmdbOriginalTitle = $tvResult['original_name'] ?? '';
+            $localScore = $this->titleMatchScore($searchNorm, $tmdbLocalTitle);
+            $originalScore = $tmdbOriginalTitle !== '' ? $this->titleMatchScore($searchNorm, $tmdbOriginalTitle) : 0.0;
+
+            if ($localScore >= 0.5 || $originalScore >= 0.5) {
                 $details = $tmdb->getTvSeriesDetails($tvResult['tmdb_id']);
                 if ($details) {
                     $tvResult = array_merge($tvResult, $details);
@@ -1159,8 +1169,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Try movie search
         $movieResult = $tmdb->searchMovie($searchTitle, tryFallback: true);
         if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
-            $tmdbTitle = $movieResult['title'] ?? $movieResult['name'] ?? '';
-            if ($this->titleMatchScore($searchNorm, $tmdbTitle) >= 0.5) {
+            $tmdbLocalTitle = $movieResult['title'] ?? '';
+            $tmdbOriginalTitle = $movieResult['original_title'] ?? '';
+            $localScore = $this->titleMatchScore($searchNorm, $tmdbLocalTitle);
+            $originalScore = $tmdbOriginalTitle !== '' ? $this->titleMatchScore($searchNorm, $tmdbOriginalTitle) : 0.0;
+
+            if ($localScore >= 0.5 || $originalScore >= 0.5) {
                 $details = $tmdb->getMovieDetails($movieResult['tmdb_id']);
                 if ($details) {
                     $movieResult = array_merge($movieResult, $details);
