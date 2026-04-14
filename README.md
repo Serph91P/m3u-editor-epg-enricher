@@ -44,6 +44,24 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 
 ## Version History
 
+### 1.9.0
+- **Breaking**: Removed TheSportsDB integration — SportsDB enrichment is now a separate plugin: [m3u-editor-epg-sportsdb](https://github.com/Serph91P/m3u-editor-epg-sportsdb)
+- Removed settings: "Enrich sport events from TheSportsDB", "TheSportsDB API key", "TheSportsDB country filter"
+
+### 1.8.1
+- Fixed confusing statistics: replaced "programmes skipped" with clearer "programmes processed", "programmes updated", "programmes already enriched"
+- Fixed duplicate log entries in Activity Stream
+- Fixed rename error when cache directory is removed during enrichment
+
+### 1.8.0
+- Added TheSportsDB integration for sport programme enrichment (now moved to separate plugin)
+- Added smart TMDB matching with title splitting and result validation
+- Added keyword-based category detection for Sports, News, Kids, Documentary
+
+### 1.7.0
+- Added configurable enrichment toggles for posters, backdrops, categories, descriptions
+- All enrichment features individually toggleable via boolean settings
+
 ### 1.6.0
 - Added playlist filter for auto-run: choose which playlists should be enriched automatically (leave empty for all)
 
