@@ -86,27 +86,6 @@
       "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to Emby EPG colors' is also enabled."
     },
     {
-      "id": "enrich_sports_events",
-      "type": "boolean",
-      "label": "Enrich sport events from TheSportsDB",
-      "default": false,
-      "helper_text": "Fetch artwork and event details from TheSportsDB for programmes detected as sports content. Requires an internet connection."
-    },
-    {
-      "id": "sportsdb_api_key",
-      "type": "text",
-      "label": "TheSportsDB API key",
-      "default": "",
-      "helper_text": "Your TheSportsDB premium API key for full TV schedule matching. Leave empty to use the free tier (limited to event-by-date matching)."
-    },
-    {
-      "id": "sportsdb_country",
-      "type": "text",
-      "label": "TheSportsDB country filter",
-      "default": "",
-      "helper_text": "Filter TheSportsDB TV schedule by country (e.g. 'Germany', 'United Kingdom'). Leave empty for all countries. Only used with a premium API key."
-    },
-    {
       "id": "auto_run_on_cache",
       "type": "boolean",
       "label": "Auto-run after EPG cache generation",

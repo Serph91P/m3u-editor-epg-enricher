@@ -12,7 +12,6 @@ use App\Plugins\Support\PluginActionResult;
 use App\Plugins\Support\PluginExecutionContext;
 use App\Services\EpgCacheService;
 use App\Services\TmdbService;
-use Carbon\Carbon;
 use Illuminate\Support\Facades\Storage;
 use ReflectionProperty;
 
@@ -334,9 +333,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $enrichBackdrops = $settings['enrich_backdrops'] ?? true;
         $mapEmbyGenres = $settings['map_emby_genres'] ?? false;
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
-        $enrichSportsEvents = $settings['enrich_sports_events'] ?? false;
-        $sportsDbApiKey = $settings['sportsdb_api_key'] ?? '';
-        $sportsDbCountry = $settings['sportsdb_country'] ?? '';
+
 
         // Load TMDB service if enrichment enabled
         $tmdb = null;
@@ -424,11 +421,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'channels_targeted' => count($targetChannelIds),
             'tmdb_lookups' => 0,
             'tmdb_cache_hits' => 0,
-            'sportsdb_matches' => 0,
-            'sportsdb_posters' => 0,
         ];
-
-        $sportsDbCache = [];
 
         $newFileStates = [];
 
@@ -500,10 +493,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $enrichBackdrops,
                 $mapEmbyGenres,
                 $keywordDetection,
-                $enrichSportsEvents,
-                $sportsDbApiKey,
-                $sportsDbCountry,
-                $sportsDbCache,
                 $context,
             );
 
@@ -515,9 +504,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $stats['descriptions_added'] += $result['descriptions'];
             $stats['tmdb_lookups'] += $result['lookups'];
             $stats['tmdb_cache_hits'] += $result['cache_hits'];
-            $stats['sportsdb_matches'] += $result['sportsdb_matches'];
-            $stats['sportsdb_posters'] += $result['sportsdb_posters'];
-
             if (! $result['modified']) {
                 $stats['days_unchanged']++;
             }
@@ -636,10 +622,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $enrichBackdrops,
         bool $mapEmbyGenres,
         bool $keywordDetection,
-        bool $enrichSportsEvents,
-        string $sportsDbApiKey,
-        string $sportsDbCountry,
-        array &$sportsDbCache,
         PluginExecutionContext $context,
     ): array {
         $result = [
@@ -651,19 +633,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'descriptions' => 0,
             'lookups' => 0,
             'cache_hits' => 0,
-            'sportsdb_matches' => 0,
-            'sportsdb_posters' => 0,
             'modified' => false,
         ];
-
-        // Pre-fetch TheSportsDB events for this date if sports enrichment is enabled
-        $sportsEvents = [];
-        if ($enrichSportsEvents) {
-            // Extract date from filename (programmes-YYYY-MM-DD.jsonl)
-            if (preg_match('/programmes-(\d{4}-\d{2}-\d{2})\.jsonl$/', $jsonlFile, $m)) {
-                $sportsEvents = $this->fetchSportsDbEventsForDate($m[1], $sportsDbApiKey, $sportsDbCountry, $sportsDbCache);
-            }
-        }
 
         $fullPath = Storage::disk('local')->path($jsonlFile);
         $targetSet = array_flip($targetChannelIds);
@@ -720,28 +691,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $result['descriptions'] += $enrichResult['description'] ? 1 : 0;
                 $result['lookups'] += $enrichResult['lookup'] ? 1 : 0;
                 $result['cache_hits'] += $enrichResult['cache_hit'] ? 1 : 0;
-
-                // TheSportsDB enrichment for sport programmes
-                if (! empty($sportsEvents) && ($programme['category'] ?? '') === 'Sports') {
-                    $matchedEvent = $this->matchSportsEvent($programme, $sportsEvents);
-                    if ($matchedEvent) {
-                        $sportsResult = $this->enrichFromSportsDb(
-                            $programme,
-                            $matchedEvent,
-                            $overwrite,
-                            $enrichPosters,
-                            $enrichBackdrops,
-                            $enrichDescriptions,
-                        );
-                        if ($sportsResult['changed']) {
-                            $result['modified'] = true;
-                            $result['sportsdb_matches']++;
-                            if ($sportsResult['poster']) {
-                                $result['sportsdb_posters']++;
-                            }
-                        }
-                    }
-                }
 
                 $enrichedLines[] = json_encode([
                     'channel' => $record['channel'],
@@ -992,19 +941,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
-        // TheSportsDB status
-        $settings = $context->settings;
-        $sportsEnabled = $settings['enrich_sports_events'] ?? false;
-        $sportsApiKey = $settings['sportsdb_api_key'] ?? '';
-        $sportsTier = $sportsEnabled
-            ? ($sportsApiKey !== '' ? 'premium' : 'free')
-            : 'disabled';
-
         return PluginActionResult::success('EPG Enricher plugin is healthy.', [
             'plugin_id' => 'epg-enricher',
             'tmdb_configured' => $tmdbConfigured,
             'tmdb_cache_entries' => $cacheEntries,
-            'sportsdb_status' => $sportsTier,
             'enrichment_state_epgs' => $trackedEpgs,
             'enrichment_state_files' => $trackedFiles,
             'last_enriched_at' => $lastEnrichedAt,
@@ -1368,260 +1308,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
-     * Fetch sport events from TheSportsDB for a given date.
-     * Results are cached per date in the sports-events cache file.
-     *
-     * For premium API keys, uses eventstv.php (returns channel info + up to 500 results).
-     * For free tier, uses eventsday.php (no channel info, limited results).
-     *
-     * @param  string  $date  Date in Y-m-d format
-     * @param  string  $apiKey  API key (empty = free tier key '123')
-     * @param  string  $country  Optional country filter for premium TV schedule
-     * @param  array<string, array>  $cache  Reference to in-memory cache
-     * @return list<array>  Array of event data
-     */
-    private function fetchSportsDbEventsForDate(
-        string $date,
-        string $apiKey,
-        string $country,
-        array &$cache,
-    ): array {
-        if (isset($cache[$date])) {
-            return $cache[$date];
-        }
-
-        $key = $apiKey !== '' ? $apiKey : '123';
-        $isPremium = $apiKey !== '';
-        $events = [];
-
-        try {
-            if ($isPremium) {
-                // Premium: use TV schedule endpoint (includes channel info)
-                $url = "https://www.thesportsdb.com/api/v1/json/{$key}/eventstv.php?d={$date}";
-                if ($country !== '') {
-                    $url .= '&a=' . urlencode(str_replace(' ', '_', $country));
-                }
-            } else {
-                // Free: use events-by-day endpoint (no channel info, 15 results)
-                $url = "https://www.thesportsdb.com/api/v1/json/{$key}/eventsday.php?d={$date}";
-            }
-
-            $response = @file_get_contents($url, false, stream_context_create([
-                'http' => [
-                    'timeout' => 10,
-                    'ignore_errors' => true,
-                    'header' => "Accept: application/json\r\n",
-                ],
-            ]));
-
-            if ($response !== false) {
-                $data = json_decode($response, true);
-                $eventList = $isPremium
-                    ? ($data['tvevents'] ?? [])
-                    : ($data['events'] ?? []);
-
-                if (is_array($eventList)) {
-                    $events = $eventList;
-                }
-            }
-        } catch (\Throwable) {
-            // Silently fail — sports enrichment is best-effort
-        }
-
-        $cache[$date] = $events;
-
-        return $events;
-    }
-
-    /**
-     * Match a sports programme to a TheSportsDB event.
-     *
-     * Uses fuzzy title matching combined with time-window overlap (±60 min).
-     * For premium users with channel data, also considers channel name similarity.
-     *
-     * @param  array  $programme  The EPG programme data
-     * @param  list<array>  $events  TheSportsDB events for the day
-     * @return array|null  The best matching event, or null
-     */
-    private function matchSportsEvent(array $programme, array $events): ?array
-    {
-        if (empty($events)) {
-            return null;
-        }
-
-        $progTitle = mb_strtolower($programme['title'] ?? '');
-        $progStart = $programme['start'] ?? null;
-
-        if ($progTitle === '') {
-            return null;
-        }
-
-        $bestMatch = null;
-        $bestScore = 0;
-
-        foreach ($events as $event) {
-            $eventName = mb_strtolower($event['strEvent'] ?? '');
-            if ($eventName === '') {
-                continue;
-            }
-
-            $score = 0;
-
-            // Token-based title matching: check how many words of the event name
-            // appear in the programme title (or vice versa)
-            $eventTokens = preg_split('/[\s\-_vs\.]+/', $eventName, -1, PREG_SPLIT_NO_EMPTY);
-            $matchedTokens = 0;
-            foreach ($eventTokens as $token) {
-                if (mb_strlen($token) >= 3 && str_contains($progTitle, $token)) {
-                    $matchedTokens++;
-                }
-            }
-
-            if (count($eventTokens) > 0) {
-                $tokenScore = $matchedTokens / count($eventTokens);
-            } else {
-                $tokenScore = 0;
-            }
-
-            // Require at least 40% token overlap to consider this a possible match
-            if ($tokenScore < 0.4) {
-                continue;
-            }
-            $score += $tokenScore * 60;  // Up to 60 points for title match
-
-            // Time proximity scoring (if both have timestamps)
-            $eventTimestamp = $event['strTimestamp'] ?? $event['strTimeStamp'] ?? null;
-            $eventDate = $event['dateEvent'] ?? null;
-            $eventTime = $event['strTime'] ?? null;
-            if (! $eventTimestamp && $eventDate && $eventTime) {
-                $eventTimestamp = $eventDate . ' ' . $eventTime;
-            }
-
-            if ($progStart && $eventTimestamp) {
-                try {
-                    $progTime = Carbon::parse($progStart);
-                    $eventTimeCarbon = Carbon::parse($eventTimestamp);
-                    $diffMinutes = abs($progTime->diffInMinutes($eventTimeCarbon));
-
-                    if ($diffMinutes <= 60) {
-                        // Within 60 min window: 40 points at exact match, down to 0 at 60 min
-                        $score += 40 * (1 - $diffMinutes / 60);
-                    } else {
-                        // Too far apart — penalize heavily
-                        $score -= 20;
-                    }
-                } catch (\Throwable) {
-                    // Ignore parse errors
-                }
-            }
-
-            // Sport type bonus: if the event sport matches a keyword in the title
-            $sport = mb_strtolower($event['strSport'] ?? '');
-            if ($sport !== '' && str_contains($progTitle, $sport)) {
-                $score += 5;
-            }
-
-            if ($score > $bestScore) {
-                $bestScore = $score;
-                $bestMatch = $event;
-            }
-        }
-
-        // Only return if we have a reasonable confidence score
-        return $bestScore >= 50 ? $bestMatch : null;
-    }
-
-    /**
-     * Enrich a programme with TheSportsDB event data.
-     *
-     * @return array{changed: bool, poster: bool, description: bool}
-     */
-    private function enrichFromSportsDb(
-        array &$programme,
-        array $event,
-        bool $overwrite,
-        bool $enrichPosters,
-        bool $enrichBackdrops,
-        bool $enrichDescriptions,
-    ): array {
-        $result = ['changed' => false, 'poster' => false, 'description' => false];
-
-        // Artwork enrichment
-        $posterUrl = $event['strEventThumb'] ?? $event['strEventPoster'] ?? $event['strThumb'] ?? null;
-        $bannerUrl = $event['strEventBanner'] ?? null;
-
-        $hasIcon = ! empty($programme['icon']);
-
-        if ($enrichPosters && $posterUrl && ($overwrite || ! $hasIcon)) {
-            $programme['icon'] = $posterUrl;
-            $result['poster'] = true;
-            $result['changed'] = true;
-        }
-
-        if ($enrichBackdrops && $bannerUrl) {
-            $existingUrls = array_column($programme['images'] ?? [], 'url');
-            if (! in_array($bannerUrl, $existingUrls, true)) {
-                $programme['images'][] = [
-                    'url' => $bannerUrl,
-                    'type' => 'backdrop',
-                    'width' => 1920,
-                    'height' => 1080,
-                    'orient' => 'L',
-                    'size' => 3,
-                ];
-                $result['changed'] = true;
-            }
-        }
-
-        if ($enrichPosters && $posterUrl) {
-            $existingUrls = array_column($programme['images'] ?? [], 'url');
-            if (! in_array($posterUrl, $existingUrls, true)) {
-                $programme['images'][] = [
-                    'url' => $posterUrl,
-                    'type' => 'poster',
-                    'width' => 500,
-                    'height' => 750,
-                    'orient' => 'P',
-                    'size' => 2,
-                ];
-                $result['changed'] = true;
-            }
-        }
-
-        // Description enrichment — build from event metadata
-        $hasDesc = ! empty($programme['desc']);
-        if ($enrichDescriptions && ($overwrite || ! $hasDesc)) {
-            $parts = [];
-            $eventName = $event['strEvent'] ?? '';
-            $sport = $event['strSport'] ?? '';
-            $league = $event['strLeague'] ?? '';
-            $season = $event['strSeason'] ?? '';
-            $venue = $event['strVenue'] ?? '';
-
-            if ($sport !== '') {
-                $parts[] = $sport;
-            }
-            if ($league !== '') {
-                $parts[] = $league;
-            }
-            if ($season !== '') {
-                $parts[] = "Season {$season}";
-            }
-            if ($venue !== '') {
-                $parts[] = $venue;
-            }
-
-            if (! empty($parts)) {
-                $programme['desc'] = implode(' · ', $parts);
-                $result['description'] = true;
-                $result['changed'] = true;
-            }
-        }
-
-        return $result;
-    }
-
-    /**
      * Override the TmdbService's protected language property via reflection.
      */
     private function setTmdbLanguage(TmdbService $tmdb, string $language): void
@@ -1675,9 +1361,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'enrich_backdrops' => $settings['enrich_backdrops'] ?? true,
             'map_emby_genres' => $settings['map_emby_genres'] ?? false,
             'keyword_category_detection' => $settings['keyword_category_detection'] ?? true,
-            'enrich_sports_events' => $settings['enrich_sports_events'] ?? false,
-            'sportsdb_api_key' => $settings['sportsdb_api_key'] ?? '',
-            'sportsdb_country' => $settings['sportsdb_country'] ?? '',
             'tmdb_language' => $settings['tmdb_language'] ?? '',
         ];
 
