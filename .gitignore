@@ -1,2 +1,7 @@
 *.zip
 *.sha256
+
+playlist.m3u
+streamtv.xml
+*.m3u
+*.xml
