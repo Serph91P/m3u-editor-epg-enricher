@@ -119,6 +119,25 @@
           "label": "Detect categories from title keywords",
           "default": true,
           "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to Emby EPG colors' is also enabled."
+        },
+        {
+          "id": "assume_series_when_episodic",
+          "type": "boolean",
+          "label": "Assume Series when episodic signals are present",
+          "default": true,
+          "helper_text": "When subtitle/episode signals indicate episodic TV but TMDB has no validated TV match, keep classification as Series to avoid Movie mislabels."
+        },
+        {
+          "id": "classifier_mode",
+          "type": "select",
+          "label": "Media-type classifier mode",
+          "default": "structural",
+          "options": {
+            "structural": "Structural (recommended) - derive Series/Movie from EPG signals + channel context",
+            "structural_strict": "Structural (strict) - never call TMDB for News/Sports/Kids detected from channel context",
+            "legacy": "Legacy - rely only on title keywords / curated franchise list"
+          },
+          "helper_text": "How to decide whether a programme is a series, movie, or non-media (News/Sports/Kids). 'Structural' uses language-independent EPG signals (subtitle, episode-num, runtime, repeat count, channel context) and works for any language. 'Legacy' uses the older keyword-based detection."
         }
       ]
     },

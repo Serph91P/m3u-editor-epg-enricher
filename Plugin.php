@@ -19,6 +19,27 @@ use ReflectionProperty;
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 {
     /**
+     * Per-run airing statistics keyed by normalized title.
+     * Populated by {@see buildAiringStats()} at the start of {@see doEnrich()}.
+     *
+     * @var array<string, array{count: int, min_runtime: int, max_runtime: int, channel_ids: array<int, string>}>
+     */
+    private array $airingStats = [];
+
+    /**
+     * Per-run channel context bias map keyed by EPG channel_id.
+     * Populated by {@see buildChannelContextMap()} at the start of {@see doEnrich()}.
+     *
+     * @var array<string, array{kids: float, sports: float, news: float, movies: float}>
+     */
+    private array $channelContextMap = [];
+
+    /**
+     * Active classifier mode for the current run: 'legacy' | 'structural' | 'structural_strict'.
+     */
+    private string $classifierMode = 'structural';
+
+    /**
      * Mapping of TMDB genre names (English + German) to Emby EPG categories.
      *
      * Emby supports 4 color-coded categories in the guide:
@@ -357,6 +378,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $mapEmbyGenres = $settings['map_emby_genres'] ?? false;
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
         $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
+        $assumeSeriesWhenEpisodic = $settings['assume_series_when_episodic'] ?? true;
+        $classifierMode = $settings['classifier_mode'] ?? 'structural';
+        if (! in_array($classifierMode, ['legacy', 'structural', 'structural_strict'], true)) {
+            $classifierMode = 'structural';
+        }
+        $this->classifierMode = $classifierMode;
 
 
         // Load TMDB service if enrichment enabled
@@ -429,11 +456,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $fileStates = [];
         }
 
-        $cacheDir = "epg-cache/{$epg->uuid}/v1";
+        $cacheVersion = $metadata['cache_version'] ?? 'v1';
+        $cacheDir = "epg-cache/{$epg->uuid}/{$cacheVersion}";
         $currentDate = Carbon::parse($minDate);
         $endDate = Carbon::parse($maxDate);
         $totalDays = $currentDate->diffInDays($endDate) + 1;
         $dayIndex = 0;
+
+        // ── Structural classifier prep ─────────────────────────────────
+        // Build per-run airing stats (cross-day repeat counts + runtime
+        // ranges) and channel-context biases. Skipped in legacy mode to
+        // keep behaviour identical to pre-classifier releases.
+        $this->airingStats = [];
+        $this->channelContextMap = [];
+        if ($this->classifierMode !== 'legacy') {
+            $context->heartbeat('Building airing-stats pre-pass for media classifier...');
+            $this->airingStats = $this->buildAiringStats(
+                $cacheDir,
+                $currentDate->copy(),
+                $endDate->copy(),
+                array_flip($targetChannelIds),
+            );
+            $this->channelContextMap = $this->buildChannelContextMap($epgId, $targetChannelIds);
+        }
 
         $stats = [
             'programmes_processed' => 0,
@@ -524,6 +569,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $mapEmbyGenres,
                 $keywordDetection,
                 $enrichEpisodeDetails,
+                $assumeSeriesWhenEpisodic,
                 $tmdbSeasonCache,
                 $context,
             );
@@ -656,6 +702,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $mapEmbyGenres,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
+        bool $assumeSeriesWhenEpisodic,
         array &$tmdbSeasonCache,
         PluginExecutionContext $context,
     ): array {
@@ -703,6 +750,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
                 $enrichResult = $this->enrichProgrammeFromTmdb(
                     $programme,
+                    (string) $record['channel'],
                     $tmdb,
                     $tmdbCache,
                     $overwrite,
@@ -713,6 +761,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $mapEmbyGenres,
                     $keywordDetection,
                     $enrichEpisodeDetails,
+                    $assumeSeriesWhenEpisodic,
                     $tmdbSeasonCache,
                 );
 
@@ -770,6 +819,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      */
     private function enrichProgrammeFromTmdb(
         array &$programme,
+        string $channelId,
         TmdbService $tmdb,
         array &$cache,
         bool $overwrite,
@@ -780,6 +830,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $mapEmbyGenres,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
+        bool $assumeSeriesWhenEpisodic,
         array &$tmdbSeasonCache,
     ): array {
         $result = [
@@ -805,9 +856,41 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         $wantsArtwork = $enrichPosters || $enrichBackdrops;
 
+        // ── Media-type detection ───────────────────────────────────────
+        // In structural modes the classifier derives type from EPG signals
+        // (subtitle, episode-num, runtime, repeat count, channel context)
+        // and is language-independent. Legacy mode preserves the old
+        // keyword-list behaviour for users who explicitly opt out.
+        $channelBias = $this->channelContextMap[$channelId] ?? ['kids' => 0.0, 'sports' => 0.0, 'news' => 0.0, 'movies' => 0.0];
         $seriesSignals = $this->detectSeriesSignals($programme);
-        $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
-        $isSeriesEpisode = $seriesSignals['is_series_episode'] || $hasEpisodicTitleKeyword;
+
+        if ($this->classifierMode === 'legacy') {
+            $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
+            $isSeriesEpisode = $seriesSignals['is_series_episode'] || $hasEpisodicTitleKeyword;
+            $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
+            $preferredMediaType = null;
+            $classificationType = $isSeriesEpisode ? 'tv' : 'unknown';
+            $classificationConfidence = $isSeriesEpisode ? 0.6 : 0.0;
+            $classifierOtherSubtype = null;
+            $classifierConfidentOther = false;
+        } else {
+            $classification = $this->classifyMediaType($programme, $existingCategory, $channelBias);
+            $isSeriesEpisode = $classification['type'] === 'tv' && $classification['confidence'] >= 0.5;
+            $forcedMediaType = match (true) {
+                $classification['type'] === 'tv' && $classification['confidence'] >= 0.7 => 'tv',
+                $classification['type'] === 'movie' && $classification['confidence'] >= 0.7 => 'movie',
+                default => null,
+            };
+            $preferredMediaType = in_array($classification['type'], ['tv', 'movie'], true)
+                && $classification['confidence'] >= 0.45
+                    ? $classification['type']
+                    : null;
+            $classificationType = $classification['type'];
+            $classificationConfidence = (float) $classification['confidence'];
+            $classifierOtherSubtype = $classification['type'] === 'other' ? $classification['subtype'] : null;
+            $classifierConfidentOther = $classifierOtherSubtype !== null && $classification['confidence'] >= 0.6;
+        }
+
         $isSeriesLikeCategory = in_array(mb_strtolower($existingCategory), ['series', 'kids'], true);
         $needsCategoryFix = $mapEmbyGenres
             && $enrichCategories
@@ -843,17 +926,51 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return $result;
         }
 
+        // ── Classifier-driven channel-context detection ───────────────
+        // When the title-keyword path didn't trigger but the structural
+        // classifier confidently identifies the programme as News/Sports
+        // based on channel context (e.g. KiKa, n-tv), apply the same
+        // category + skip-TMDB short-circuit. In structural_strict mode
+        // we also skip TMDB for confident Kids/Documentary classifications.
+        if ($classifierConfidentOther && $mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
+            $contextCategory = match ($classifierOtherSubtype) {
+                'news' => 'News',
+                'sports' => 'Sports',
+                'kids' => 'Kids',
+                'documentary' => 'Documentary',
+                default => null,
+            };
+            if ($contextCategory !== null && $keywordCategory === null) {
+                $programme['category'] = $contextCategory;
+                $result['category'] = true;
+                $result['changed'] = true;
+            }
+            if (in_array($classifierOtherSubtype, ['news', 'sports'], true)) {
+                return $result;
+            }
+            if ($this->classifierMode === 'structural_strict'
+                && in_array($classifierOtherSubtype, ['kids', 'documentary'], true)) {
+                return $result;
+            }
+        }
+
         // ── Extract base title ─────────────────────────────────────────
         // EPG titles are often "Series Name - Episode Title" or "Show: Subtitle".
         // Extract the base show name for fallback TMDB search.
         $baseTitle = $this->extractBaseTitle($title);
-        $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
         $cacheSuffix = $forcedMediaType ? "|{$forcedMediaType}" : '';
         $fullCacheKey = $this->normalizeCacheKey($title).$cacheSuffix;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).$cacheSuffix : null;
 
-        // Check TMDB lookup cache — try full title first, then base title
-        if (isset($cache[$fullCacheKey])) {
+        $tmdbData = $this->resolveTmdbByExternalUrls($tmdb, $programme);
+        if ($tmdbData !== null) {
+            $result['lookup'] = true;
+            $cache[$fullCacheKey] = $tmdbData;
+            if ($baseCacheKey !== null) {
+                $cache[$baseCacheKey] = $tmdbData;
+            }
+        } elseif (isset($cache[$fullCacheKey])) {
+            // Check TMDB lookup cache — try full title first, then base title
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
         } elseif ($baseCacheKey !== null && isset($cache[$baseCacheKey])) {
@@ -865,11 +982,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
-            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType);
+            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType, $preferredMediaType);
             $matchedViaBase = false;
 
             if (! $tmdbData && $baseTitle !== $title) {
-                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType);
+                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType, $preferredMediaType);
                 $matchedViaBase = $tmdbData !== null;
             }
 
@@ -886,10 +1003,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         if (! $tmdbData) {
-            if ($mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
-                $programme['category'] = 'Series';
-                $result['category'] = true;
-                $result['changed'] = true;
+            if ($assumeSeriesWhenEpisodic && $isSeriesEpisode) {
+                $syntheticTitle = trim($baseTitle !== '' ? $baseTitle : $title);
+                $tmdbData = [
+                    'name' => $syntheticTitle,
+                    'title' => $syntheticTitle,
+                    'overview' => '',
+                    'genres' => 'Series',
+                    '_media_type' => 'tv',
+                ];
+            }
+        }
+
+        if (! $tmdbData) {
+            if ($mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
+                if ($classificationType === 'tv' && $classificationConfidence >= 0.6) {
+                    $programme['category'] = 'Series';
+                    $result['category'] = true;
+                    $result['changed'] = true;
+                } elseif ($classificationType === 'movie' && $classificationConfidence >= 0.7) {
+                    $programme['category'] = 'Movie';
+                    $result['category'] = true;
+                    $result['changed'] = true;
+                }
             }
 
             return $result;
@@ -965,7 +1101,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Enrich description
         $overview = $tmdbData['overview'] ?? '';
 
-        if ($enrichEpisodeDetails && ($tmdbData['_media_type'] ?? null) === 'tv') {
+        if ($enrichEpisodeDetails
+            && ($tmdbData['_media_type'] ?? null) === 'tv'
+            && $seriesSignals['season'] !== null
+            && $seriesSignals['episode'] !== null
+            && trim((string) ($programme['subtitle'] ?? '')) !== '') {
             $episodeDetails = $this->resolveEpisodeDetails(
                 $tmdb,
                 $tmdbSeasonCache,
@@ -1053,12 +1193,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      */
     private function readMetadata(Epg $epg): ?array
     {
-        $path = "epg-cache/{$epg->uuid}/v1/metadata.json";
-        if (! Storage::disk('local')->exists($path)) {
-            return null;
+        $candidatePaths = [
+            "epg-cache/{$epg->uuid}/v2/metadata.json",
+            "epg-cache/{$epg->uuid}/v1/metadata.json",
+        ];
+
+        foreach ($candidatePaths as $path) {
+            if (! Storage::disk('local')->exists($path)) {
+                continue;
+            }
+
+            $metadata = json_decode(Storage::disk('local')->get($path), true);
+            if (is_array($metadata)) {
+                $metadata['cache_version'] = $metadata['cache_version'] ?? basename(dirname($path));
+
+                return $metadata;
+            }
         }
 
-        return json_decode(Storage::disk('local')->get($path), true);
+        return null;
     }
 
     /**
@@ -1253,6 +1406,126 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Resolve TMDB data via external IDs found in XMLTV url fields.
+     *
+     * This path is authoritative and language-independent:
+     * imdb/tvdb/tmdb IDs map directly to the correct entity type.
+     *
+     * @param  array<string, mixed>  $programme
+     * @return array<string, mixed>|null
+     */
+    private function resolveTmdbByExternalUrls(TmdbService $tmdb, array $programme): ?array
+    {
+        foreach ($this->extractExternalIdCandidates($programme) as $candidate) {
+            $match = $tmdb->findByExternalId($candidate['id'], $candidate['source']);
+            if (! is_array($match) || ! ($match['tmdb_id'] ?? null)) {
+                continue;
+            }
+
+            $mediaType = $match['_media_type'] ?? $candidate['media_hint'];
+            $tmdbId = (int) ($match['tmdb_id'] ?? 0);
+
+            if ($tmdbId > 0 && $mediaType === 'tv') {
+                $details = $tmdb->getTvSeriesDetails($tmdbId);
+                if (is_array($details)) {
+                    $match = array_merge($match, $details);
+                }
+            } elseif ($tmdbId > 0 && $mediaType === 'movie') {
+                $details = $tmdb->getMovieDetails($tmdbId);
+                if (is_array($details)) {
+                    $match = array_merge($match, $details);
+                }
+            }
+
+            if ($mediaType !== null) {
+                $match['_media_type'] = $mediaType;
+            }
+
+            return $match;
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract normalized external-id lookup candidates from XMLTV url fields.
+     *
+     * @param  array<string, mixed>  $programme
+     * @return array<int, array{source: string, id: string, media_hint: ?string}>
+     */
+    private function extractExternalIdCandidates(array $programme): array
+    {
+        $urls = $programme['urls'] ?? null;
+        if (! is_array($urls)) {
+            return [];
+        }
+
+        $candidates = [];
+        foreach ($urls as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $system = mb_strtolower(trim((string) ($row['system'] ?? '')));
+            $value = trim((string) ($row['value'] ?? ''));
+            if ($value === '') {
+                continue;
+            }
+
+            $source = null;
+            $id = null;
+            $mediaHint = null;
+
+            if (in_array($system, ['imdb', 'imdb_id'], true) || str_contains($value, 'imdb')) {
+                if (preg_match('/tt\d+/i', $value, $matches)) {
+                    $source = 'imdb_id';
+                    $id = mb_strtolower($matches[0]);
+                }
+            } elseif (in_array($system, ['tvdb', 'tvdb_id', 'thetvdb'], true) || str_contains($value, 'tvdb')) {
+                if (preg_match('/\d{3,}/', $value, $matches)) {
+                    $source = 'tvdb_id';
+                    $id = $matches[0];
+                }
+            } elseif (in_array($system, ['tmdb', 'tmdb_id', 'moviedb', 'themoviedb'], true)
+                || str_contains($value, 'themoviedb.org')
+                || str_contains($value, 'tmdb.org')) {
+                if (preg_match('#/(tv|movie)/(\d+)#i', $value, $matches)) {
+                    $source = 'tmdb_id';
+                    $id = $matches[2];
+                    $mediaHint = mb_strtolower($matches[1]) === 'tv' ? 'tv' : 'movie';
+                } elseif (preg_match('/^\d+$/', $value)) {
+                    $source = 'tmdb_id';
+                    $id = $value;
+                } elseif (preg_match('/\d{2,}/', $value, $matches)) {
+                    $source = 'tmdb_id';
+                    $id = $matches[0];
+                }
+            }
+
+            if ($source === null || $id === null) {
+                continue;
+            }
+
+            $dedupeKey = "{$source}:{$id}";
+            if (isset($candidates[$dedupeKey])) {
+                if (($candidates[$dedupeKey]['media_hint'] ?? null) === null && $mediaHint !== null) {
+                    $candidates[$dedupeKey]['media_hint'] = $mediaHint;
+                }
+
+                continue;
+            }
+
+            $candidates[$dedupeKey] = [
+                'source' => $source,
+                'id' => $id,
+                'media_hint' => $mediaHint,
+            ];
+        }
+
+        return array_values($candidates);
+    }
+
+    /**
      * Search TMDB for a title with result validation.
      *
      * Searches TV series first, then movies. Validates that the returned title
@@ -1260,7 +1533,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      *
      * @return array|null  TMDB data with '_media_type' set, or null if no good match
      */
-    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle, ?string $forceMediaType = null): ?array
+    private function searchTmdbWithValidation(
+        TmdbService $tmdb,
+        string $searchTitle,
+        ?string $forceMediaType = null,
+        ?string $preferredMediaType = null,
+    ): ?array
     {
         $searchNorm = mb_strtolower(trim($searchTitle));
 
@@ -1296,26 +1574,82 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return null;
         }
 
-        // Try movie search
-        $movieResult = $tmdb->searchMovie($searchTitle, tryFallback: true);
-        if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
-            $tmdbLocalTitle = $movieResult['title'] ?? '';
-            $tmdbOriginalTitle = $movieResult['original_title'] ?? '';
-            $localScore = $this->titleMatchScore($searchNorm, $tmdbLocalTitle);
-            $originalScore = $tmdbOriginalTitle !== '' ? $this->titleMatchScore($searchNorm, $tmdbOriginalTitle) : 0.0;
+        if ($forceMediaType !== 'tv') {
+            // Try movie search
+            $movieResult = $tmdb->searchMovie($searchTitle, tryFallback: true);
+            if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
+                $tmdbLocalTitle = $movieResult['title'] ?? '';
+                $tmdbOriginalTitle = $movieResult['original_title'] ?? '';
+                $localScore = $this->titleMatchScore($searchNorm, $tmdbLocalTitle);
+                $originalScore = $tmdbOriginalTitle !== '' ? $this->titleMatchScore($searchNorm, $tmdbOriginalTitle) : 0.0;
 
-            if ($localScore >= 0.5 || $originalScore >= 0.5) {
-                $details = $tmdb->getMovieDetails($movieResult['tmdb_id']);
-                if ($details) {
-                    $movieResult = array_merge($movieResult, $details);
+                if ($localScore >= 0.5 || $originalScore >= 0.5) {
+                    $details = $tmdb->getMovieDetails($movieResult['tmdb_id']);
+                    if ($details) {
+                        $movieResult = array_merge($movieResult, $details);
+                    }
+                    $movieResult['_media_type'] = 'movie';
+
+                    return $movieResult;
                 }
-                $movieResult['_media_type'] = 'movie';
-
-                return $movieResult;
             }
         }
 
-        return null;
+        // Last fallback: TMDB multi-search returns media_type directly and can
+        // resolve titles where separate tv/movie endpoints miss due to locale.
+        $multiResult = $tmdb->searchMulti($searchTitle);
+        if (! $multiResult || ! ($multiResult['tmdb_id'] ?? null)) {
+            return null;
+        }
+
+        $mediaType = $multiResult['_media_type'] ?? null;
+        if ($forceMediaType !== null && $mediaType !== $forceMediaType) {
+            return null;
+        }
+
+        if ($preferredMediaType !== null && $mediaType !== null && $mediaType !== $preferredMediaType) {
+            // Respect a soft preference only when the title match is weak.
+            $candidateTitle = $mediaType === 'tv'
+                ? (string) ($multiResult['name'] ?? '')
+                : (string) ($multiResult['title'] ?? '');
+            if ($this->titleMatchScore($searchNorm, $candidateTitle) < 0.7) {
+                return null;
+            }
+        }
+
+        $tmdbLocalTitle = $mediaType === 'tv'
+            ? (string) ($multiResult['name'] ?? '')
+            : (string) ($multiResult['title'] ?? '');
+        $tmdbOriginalTitle = $mediaType === 'tv'
+            ? (string) ($multiResult['original_name'] ?? '')
+            : (string) ($multiResult['original_title'] ?? '');
+        $localScore = $this->titleMatchScore($searchNorm, $tmdbLocalTitle);
+        $originalScore = $tmdbOriginalTitle !== '' ? $this->titleMatchScore($searchNorm, $tmdbOriginalTitle) : 0.0;
+        if ($localScore < 0.5 && $originalScore < 0.5) {
+            return null;
+        }
+
+        $tmdbId = (int) ($multiResult['tmdb_id'] ?? 0);
+        if ($tmdbId > 0) {
+            if ($mediaType === 'tv') {
+                $details = $tmdb->getTvSeriesDetails($tmdbId);
+                if (is_array($details)) {
+                    $multiResult = array_merge($multiResult, $details);
+                }
+            } elseif ($mediaType === 'movie') {
+                $details = $tmdb->getMovieDetails($tmdbId);
+                if (is_array($details)) {
+                    $multiResult = array_merge($multiResult, $details);
+                }
+            }
+        }
+
+        if ($mediaType === null) {
+            $mediaType = isset($multiResult['name']) ? 'tv' : 'movie';
+        }
+        $multiResult['_media_type'] = $mediaType;
+
+        return $multiResult;
     }
 
     /**
@@ -1463,21 +1797,24 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     private function detectSeriesSignals(array $programme): array
     {
         $subtitle = trim((string) ($programme['subtitle'] ?? ''));
-        $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
-
-        [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+        $episodeSignals = $this->extractEpisodeSignals($programme);
+        $season = $episodeSignals['season'];
+        $episode = $episodeSignals['episode'];
+        $isNew = (bool) ($programme['new'] ?? false);
 
         $hasSubtitle = $subtitle !== '';
-        $hasParsedEpisode = $season !== null || $episode !== null;
-        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH|MV|SP)\d+/i', $episodeNum);
+        $hasParsedEpisode = $episodeSignals['has_parsed'];
+        $hasEpisodicProviderId = $episodeSignals['has_episodic_provider_id'];
 
-        $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
+        $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId || $isNew;
 
         $confidence = 'none';
         if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId)) {
             $confidence = 'high';
-        } elseif ($isSeriesEpisode) {
+        } elseif ($hasParsedEpisode || $hasEpisodicProviderId) {
             $confidence = 'medium';
+        } elseif ($hasSubtitle || $isNew) {
+            $confidence = 'low';
         }
 
         return [
@@ -1522,6 +1859,120 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return [null, null];
+    }
+
+    /**
+     * Extract normalized episode signals from both legacy episode_num and
+     * structured episode_nums entries captured from XMLTV.
+     *
+     * @param  array<string, mixed>  $programme
+    * @return array{season: int|null, episode: int|null, has_any: bool, has_parsed: bool, has_episodic_provider_id: bool, has_movie_provider_id: bool, has_xmltv_ns: bool}
+     */
+    private function extractEpisodeSignals(array $programme): array
+    {
+        $candidates = [];
+
+        $primaryEpisodeNum = trim((string) ($programme['episode_num'] ?? ''));
+        if ($primaryEpisodeNum !== '') {
+            $candidates[] = ['system' => '', 'value' => $primaryEpisodeNum];
+        }
+
+        $episodeNums = $programme['episode_nums'] ?? null;
+        if (is_array($episodeNums)) {
+            foreach ($episodeNums as $episodeRow) {
+                if (! is_array($episodeRow)) {
+                    continue;
+                }
+
+                $value = trim((string) ($episodeRow['value'] ?? ''));
+                if ($value === '') {
+                    continue;
+                }
+
+                $system = mb_strtolower(trim((string) ($episodeRow['system'] ?? '')));
+                $candidates[] = ['system' => $system, 'value' => $value];
+            }
+        }
+
+        if (empty($candidates)) {
+            return [
+                'season' => null,
+                'episode' => null,
+                'has_any' => false,
+                'has_parsed' => false,
+                'has_episodic_provider_id' => false,
+                'has_movie_provider_id' => false,
+                'has_xmltv_ns' => false,
+            ];
+        }
+
+        $bestSeason = null;
+        $bestEpisode = null;
+        $bestScore = -1;
+        $hasParsed = false;
+        $hasEpisodicProviderId = false;
+        $hasMovieProviderId = false;
+        $hasXmltvNs = false;
+        $seen = [];
+
+        foreach ($candidates as $candidate) {
+            $system = mb_strtolower(trim((string) ($candidate['system'] ?? '')));
+            $value = trim((string) ($candidate['value'] ?? ''));
+
+            if ($value === '') {
+                continue;
+            }
+
+            $dedupeKey = "{$system}|{$value}";
+            if (isset($seen[$dedupeKey])) {
+                continue;
+            }
+            $seen[$dedupeKey] = true;
+
+            if ($system === 'xmltv_ns') {
+                $hasXmltvNs = true;
+            }
+            if (preg_match('/^(EP|SH)\d+/i', $value)) {
+                $hasEpisodicProviderId = true;
+            }
+            if (preg_match('/^MV\d+/i', $value)) {
+                $hasMovieProviderId = true;
+            }
+
+            [$season, $episode] = $this->parseSeasonEpisode($value);
+            if ($season === null && $episode === null) {
+                continue;
+            }
+
+            $hasParsed = true;
+
+            $score = 0;
+            if ($season !== null) {
+                $score += 1;
+            }
+            if ($episode !== null) {
+                $score += 2;
+            }
+            if ($system === 'xmltv_ns') {
+                $score += 2;
+            }
+
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestSeason = $season;
+                $bestEpisode = $episode;
+            }
+        }
+
+        return [
+            'season' => $bestSeason,
+            'episode' => $bestEpisode,
+            'has_any' => true,
+            'has_parsed' => $hasParsed,
+            'has_episodic_provider_id' => $hasEpisodicProviderId,
+            'has_movie_provider_id' => $hasMovieProviderId,
+            'has_xmltv_ns' => $hasXmltvNs,
+        ];
     }
 
     /**
@@ -1642,6 +2093,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'map_emby_genres' => $settings['map_emby_genres'] ?? false,
             'keyword_category_detection' => $settings['keyword_category_detection'] ?? true,
             'enrich_episode_details' => $settings['enrich_episode_details'] ?? true,
+            'assume_series_when_episodic' => $settings['assume_series_when_episodic'] ?? true,
+            'classifier_mode' => $settings['classifier_mode'] ?? 'structural',
             'tmdb_language' => $settings['tmdb_language'] ?? '',
         ];
 
@@ -1659,6 +2112,329 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         sort($sorted);
 
         return md5(json_encode($sorted));
+    }
+
+    /**
+     * Classify a programme into a media-type bucket using language-independent
+     * structural EPG signals plus channel-context bias.
+     *
+     * Inputs (all optional):
+     *   - sub-title presence
+     *   - episode-num parseable (xmltv_ns / SxxExx / dd_progid / common)
+     *   - runtime in minutes
+     *   - cross-day airing repetition (from {@see $airingStats})
+     *   - channel display-name bias (from {@see $channelContextMap})
+     *   - existing source category (lightly weighted)
+     *
+     * @param  array<string, mixed>  $programme
+     * @param  array{kids: float, sports: float, news: float, movies: float}  $channelBias
+     * @return array{type: 'tv'|'movie'|'other'|'unknown', subtype: ?string, confidence: float, reasons: array<int, string>}
+     */
+    private function classifyMediaType(array $programme, string $existingCategory, array $channelBias): array
+    {
+        $subtitle = trim((string) ($programme['subtitle'] ?? ''));
+        $title = trim((string) ($programme['title'] ?? ''));
+
+        $episodeSignals = $this->extractEpisodeSignals($programme);
+        $hasSubtitle = $subtitle !== '';
+        $hasParsedEpisode = $episodeSignals['has_parsed'];
+        $hasEpisodicProviderId = $episodeSignals['has_episodic_provider_id'];
+        $hasMovieProviderId = $episodeSignals['has_movie_provider_id'];
+        $hasAnyEpisodeNum = $episodeSignals['has_any'];
+        $hasXmltvNs = $episodeSignals['has_xmltv_ns'];
+        $runtime = $this->computeRuntimeMinutes($programme);
+
+        $titleNorm = $this->normalizeCacheKey($title);
+        $airingStats = $this->airingStats[$titleNorm] ?? null;
+
+        $scoreSeries = 0.0;
+        $scoreMovie = 0.0;
+        $scoreOther = ['kids' => 0.0, 'sports' => 0.0, 'news' => 0.0, 'documentary' => 0.0];
+        $reasons = [];
+
+        if ($hasSubtitle) {
+            $scoreSeries += 0.30;
+            $reasons[] = 'subtitle';
+        }
+
+        if ($hasParsedEpisode) {
+            $scoreSeries += 0.45;
+            $reasons[] = 'episode-num parsed';
+        } elseif ($hasEpisodicProviderId) {
+            $scoreSeries += 0.40;
+            $reasons[] = 'episode-num provider id';
+        } elseif ($hasAnyEpisodeNum) {
+            $scoreSeries += 0.20;
+            $reasons[] = 'episode-num present';
+        }
+
+        if ($hasXmltvNs) {
+            $scoreSeries += 0.15;
+            $reasons[] = 'episode-num xmltv_ns';
+        }
+
+        if ($hasMovieProviderId) {
+            $scoreMovie += 0.35;
+            $reasons[] = 'episode-num movie id';
+        }
+
+        if ($this->classifierMode === 'structural_strict') {
+            $hasStrongEpisodicSignal = $hasSubtitle || $hasParsedEpisode || $hasXmltvNs;
+            if ($hasStrongEpisodicSignal && $scoreMovie > 0 && abs($scoreSeries - $scoreMovie) <= 0.35) {
+                $scoreSeries += 0.25;
+                $reasons[] = 'strict:episodic tie-break';
+            }
+        }
+
+        if ($runtime > 0 && $runtime <= 65) {
+            $scoreSeries += 0.20;
+            $reasons[] = "runtime {$runtime}min";
+        } elseif ($runtime >= 80 && $runtime <= 220) {
+            $scoreMovie += 0.30;
+            $reasons[] = "runtime {$runtime}min";
+        }
+
+        if ($airingStats !== null) {
+            $count = $airingStats['count'];
+            if ($count >= 5) {
+                $scoreSeries += 0.40;
+                $reasons[] = "airs {$count}x";
+            } elseif ($count >= 2) {
+                $scoreSeries += 0.20;
+                $reasons[] = "airs {$count}x";
+            } elseif ($count === 1 && $runtime >= 75) {
+                $scoreMovie += 0.20;
+                $reasons[] = 'single airing';
+            }
+        }
+
+        if ($channelBias['movies'] > 0) {
+            $scoreMovie += $channelBias['movies'];
+            $reasons[] = 'channel:movies';
+        }
+        foreach (['kids', 'sports', 'news'] as $bucket) {
+            if ($channelBias[$bucket] > 0) {
+                $scoreOther[$bucket] += $channelBias[$bucket];
+                $reasons[] = "channel:{$bucket}";
+            }
+        }
+
+        // Existing category hint (light weight; avoid feedback loops with our own writes)
+        $catLower = mb_strtolower($existingCategory);
+        if (in_array($catLower, ['series', 'serie', 'sitcom', 'soap', 'drama series', 'reality'], true)) {
+            $scoreSeries += 0.25;
+            $reasons[] = "category={$existingCategory}";
+        } elseif (in_array($catLower, ['film', 'spielfilm', 'feature film'], true)) {
+            $scoreMovie += 0.25;
+            $reasons[] = "category={$existingCategory}";
+        } elseif (in_array($catLower, ['news', 'nachrichten'], true)) {
+            $scoreOther['news'] += 0.40;
+            $reasons[] = "category={$existingCategory}";
+        } elseif (in_array($catLower, ['sports', 'sport'], true)) {
+            $scoreOther['sports'] += 0.40;
+            $reasons[] = "category={$existingCategory}";
+        } elseif (in_array($catLower, ['kids', 'kinder', 'children'], true)) {
+            $scoreOther['kids'] += 0.40;
+            $reasons[] = "category={$existingCategory}";
+        } elseif (in_array($catLower, ['documentary', 'dokumentation', 'dokumentarfilm'], true)) {
+            $scoreOther['documentary'] += 0.40;
+            $reasons[] = "category={$existingCategory}";
+        }
+
+        // Pick winner. "Other" wins only if it's both >=0.5 AND not dominated by series/movie evidence.
+        $maxOther = max($scoreOther);
+        $bestOther = (string) array_search($maxOther, $scoreOther, true);
+
+        if ($maxOther >= 0.5 && $maxOther >= $scoreSeries && $maxOther >= $scoreMovie) {
+            return [
+                'type' => 'other',
+                'subtype' => $bestOther,
+                'confidence' => min(1.0, $maxOther),
+                'reasons' => $reasons,
+            ];
+        }
+
+        if ($scoreSeries >= 0.6 && ($scoreSeries - $scoreMovie) >= 0.15) {
+            return ['type' => 'tv', 'subtype' => null, 'confidence' => min(1.0, $scoreSeries), 'reasons' => $reasons];
+        }
+        if ($scoreMovie >= 0.6 && ($scoreMovie - $scoreSeries) >= 0.15) {
+            return ['type' => 'movie', 'subtype' => null, 'confidence' => min(1.0, $scoreMovie), 'reasons' => $reasons];
+        }
+
+        // Soft lean — EPG is overwhelmingly TV; pick the leader at lower confidence
+        if ($scoreSeries > $scoreMovie && $scoreSeries > 0) {
+            return ['type' => 'tv', 'subtype' => null, 'confidence' => min(1.0, $scoreSeries), 'reasons' => $reasons];
+        }
+        if ($scoreMovie > $scoreSeries && $scoreMovie > 0) {
+            return ['type' => 'movie', 'subtype' => null, 'confidence' => min(1.0, $scoreMovie), 'reasons' => $reasons];
+        }
+
+        return ['type' => 'unknown', 'subtype' => null, 'confidence' => 0.0, 'reasons' => $reasons];
+    }
+
+    /**
+     * Pre-pass over all cached JSONL files in the EPG window to collect
+     * cross-day airing statistics keyed by normalized title.
+     *
+     * @param  array<string, int>  $targetSet  Flipped target channel id map
+     * @return array<string, array{count: int, min_runtime: int, max_runtime: int, channel_ids: array<int, string>}>
+     */
+    private function buildAiringStats(string $cacheDir, Carbon $start, Carbon $end, array $targetSet): array
+    {
+        $stats = [];
+        $current = $start->copy();
+
+        while ($current->lte($end)) {
+            $jsonlFile = "{$cacheDir}/programmes-{$current->format('Y-m-d')}.jsonl";
+            $current->addDay();
+
+            if (! Storage::disk('local')->exists($jsonlFile)) {
+                continue;
+            }
+
+            $fullPath = Storage::disk('local')->path($jsonlFile);
+            $handle = @fopen($fullPath, 'r');
+            if ($handle === false) {
+                continue;
+            }
+
+            while (($line = fgets($handle)) !== false) {
+                $line = trim($line);
+                if ($line === '') {
+                    continue;
+                }
+                $record = json_decode($line, true);
+                if (! is_array($record) || ! isset($record['channel'], $record['programme'])) {
+                    continue;
+                }
+                if (! isset($targetSet[$record['channel']])) {
+                    continue;
+                }
+                $title = trim((string) ($record['programme']['title'] ?? ''));
+                if ($title === '') {
+                    continue;
+                }
+                $key = $this->normalizeCacheKey($title);
+
+                if (! isset($stats[$key])) {
+                    $stats[$key] = [
+                        'count' => 0,
+                        'min_runtime' => PHP_INT_MAX,
+                        'max_runtime' => 0,
+                        'channel_ids' => [],
+                    ];
+                }
+                $stats[$key]['count']++;
+
+                $runtime = $this->computeRuntimeMinutes($record['programme']);
+                if ($runtime > 0) {
+                    $stats[$key]['min_runtime'] = min($stats[$key]['min_runtime'], $runtime);
+                    $stats[$key]['max_runtime'] = max($stats[$key]['max_runtime'], $runtime);
+                }
+                $stats[$key]['channel_ids'][$record['channel']] = true;
+            }
+
+            fclose($handle);
+        }
+
+        // Normalize sentinels and channel sets
+        foreach ($stats as $key => $entry) {
+            if ($entry['min_runtime'] === PHP_INT_MAX) {
+                $entry['min_runtime'] = 0;
+            }
+            $entry['channel_ids'] = array_keys($entry['channel_ids']);
+            $stats[$key] = $entry;
+        }
+
+        return $stats;
+    }
+
+    /**
+     * Build per-run channel-context bias map from EpgChannel display names.
+     * Uses a small list of universal cognate tokens (kids/sport/news/cinema)
+     * — short and language-agnostic, never show names.
+     *
+     * @param  array<int, string>  $targetChannelIds
+     * @return array<string, array{kids: float, sports: float, news: float, movies: float}>
+     */
+    private function buildChannelContextMap(int $epgId, array $targetChannelIds): array
+    {
+        if (empty($targetChannelIds)) {
+            return [];
+        }
+
+        $map = [];
+
+        EpgChannel::query()
+            ->where('epg_id', $epgId)
+            ->whereIn('channel_id', $targetChannelIds)
+            ->select(['channel_id', 'display_name'])
+            ->chunk(500, function ($chunk) use (&$map): void {
+                foreach ($chunk as $channel) {
+                    $name = mb_strtolower(trim((string) $channel->display_name));
+                    if ($name === '') {
+                        continue;
+                    }
+                    $map[(string) $channel->channel_id] = $this->deriveChannelBias($name);
+                }
+            });
+
+        return $map;
+    }
+
+    /**
+     * Derive a {kids, sports, news, movies} bias from a lowercased channel name
+     * using universal cognate tokens. Each matched bucket scores 0.40.
+     *
+     * @return array{kids: float, sports: float, news: float, movies: float}
+     */
+    private function deriveChannelBias(string $nameLower): array
+    {
+        $tokens = [
+            'kids' => ['kid', 'kinder', 'junior', 'cartoon', 'toon', 'disney', 'nick', 'baby', 'jeunesse', 'enfant', 'niñ'],
+            'sports' => ['sport', 'espn', 'eurosport', 'dazn', 'ufc', 'nfl', 'nba', 'mlb', 'nhl'],
+            'news' => ['news', 'nachricht', 'cnn', 'bbc news', 'ntv', 'n-tv', 'tagesschau', 'al jazeera', 'journal', 'noticias', 'noticia'],
+            'movies' => ['cinema', 'kino', 'hbo', 'cinemax', 'premiere', 'movie', 'movies', 'sundance', 'starz'],
+        ];
+
+        $bias = ['kids' => 0.0, 'sports' => 0.0, 'news' => 0.0, 'movies' => 0.0];
+        foreach ($tokens as $bucket => $list) {
+            foreach ($list as $token) {
+                if (str_contains($nameLower, $token)) {
+                    $bias[$bucket] = 0.40;
+
+                    break;
+                }
+            }
+        }
+
+        return $bias;
+    }
+
+    /**
+     * Compute programme runtime in minutes from XMLTV-style start/stop fields.
+     * Returns 0 when either is missing or unparseable.
+     */
+    private function computeRuntimeMinutes(array $programme): int
+    {
+        $start = $programme['start'] ?? null;
+        $stop = $programme['stop'] ?? null;
+        if (! $start || ! $stop) {
+            return 0;
+        }
+
+        try {
+            $startTs = Carbon::parse($start)->getTimestamp();
+            $stopTs = Carbon::parse($stop)->getTimestamp();
+        } catch (\Throwable) {
+            return 0;
+        }
+
+        if ($stopTs <= $startTs) {
+            return 0;
+        }
+
+        return (int) round(($stopTs - $startTs) / 60);
     }
 
     /**
