@@ -184,6 +184,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     ];
 
     /**
+     * Additional title keywords that strongly indicate episodic TV content.
+     *
+     * These are used as a tiebreaker to force TV-only TMDB lookup for
+     * commonly misclassified programme titles.
+     *
+     * @var list<string>
+     */
+    private const array EPISODIC_TITLE_KEYWORDS = [
+        'soko ',
+        'tatort',
+        'polizeiruf',
+        'watzmann ermittelt',
+        'in aller freundschaft',
+        'sturm der liebe',
+        'großstadtrevier',
+        'grossstadtrevier',
+        'rote rosen',
+        'gute zeiten schlechte zeiten',
+        'gzsz',
+    ];
+
+    /**
      * Handle manual actions triggered from the plugin UI.
      */
     public function runAction(string $action, array $payload, PluginExecutionContext $context): PluginActionResult
@@ -334,6 +356,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $enrichBackdrops = $settings['enrich_backdrops'] ?? true;
         $mapEmbyGenres = $settings['map_emby_genres'] ?? false;
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
+        $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
 
 
         // Load TMDB service if enrichment enabled
@@ -360,6 +383,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         // Load TMDB lookup cache from disk
         $tmdbCache = $this->loadTmdbCache();
+        $tmdbSeasonCache = $this->loadTmdbSeasonCache();
 
         // If language changed, the TMDB lookup cache contains results in the old
         // language. Clear it so titles are re-searched with the new language.
@@ -368,8 +392,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         if ($storedLanguage !== null && $storedLanguage !== $currentLanguage) {
             $context->heartbeat('TMDB language changed - clearing lookup cache for fresh results.');
             $tmdbCache = [];
+            $tmdbSeasonCache = [];
         }
         $tmdbCache['__language'] = $currentLanguage;
+        $tmdbSeasonCache['__language'] = $currentLanguage;
 
         // Read metadata to find date range
         $metadata = $this->readMetadata($epg);
@@ -497,6 +523,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $enrichBackdrops,
                 $mapEmbyGenres,
                 $keywordDetection,
+                $enrichEpisodeDetails,
+                $tmdbSeasonCache,
                 $context,
             );
 
@@ -535,6 +563,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         // Persist TMDB lookup cache
         $this->saveTmdbCache($tmdbCache);
+        $this->saveTmdbSeasonCache($tmdbSeasonCache);
 
         // Persist enrichment state
         $enrichmentState[$stateKey] = [
@@ -626,6 +655,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $enrichBackdrops,
         bool $mapEmbyGenres,
         bool $keywordDetection,
+        bool $enrichEpisodeDetails,
+        array &$tmdbSeasonCache,
         PluginExecutionContext $context,
     ): array {
         $result = [
@@ -681,6 +712,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $enrichBackdrops,
                     $mapEmbyGenres,
                     $keywordDetection,
+                    $enrichEpisodeDetails,
+                    $tmdbSeasonCache,
                 );
 
                 if ($enrichResult['changed']) {
@@ -746,6 +779,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $enrichBackdrops,
         bool $mapEmbyGenres,
         bool $keywordDetection,
+        bool $enrichEpisodeDetails,
+        array &$tmdbSeasonCache,
     ): array {
         $result = [
             'changed' => false,
@@ -766,10 +801,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $hasIcon = ! empty($programme['icon']);
         $hasCategory = ! empty($programme['category']);
         $hasDesc = ! empty($programme['desc']);
+        $existingCategory = trim((string) ($programme['category'] ?? ''));
 
         $wantsArtwork = $enrichPosters || $enrichBackdrops;
 
-        if (! $overwrite && (! $wantsArtwork || $hasIcon) && ($hasCategory || ! $enrichCategories) && ($hasDesc || ! $enrichDescriptions)) {
+        $seriesSignals = $this->detectSeriesSignals($programme);
+        $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
+        $isSeriesEpisode = $seriesSignals['is_series_episode'] || $hasEpisodicTitleKeyword;
+        $isSeriesLikeCategory = in_array(mb_strtolower($existingCategory), ['series', 'kids'], true);
+        $needsCategoryFix = $mapEmbyGenres
+            && $enrichCategories
+            && $hasCategory
+            && $isSeriesEpisode
+            && ! $isSeriesLikeCategory;
+
+        if (! $overwrite
+            && (! $wantsArtwork || $hasIcon)
+            && ($hasCategory || ! $enrichCategories)
+            && ($hasDesc || ! $enrichDescriptions)
+            && ! $needsCategoryFix) {
             return $result;
         }
 
@@ -778,7 +828,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // This prevents unnecessary TMDB lookups for live sports, news, etc. and avoids
         // wrong matches like "ALL IN - Die Bundesliga Highlight Show" → film "All In".
         $keywordCategory = null;
-        if ($keywordDetection && $mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory)) {
+        if ($keywordDetection && $mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
             $keywordCategory = $this->detectCategoryFromTitle($title);
             if ($keywordCategory !== null) {
                 $programme['category'] = $keywordCategory;
@@ -797,8 +847,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // EPG titles are often "Series Name - Episode Title" or "Show: Subtitle".
         // Extract the base show name for fallback TMDB search.
         $baseTitle = $this->extractBaseTitle($title);
-        $fullCacheKey = $this->normalizeCacheKey($title);
-        $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle) : null;
+        $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
+        $cacheSuffix = $forcedMediaType ? "|{$forcedMediaType}" : '';
+        $fullCacheKey = $this->normalizeCacheKey($title).$cacheSuffix;
+        $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).$cacheSuffix : null;
 
         // Check TMDB lookup cache — try full title first, then base title
         if (isset($cache[$fullCacheKey])) {
@@ -813,11 +865,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
-            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title);
+            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType);
             $matchedViaBase = false;
 
             if (! $tmdbData && $baseTitle !== $title) {
-                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle);
+                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType);
                 $matchedViaBase = $tmdbData !== null;
             }
 
@@ -834,6 +886,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         if (! $tmdbData) {
+            if ($mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
+                $programme['category'] = 'Series';
+                $result['category'] = true;
+                $result['changed'] = true;
+            }
+
             return $result;
         }
 
@@ -906,6 +964,40 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         // Enrich description
         $overview = $tmdbData['overview'] ?? '';
+
+        if ($enrichEpisodeDetails && ($tmdbData['_media_type'] ?? null) === 'tv') {
+            $episodeDetails = $this->resolveEpisodeDetails(
+                $tmdb,
+                $tmdbSeasonCache,
+                (int) ($tmdbData['tmdb_id'] ?? 0),
+                $seriesSignals['season'],
+                $seriesSignals['episode']
+            );
+
+            if ($episodeDetails) {
+                $episodeOverview = trim((string) ($episodeDetails['overview'] ?? ''));
+                if ($episodeOverview !== '') {
+                    $overview = $episodeOverview;
+                }
+
+                $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
+                if ($enrichBackdrops && $stillUrl !== '') {
+                    $existingUrls = array_column($programme['images'] ?? [], 'url');
+                    if (! in_array($stillUrl, $existingUrls, true)) {
+                        $programme['images'][] = [
+                            'url' => $stillUrl,
+                            'type' => 'screenshot',
+                            'width' => 1280,
+                            'height' => 720,
+                            'orient' => 'L',
+                            'size' => 2,
+                        ];
+                        $result['changed'] = true;
+                    }
+                }
+            }
+        }
+
         if ($enrichDescriptions && $overview !== '' && ($overwrite || ! $hasDesc)) {
             $programme['desc'] = $overview;
             $result['description'] = true;
@@ -987,6 +1079,23 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Load TMDB season lookup cache from disk.
+     *
+     * @return array<string, array|null>
+     */
+    private function loadTmdbSeasonCache(): array
+    {
+        $path = 'plugin-data/epg-enricher/tmdb-season-cache.json';
+        if (! Storage::disk('local')->exists($path)) {
+            return [];
+        }
+
+        $data = json_decode(Storage::disk('local')->get($path), true);
+
+        return is_array($data) ? $data : [];
+    }
+
+    /**
      * Save TMDB title lookup cache to disk.
      *
      * @param  array<string, array|null>  $cache
@@ -996,6 +1105,20 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
         Storage::disk('local')->put(
             'plugin-data/epg-enricher/tmdb-cache.json',
+            json_encode($cache, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
+        );
+    }
+
+    /**
+     * Save TMDB season lookup cache to disk.
+     *
+     * @param  array<string, array|null>  $cache
+     */
+    private function saveTmdbSeasonCache(array $cache): void
+    {
+        Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
+        Storage::disk('local')->put(
+            'plugin-data/epg-enricher/tmdb-season-cache.json',
             json_encode($cache, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
         );
     }
@@ -1137,33 +1260,40 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      *
      * @return array|null  TMDB data with '_media_type' set, or null if no good match
      */
-    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle): ?array
+    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle, ?string $forceMediaType = null): ?array
     {
         $searchNorm = mb_strtolower(trim($searchTitle));
 
-        // Try TV series first (EPG = primarily TV content)
-        $tvResult = $tmdb->searchTvSeries($searchTitle);
-        if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
-            // Check against both the localized display name AND the original language name.
-            // When TMDB is configured with a non-English language (e.g. de-DE), the returned
-            // `name` may be the local title ("Typisch Familie" for "The Middle"), causing the
-            // match to fail even though TMDB correctly identified the TV show. Checking the
-            // `original_name` (always the show's native English title) prevents TV series from
-            // falling through to the movie search and being mislabelled as "Movie".
-            $tmdbLocalTitle = $tvResult['name'] ?? '';
-            $tmdbOriginalTitle = $tvResult['original_name'] ?? '';
-            $localScore = $this->titleMatchScore($searchNorm, $tmdbLocalTitle);
-            $originalScore = $tmdbOriginalTitle !== '' ? $this->titleMatchScore($searchNorm, $tmdbOriginalTitle) : 0.0;
+        if ($forceMediaType !== 'movie') {
+            // Try TV series first (EPG = primarily TV content)
+            $tvResult = $tmdb->searchTvSeries($searchTitle);
+            if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
+                // Check against both the localized display name AND the original language name.
+                // When TMDB is configured with a non-English language (e.g. de-DE), the returned
+                // `name` may be the local title ("Typisch Familie" for "The Middle"), causing the
+                // match to fail even though TMDB correctly identified the TV show. Checking the
+                // `original_name` (always the show's native English title) prevents TV series from
+                // falling through to the movie search and being mislabelled as "Movie".
+                $tmdbLocalTitle = $tvResult['name'] ?? '';
+                $tmdbOriginalTitle = $tvResult['original_name'] ?? '';
+                $localScore = $this->titleMatchScore($searchNorm, $tmdbLocalTitle);
+                $originalScore = $tmdbOriginalTitle !== '' ? $this->titleMatchScore($searchNorm, $tmdbOriginalTitle) : 0.0;
 
-            if ($localScore >= 0.5 || $originalScore >= 0.5) {
-                $details = $tmdb->getTvSeriesDetails($tvResult['tmdb_id']);
-                if ($details) {
-                    $tvResult = array_merge($tvResult, $details);
+                if ($localScore >= 0.5 || $originalScore >= 0.5) {
+                    $details = $tmdb->getTvSeriesDetails($tvResult['tmdb_id']);
+                    if ($details) {
+                        $tvResult = array_merge($tvResult, $details);
+                    }
+                    $tvResult['_media_type'] = 'tv';
+
+                    return $tvResult;
                 }
-                $tvResult['_media_type'] = 'tv';
-
-                return $tvResult;
             }
+        }
+
+        // If this title is strongly episodic, do not fall back to movie search.
+        if ($forceMediaType === 'tv') {
+            return null;
         }
 
         // Try movie search
@@ -1326,6 +1456,138 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Detect whether a programme likely represents an episodic TV series.
+     *
+     * @return array{is_series_episode: bool, season: int|null, episode: int|null, confidence: string}
+     */
+    private function detectSeriesSignals(array $programme): array
+    {
+        $subtitle = trim((string) ($programme['subtitle'] ?? ''));
+        $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
+
+        [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+
+        $hasSubtitle = $subtitle !== '';
+        $hasParsedEpisode = $season !== null || $episode !== null;
+        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH|MV|SP)\d+/i', $episodeNum);
+
+        $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
+
+        $confidence = 'none';
+        if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId)) {
+            $confidence = 'high';
+        } elseif ($isSeriesEpisode) {
+            $confidence = 'medium';
+        }
+
+        return [
+            'is_series_episode' => $isSeriesEpisode,
+            'season' => $season,
+            'episode' => $episode,
+            'confidence' => $confidence,
+        ];
+    }
+
+    /**
+     * Parse season/episode numbers from common XMLTV episode formats.
+     *
+     * @return array{0: int|null, 1: int|null}
+     */
+    private function parseSeasonEpisode(string $episodeNum): array
+    {
+        $value = mb_strtolower(trim($episodeNum));
+        if ($value === '') {
+            return [null, null];
+        }
+
+        // xmltv_ns format: season.episode.part/total (zero-based season/episode)
+        if (preg_match('/^(\d+)\.(\d+)(?:\.\d+)?(?:\/\d+)?$/', $value, $m)) {
+            return [(int) $m[1] + 1, (int) $m[2] + 1];
+        }
+
+        // On-screen formats: S01E02, 1x02
+        if (preg_match('/s(\d{1,2})\s*e(\d{1,3})/i', $value, $m)) {
+            return [(int) $m[1], (int) $m[2]];
+        }
+        if (preg_match('/(\d{1,2})x(\d{1,3})/', $value, $m)) {
+            return [(int) $m[1], (int) $m[2]];
+        }
+
+        // Localized wording: Staffel 3 Folge 12 / Folge 12
+        if (preg_match('/staffel\s*(\d{1,2}).{0,12}(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/u', $value, $m)) {
+            return [(int) $m[1], (int) $m[2]];
+        }
+        if (preg_match('/(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/u', $value, $m)) {
+            return [null, (int) $m[1]];
+        }
+
+        return [null, null];
+    }
+
+    /**
+     * Detect known series-franchise keywords in programme titles.
+     */
+    private function hasEpisodicTitleKeyword(string $title): bool
+    {
+        $titleLower = mb_strtolower($title);
+
+        foreach (self::EPISODIC_TITLE_KEYWORDS as $keyword) {
+            if (str_contains($titleLower, $keyword)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Resolve episode details from TMDB by season/episode, using cached season payloads.
+     *
+     * @param  array<string, array|null>  $seasonCache
+     * @return array<string, mixed>|null
+     */
+    private function resolveEpisodeDetails(
+        TmdbService $tmdb,
+        array &$seasonCache,
+        int $tmdbId,
+        ?int $season,
+        ?int $episode,
+    ): ?array {
+        if ($tmdbId <= 0 || $season === null || $episode === null || $season <= 0 || $episode <= 0) {
+            return null;
+        }
+
+        $cacheKey = "{$tmdbId}:{$season}";
+        if (array_key_exists($cacheKey, $seasonCache)) {
+            $seasonData = $seasonCache[$cacheKey];
+        } else {
+            $seasonData = $tmdb->getSeasonDetails($tmdbId, $season);
+            $seasonCache[$cacheKey] = $seasonData;
+        }
+
+        if (! is_array($seasonData)) {
+            return null;
+        }
+
+        foreach (($seasonData['episodes'] ?? []) as $episodeData) {
+            if ((int) ($episodeData['episode_number'] ?? 0) !== $episode) {
+                continue;
+            }
+
+            $stillPath = trim((string) ($episodeData['still_path'] ?? ''));
+            if ($stillPath !== '' && ! str_starts_with($stillPath, 'http')) {
+                $stillPath = "https://image.tmdb.org/t/p/original{$stillPath}";
+            }
+
+            $episodeData['still_url'] = $stillPath;
+
+            return $episodeData;
+        }
+
+        return null;
+    }
+
+    /**
      * Override the TmdbService's protected language property via reflection.
      */
     private function setTmdbLanguage(TmdbService $tmdb, string $language): void
@@ -1379,6 +1641,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'enrich_backdrops' => $settings['enrich_backdrops'] ?? true,
             'map_emby_genres' => $settings['map_emby_genres'] ?? false,
             'keyword_category_detection' => $settings['keyword_category_detection'] ?? true,
+            'enrich_episode_details' => $settings['enrich_episode_details'] ?? true,
             'tmdb_language' => $settings['tmdb_language'] ?? '',
         ];
 
