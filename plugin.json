@@ -76,6 +76,13 @@
           "helper_text": "Fill in missing programme descriptions from TMDB."
         },
         {
+          "id": "enrich_episode_details",
+          "type": "boolean",
+          "label": "Use episode-level details for TV series",
+          "default": true,
+          "helper_text": "For episodic TV programmes with season/episode data, use TMDB episode overview and screenshots when available."
+        },
+        {
           "id": "enrich_posters",
           "type": "boolean",
           "label": "Enrich poster/icon artwork",
@@ -181,7 +188,8 @@
     ],
     "tables": [],
     "files": [
-      "plugin-data/epg-enricher/enrichment-state.json"
+      "plugin-data/epg-enricher/enrichment-state.json",
+      "plugin-data/epg-enricher/tmdb-season-cache.json"
     ],
     "default_cleanup_policy": "preserve"
   }
