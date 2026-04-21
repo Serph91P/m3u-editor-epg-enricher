@@ -1485,6 +1485,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
 
             $dedupeKey = "{$source}:{$id}";
+            if (isset($candidates[$dedupeKey])) {
+                if (($candidates[$dedupeKey]['media_hint'] ?? null) === null && $mediaHint !== null) {
+                    $candidates[$dedupeKey]['media_hint'] = $mediaHint;
+                }
+
+                continue;
+            }
+
             $candidates[$dedupeKey] = [
                 'source' => $source,
                 'id' => $id,

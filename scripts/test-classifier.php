@@ -45,6 +45,17 @@ namespace {
         }
     }
 
+    function findCandidate(array $candidates, string $source, string $id): ?array
+    {
+        foreach ($candidates as $candidate) {
+            if (($candidate['source'] ?? null) === $source && ($candidate['id'] ?? null) === $id) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
     function callPrivate(object $instance, string $method, mixed ...$args): mixed
     {
         $reflection = new \ReflectionClass($instance);
@@ -113,6 +124,41 @@ namespace {
     ], '', ['kids' => 0.0, 'sports' => 0.0, 'news' => 0.0, 'movies' => 0.3]);
 
     assertTrue($strictClassification['type'] === 'tv', 'Strict mode should flip close-score episodic titles to TV.');
+
+    // Regression: external-id extraction must recognize common imdb/tvdb/tmdb
+    // URL patterns and preserve TMDB media hints for tv/movie paths.
+    $externalIdProgramme = [
+        'urls' => [
+            ['system' => 'imdb', 'value' => 'https://www.imdb.com/title/tt0944947/?ref_=fn_al_tt_1'],
+            ['system' => 'imdb', 'value' => 'tt0944947'],
+            ['system' => 'thetvdb', 'value' => 'https://thetvdb.com/series/121361'],
+            ['system' => 'tmdb', 'value' => 'https://www.themoviedb.org/tv/1396-breaking-bad'],
+            ['system' => 'tmdb', 'value' => 'https://www.themoviedb.org/movie/603-the-matrix'],
+            ['system' => 'tmdb_id', 'value' => '603'],
+        ],
+    ];
+
+    $externalCandidates = callPrivate($plugin, 'extractExternalIdCandidates', $externalIdProgramme);
+
+    $imdbCandidate = findCandidate($externalCandidates, 'imdb_id', 'tt0944947');
+    assertTrue($imdbCandidate !== null, 'IMDb candidate should be extracted from imdb URLs/IDs.');
+
+    $tvdbCandidate = findCandidate($externalCandidates, 'tvdb_id', '121361');
+    assertTrue($tvdbCandidate !== null, 'TVDB candidate should be extracted from thetvdb URLs.');
+
+    $tmdbTvCandidate = findCandidate($externalCandidates, 'tmdb_id', '1396');
+    assertTrue($tmdbTvCandidate !== null, 'TMDB TV candidate should be extracted from /tv/{id} URLs.');
+    assertTrue(($tmdbTvCandidate['media_hint'] ?? null) === 'tv', 'TMDB TV URL should set media_hint=tv.');
+
+    $tmdbMovieCandidate = findCandidate($externalCandidates, 'tmdb_id', '603');
+    assertTrue($tmdbMovieCandidate !== null, 'TMDB movie candidate should be extracted from /movie/{id} URLs or numeric IDs.');
+    assertTrue(($tmdbMovieCandidate['media_hint'] ?? null) === 'movie', 'TMDB movie URL should set media_hint=movie.');
+
+    $imdbDuplicateCount = count(array_filter(
+        $externalCandidates,
+        static fn (array $candidate): bool => ($candidate['source'] ?? null) === 'imdb_id' && ($candidate['id'] ?? null) === 'tt0944947'
+    ));
+    assertTrue($imdbDuplicateCount === 1, 'Duplicate external IDs should be deduplicated.');
 
     fwrite(STDOUT, "All classifier regression checks passed.\n");
 }
