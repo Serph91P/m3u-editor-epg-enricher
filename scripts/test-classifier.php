@@ -85,6 +85,16 @@ namespace {
     $movieSignal = callPrivate($plugin, 'detectSeriesSignals', $movieSignalProgramme);
     assertTrue($movieSignal['is_series_episode'] === false, 'MV provider IDs should not mark a programme as episodic TV.');
 
+    // Regression: the XMLTV <new/> flag should act as a weak episodic signal.
+    $newFlagSignal = callPrivate($plugin, 'detectSeriesSignals', [
+        'title' => 'Pilot Episode',
+        'new' => true,
+        'episode_num' => '',
+        'episode_nums' => [],
+    ]);
+    assertTrue($newFlagSignal['is_series_episode'] === true, 'new=true should be treated as a weak episodic indicator.');
+    assertTrue($newFlagSignal['confidence'] === 'low', 'new=true alone should yield low confidence.');
+
     // Regression: structured episode_nums (xmltv_ns) should provide season/episode details.
     $xmltvProgramme = [
         'title' => 'SOKO Stuttgart',
@@ -159,6 +169,15 @@ namespace {
         static fn (array $candidate): bool => ($candidate['source'] ?? null) === 'imdb_id' && ($candidate['id'] ?? null) === 'tt0944947'
     ));
     assertTrue($imdbDuplicateCount === 1, 'Duplicate external IDs should be deduplicated.');
+
+    // Regression: changing assume_series_when_episodic must invalidate state hash.
+    $settingsHashEnabled = callPrivate($plugin, 'computeSettingsHash', [
+        'assume_series_when_episodic' => true,
+    ]);
+    $settingsHashDisabled = callPrivate($plugin, 'computeSettingsHash', [
+        'assume_series_when_episodic' => false,
+    ]);
+    assertTrue($settingsHashEnabled !== $settingsHashDisabled, 'assume_series_when_episodic must be included in settings hash invalidation.');
 
     fwrite(STDOUT, "All classifier regression checks passed.\n");
 }

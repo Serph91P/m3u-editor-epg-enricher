@@ -378,6 +378,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $mapEmbyGenres = $settings['map_emby_genres'] ?? false;
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
         $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
+        $assumeSeriesWhenEpisodic = $settings['assume_series_when_episodic'] ?? true;
         $classifierMode = $settings['classifier_mode'] ?? 'structural';
         if (! in_array($classifierMode, ['legacy', 'structural', 'structural_strict'], true)) {
             $classifierMode = 'structural';
@@ -568,6 +569,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $mapEmbyGenres,
                 $keywordDetection,
                 $enrichEpisodeDetails,
+                $assumeSeriesWhenEpisodic,
                 $tmdbSeasonCache,
                 $context,
             );
@@ -700,6 +702,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $mapEmbyGenres,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
+        bool $assumeSeriesWhenEpisodic,
         array &$tmdbSeasonCache,
         PluginExecutionContext $context,
     ): array {
@@ -758,6 +761,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $mapEmbyGenres,
                     $keywordDetection,
                     $enrichEpisodeDetails,
+                    $assumeSeriesWhenEpisodic,
                     $tmdbSeasonCache,
                 );
 
@@ -826,6 +830,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $mapEmbyGenres,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
+        bool $assumeSeriesWhenEpisodic,
         array &$tmdbSeasonCache,
     ): array {
         $result = [
@@ -998,6 +1003,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         if (! $tmdbData) {
+            if ($assumeSeriesWhenEpisodic && $isSeriesEpisode) {
+                $syntheticTitle = trim($baseTitle !== '' ? $baseTitle : $title);
+                $tmdbData = [
+                    'name' => $syntheticTitle,
+                    'title' => $syntheticTitle,
+                    'overview' => '',
+                    'genres' => 'Series',
+                    '_media_type' => 'tv',
+                ];
+            }
+        }
+
+        if (! $tmdbData) {
             if ($mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
                 if ($classificationType === 'tv' && $classificationConfidence >= 0.6) {
                     $programme['category'] = 'Series';
@@ -1083,7 +1101,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Enrich description
         $overview = $tmdbData['overview'] ?? '';
 
-        if ($enrichEpisodeDetails && ($tmdbData['_media_type'] ?? null) === 'tv') {
+        if ($enrichEpisodeDetails
+            && ($tmdbData['_media_type'] ?? null) === 'tv'
+            && $seriesSignals['season'] !== null
+            && $seriesSignals['episode'] !== null
+            && trim((string) ($programme['subtitle'] ?? '')) !== '') {
             $episodeDetails = $this->resolveEpisodeDetails(
                 $tmdb,
                 $tmdbSeasonCache,
@@ -1778,18 +1800,21 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $episodeSignals = $this->extractEpisodeSignals($programme);
         $season = $episodeSignals['season'];
         $episode = $episodeSignals['episode'];
+        $isNew = (bool) ($programme['new'] ?? false);
 
         $hasSubtitle = $subtitle !== '';
         $hasParsedEpisode = $episodeSignals['has_parsed'];
         $hasEpisodicProviderId = $episodeSignals['has_episodic_provider_id'];
 
-        $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
+        $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId || $isNew;
 
         $confidence = 'none';
         if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId)) {
             $confidence = 'high';
-        } elseif ($isSeriesEpisode) {
+        } elseif ($hasParsedEpisode || $hasEpisodicProviderId) {
             $confidence = 'medium';
+        } elseif ($hasSubtitle || $isNew) {
+            $confidence = 'low';
         }
 
         return [
@@ -2068,6 +2093,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'map_emby_genres' => $settings['map_emby_genres'] ?? false,
             'keyword_category_detection' => $settings['keyword_category_detection'] ?? true,
             'enrich_episode_details' => $settings['enrich_episode_details'] ?? true,
+            'assume_series_when_episodic' => $settings['assume_series_when_episodic'] ?? true,
             'classifier_mode' => $settings['classifier_mode'] ?? 'structural',
             'tmdb_language' => $settings['tmdb_language'] ?? '',
         ];

@@ -121,6 +121,13 @@
           "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to Emby EPG colors' is also enabled."
         },
         {
+          "id": "assume_series_when_episodic",
+          "type": "boolean",
+          "label": "Assume Series when episodic signals are present",
+          "default": true,
+          "helper_text": "When subtitle/episode signals indicate episodic TV but TMDB has no validated TV match, keep classification as Series to avoid Movie mislabels."
+        },
+        {
           "id": "classifier_mode",
           "type": "select",
           "label": "Media-type classifier mode",
