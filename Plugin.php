@@ -857,9 +857,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // and is language-independent. Legacy mode preserves the old
         // keyword-list behaviour for users who explicitly opt out.
         $channelBias = $this->channelContextMap[$channelId] ?? ['kids' => 0.0, 'sports' => 0.0, 'news' => 0.0, 'movies' => 0.0];
+        $seriesSignals = $this->detectSeriesSignals($programme);
 
         if ($this->classifierMode === 'legacy') {
-            $seriesSignals = $this->detectSeriesSignals($programme);
             $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
             $isSeriesEpisode = $seriesSignals['is_series_episode'] || $hasEpisodicTitleKeyword;
             $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
@@ -1767,13 +1767,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     private function detectSeriesSignals(array $programme): array
     {
         $subtitle = trim((string) ($programme['subtitle'] ?? ''));
-        $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
-
-        [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+        $episodeSignals = $this->extractEpisodeSignals($programme);
+        $season = $episodeSignals['season'];
+        $episode = $episodeSignals['episode'];
 
         $hasSubtitle = $subtitle !== '';
-        $hasParsedEpisode = $season !== null || $episode !== null;
-        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH|MV|SP)\d+/i', $episodeNum);
+        $hasParsedEpisode = $episodeSignals['has_parsed'];
+        $hasEpisodicProviderId = $episodeSignals['has_episodic_provider_id'];
 
         $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
 
@@ -1826,6 +1826,114 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return [null, null];
+    }
+
+    /**
+     * Extract normalized episode signals from both legacy episode_num and
+     * structured episode_nums entries captured from XMLTV.
+     *
+     * @param  array<string, mixed>  $programme
+     * @return array{season: int|null, episode: int|null, has_any: bool, has_parsed: bool, has_episodic_provider_id: bool, has_xmltv_ns: bool}
+     */
+    private function extractEpisodeSignals(array $programme): array
+    {
+        $candidates = [];
+
+        $primaryEpisodeNum = trim((string) ($programme['episode_num'] ?? ''));
+        if ($primaryEpisodeNum !== '') {
+            $candidates[] = ['system' => '', 'value' => $primaryEpisodeNum];
+        }
+
+        $episodeNums = $programme['episode_nums'] ?? null;
+        if (is_array($episodeNums)) {
+            foreach ($episodeNums as $episodeRow) {
+                if (! is_array($episodeRow)) {
+                    continue;
+                }
+
+                $value = trim((string) ($episodeRow['value'] ?? ''));
+                if ($value === '') {
+                    continue;
+                }
+
+                $system = mb_strtolower(trim((string) ($episodeRow['system'] ?? '')));
+                $candidates[] = ['system' => $system, 'value' => $value];
+            }
+        }
+
+        if (empty($candidates)) {
+            return [
+                'season' => null,
+                'episode' => null,
+                'has_any' => false,
+                'has_parsed' => false,
+                'has_episodic_provider_id' => false,
+                'has_xmltv_ns' => false,
+            ];
+        }
+
+        $bestSeason = null;
+        $bestEpisode = null;
+        $bestScore = -1;
+        $hasParsed = false;
+        $hasEpisodicProviderId = false;
+        $hasXmltvNs = false;
+        $seen = [];
+
+        foreach ($candidates as $candidate) {
+            $system = mb_strtolower(trim((string) ($candidate['system'] ?? '')));
+            $value = trim((string) ($candidate['value'] ?? ''));
+
+            if ($value === '') {
+                continue;
+            }
+
+            $dedupeKey = "{$system}|{$value}";
+            if (isset($seen[$dedupeKey])) {
+                continue;
+            }
+            $seen[$dedupeKey] = true;
+
+            if ($system === 'xmltv_ns') {
+                $hasXmltvNs = true;
+            }
+            if (preg_match('/^(EP|SH|MV|SP)\d+/i', $value)) {
+                $hasEpisodicProviderId = true;
+            }
+
+            [$season, $episode] = $this->parseSeasonEpisode($value);
+            if ($season === null && $episode === null) {
+                continue;
+            }
+
+            $hasParsed = true;
+
+            $score = 0;
+            if ($season !== null) {
+                $score += 1;
+            }
+            if ($episode !== null) {
+                $score += 2;
+            }
+            if ($system === 'xmltv_ns') {
+                $score += 2;
+            }
+
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestSeason = $season;
+                $bestEpisode = $episode;
+            }
+        }
+
+        return [
+            'season' => $bestSeason,
+            'episode' => $bestEpisode,
+            'has_any' => true,
+            'has_parsed' => $hasParsed,
+            'has_episodic_provider_id' => $hasEpisodicProviderId,
+            'has_xmltv_ns' => $hasXmltvNs,
+        ];
     }
 
     /**
@@ -1985,14 +2093,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     private function classifyMediaType(array $programme, string $existingCategory, array $channelBias): array
     {
         $subtitle = trim((string) ($programme['subtitle'] ?? ''));
-        $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
         $title = trim((string) ($programme['title'] ?? ''));
 
-        [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+        $episodeSignals = $this->extractEpisodeSignals($programme);
         $hasSubtitle = $subtitle !== '';
-        $hasParsedEpisode = $season !== null || $episode !== null;
-        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH|MV|SP)\d+/i', $episodeNum);
-        $hasAnyEpisodeNum = $episodeNum !== '';
+        $hasParsedEpisode = $episodeSignals['has_parsed'];
+        $hasEpisodicProviderId = $episodeSignals['has_episodic_provider_id'];
+        $hasAnyEpisodeNum = $episodeSignals['has_any'];
+        $hasXmltvNs = $episodeSignals['has_xmltv_ns'];
         $runtime = $this->computeRuntimeMinutes($programme);
 
         $titleNorm = $this->normalizeCacheKey($title);
@@ -2017,6 +2125,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         } elseif ($hasAnyEpisodeNum) {
             $scoreSeries += 0.20;
             $reasons[] = 'episode-num present';
+        }
+
+        if ($hasXmltvNs) {
+            $scoreSeries += 0.15;
+            $reasons[] = 'episode-num xmltv_ns';
         }
 
         if ($runtime > 0 && $runtime <= 65) {
