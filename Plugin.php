@@ -14,6 +14,8 @@ use App\Services\EpgCacheService;
 use App\Services\TmdbService;
 use App\Settings\GeneralSettings;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use ReflectionProperty;
 
@@ -1159,6 +1161,63 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
         $path = $dir.'/tmdb-images-cache.json';
         @file_put_contents($path, json_encode($cache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * Fetch /movie/{id}/images or /tv/{id}/images from TMDB.
+     *
+     * @return array{posters: array, backdrops: array, logos: array}|null
+     */
+    private function fetchTmdbImages(int $tmdbId, string $mediaType, array &$cache): ?array
+    {
+        $cacheKey = "{$mediaType}:{$tmdbId}";
+        if (array_key_exists($cacheKey, $cache)) {
+            return $cache[$cacheKey];
+        }
+
+        $creds = $this->getTmdbCredentials();
+        if ($creds === null) {
+            return null;
+        }
+
+        $endpoint = $mediaType === 'movie' ? "movie/{$tmdbId}/images" : "tv/{$tmdbId}/images";
+        $shortLang = explode('-', $creds['language'])[0] ?? 'en';
+
+        try {
+            $response = Http::timeout(15)->get(
+                "https://api.themoviedb.org/3/{$endpoint}",
+                [
+                    'api_key' => $creds['key'],
+                    // null = sprach-neutrale assets (wichtig für logos)
+                    'include_image_language' => "{$shortLang},en,null",
+                ]
+            );
+
+            if (! $response->successful()) {
+                $cache[$cacheKey] = null;
+
+                return null;
+            }
+
+            $data = $response->json();
+            $result = [
+                'posters' => is_array($data['posters'] ?? null) ? $data['posters'] : [],
+                'backdrops' => is_array($data['backdrops'] ?? null) ? $data['backdrops'] : [],
+                'logos' => is_array($data['logos'] ?? null) ? $data['logos'] : [],
+            ];
+            $cache[$cacheKey] = $result;
+
+            return $result;
+        } catch (\Throwable $e) {
+            Log::warning('[EpgEnricher] TMDB images fetch failed', [
+                'tmdb_id' => $tmdbId,
+                'media_type' => $mediaType,
+                'error' => $e->getMessage(),
+            ]);
+            $cache[$cacheKey] = null;
+
+            return null;
+        }
     }
 
     /**
