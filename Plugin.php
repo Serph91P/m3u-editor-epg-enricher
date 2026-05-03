@@ -898,6 +898,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         if (! $tmdbData) {
+            if (! $result['cache_hit']) {
+                $this->logMissedTitle($title, $baseTitle, $year, $forcedMediaType);
+            }
+
             if ($mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
                 $programme['category'] = 'Series';
                 $result['category'] = true;
@@ -1087,6 +1091,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'enrichment_state_epgs' => $trackedEpgs,
             'enrichment_state_files' => $trackedFiles,
             'last_enriched_at' => $lastEnrichedAt,
+            'top_missed_titles' => $this->topMissedTitles(20),
             'timestamp' => now()->toIso8601String(),
         ]);
     }
@@ -1200,6 +1205,65 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
         $path = $dir.'/tmdb-images-cache.json';
         @file_put_contents($path, json_encode($cache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * Append a missed (no-TMDB-match) title to the JSONL log for later tuning.
+     */
+    private function logMissedTitle(string $title, string $baseTitle, ?int $year, ?string $forcedMediaType): void
+    {
+        $dir = storage_path('app/plugin-data/epg-enricher');
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $line = json_encode([
+            'ts' => date('c'),
+            'title' => $title,
+            'base' => $baseTitle,
+            'year' => $year,
+            'forced_type' => $forcedMediaType,
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        @file_put_contents($dir.'/missed-titles.jsonl', $line."\n", FILE_APPEND | LOCK_EX);
+    }
+
+    /**
+     * Aggregate the missed-titles log into a top-N count list.
+     *
+     * @return array<int, array{title: string, count: int, last_seen: string}>
+     */
+    private function topMissedTitles(int $limit = 20): array
+    {
+        $path = storage_path('app/plugin-data/epg-enricher/missed-titles.jsonl');
+        if (! file_exists($path)) {
+            return [];
+        }
+        $counts = [];
+        $lastSeen = [];
+        $handle = @fopen($path, 'r');
+        if (! $handle) {
+            return [];
+        }
+        while (($line = fgets($handle)) !== false) {
+            $entry = json_decode(trim($line), true);
+            if (! is_array($entry) || empty($entry['title'])) {
+                continue;
+            }
+            $key = (string) $entry['title'];
+            $counts[$key] = ($counts[$key] ?? 0) + 1;
+            $lastSeen[$key] = $entry['ts'] ?? '';
+        }
+        fclose($handle);
+        arsort($counts);
+        $out = [];
+        foreach (array_slice($counts, 0, $limit, true) as $title => $count) {
+            $out[] = [
+                'title' => $title,
+                'count' => $count,
+                'last_seen' => $lastSeen[$title] ?? '',
+            ];
+        }
+
+        return $out;
     }
 
     /**
