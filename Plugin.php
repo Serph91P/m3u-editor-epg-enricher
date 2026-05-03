@@ -1221,6 +1221,97 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Select the best image variants per type from a TMDB images response.
+     * Returns programme-ready image entries (url + type + width + height + orient + size).
+     *
+     * @param  array{posters: array, backdrops: array, logos: array}  $images
+     * @return array<int, array{url: string, type: string, width: int, height: int, orient: string, size: int}>
+     */
+    private function selectImageSet(array $images, string $userLang): array
+    {
+        $shortLang = explode('-', $userLang)[0] ?? 'en';
+        $out = [];
+
+        $rank = function (array $img, array $langPriority): int {
+            $iso = $img['iso_639_1'] ?? null;
+            foreach ($langPriority as $idx => $code) {
+                if ($iso === $code || ($code === null && $iso === null)) {
+                    return $idx;
+                }
+            }
+
+            return count($langPriority);
+        };
+
+        $sortBy = function (array $a, array $b, array $langPriority) use ($rank): int {
+            $ra = $rank($a, $langPriority);
+            $rb = $rank($b, $langPriority);
+            if ($ra !== $rb) {
+                return $ra <=> $rb;
+            }
+
+            // Höhere vote_average zuerst
+            return ($b['vote_average'] ?? 0) <=> ($a['vote_average'] ?? 0);
+        };
+
+        // Posters: user-lang bevorzugt
+        $posters = $images['posters'] ?? [];
+        $langPrioPoster = [$shortLang, 'en', null];
+        usort($posters, fn ($a, $b) => $sortBy($a, $b, $langPrioPoster));
+        foreach (array_slice($posters, 0, 2) as $p) {
+            if (empty($p['file_path'])) {
+                continue;
+            }
+            $out[] = [
+                'url' => 'https://image.tmdb.org/t/p/w500'.$p['file_path'],
+                'type' => 'poster',
+                'width' => 500,
+                'height' => (int) round(500 / max($p['aspect_ratio'] ?? 0.667, 0.1)),
+                'orient' => 'P',
+                'size' => 2,
+            ];
+        }
+
+        // Backdrops: sprach-neutral bevorzugt
+        $backdrops = $images['backdrops'] ?? [];
+        $langPrioBack = [null, $shortLang, 'en'];
+        usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
+        foreach (array_slice($backdrops, 0, 2) as $b) {
+            if (empty($b['file_path'])) {
+                continue;
+            }
+            $out[] = [
+                'url' => 'https://image.tmdb.org/t/p/w1280'.$b['file_path'],
+                'type' => 'backdrop',
+                'width' => 1280,
+                'height' => (int) round(1280 / max($b['aspect_ratio'] ?? 1.778, 0.1)),
+                'orient' => 'L',
+                'size' => 3,
+            ];
+        }
+
+        // Logos: user-lang→en→null
+        $logos = $images['logos'] ?? [];
+        $langPrioLogo = [$shortLang, 'en', null];
+        usort($logos, fn ($a, $b) => $sortBy($a, $b, $langPrioLogo));
+        foreach (array_slice($logos, 0, 1) as $l) {
+            if (empty($l['file_path'])) {
+                continue;
+            }
+            $out[] = [
+                'url' => 'https://image.tmdb.org/t/p/w500'.$l['file_path'],
+                'type' => 'logo',
+                'width' => 500,
+                'height' => (int) round(500 / max($l['aspect_ratio'] ?? 2.5, 0.1)),
+                'orient' => 'L',
+                'size' => 1,
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
      * Normalize a programme title into a stable cache key.
      */
     private function normalizeCacheKey(string $title): string
