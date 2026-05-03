@@ -1126,6 +1126,42 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Load TMDB images endpoint cache from disk.
+     * Key = "{media_type}:{tmdb_id}".
+     *
+     * @return array<string, array|null>
+     */
+    private function loadTmdbImagesCache(): array
+    {
+        $path = storage_path('app/plugin-data/epg-enricher/tmdb-images-cache.json');
+        if (! file_exists($path)) {
+            return [];
+        }
+        $raw = file_get_contents($path);
+        if ($raw === false) {
+            return [];
+        }
+        $decoded = json_decode($raw, true);
+
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    /**
+     * Save TMDB images endpoint cache to disk.
+     *
+     * @param  array<string, array|null>  $cache
+     */
+    private function saveTmdbImagesCache(array $cache): void
+    {
+        $dir = storage_path('app/plugin-data/epg-enricher');
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $path = $dir.'/tmdb-images-cache.json';
+        @file_put_contents($path, json_encode($cache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
      * Normalize a programme title into a stable cache key.
      */
     private function normalizeCacheKey(string $title): string
