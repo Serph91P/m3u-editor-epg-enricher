@@ -358,7 +358,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
         $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
 
-
         // Load TMDB service if enrichment enabled
         $tmdb = null;
         if ($enrichTmdb) {
@@ -846,9 +845,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // ── Extract base title ─────────────────────────────────────────
         // EPG titles are often "Series Name - Episode Title" or "Show: Subtitle".
         // Extract the base show name for fallback TMDB search.
-        $baseTitle = $this->extractBaseTitle($title);
+        $baseExtracted = $this->extractBaseTitle($title);
+        $baseTitle = $baseExtracted['title'];
+        $year = $baseExtracted['year'];
         $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
-        $cacheSuffix = $forcedMediaType ? "|{$forcedMediaType}" : '';
+        $cacheSuffix = ($forcedMediaType ? "|{$forcedMediaType}" : '').($year ? "|y{$year}" : '');
         $fullCacheKey = $this->normalizeCacheKey($title).$cacheSuffix;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).$cacheSuffix : null;
 
@@ -865,11 +866,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
-            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType);
+            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType, $year);
             $matchedViaBase = false;
 
             if (! $tmdbData && $baseTitle !== $title) {
-                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType);
+                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType, $year);
                 $matchedViaBase = $tmdbData !== null;
             }
 
@@ -1228,9 +1229,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * by the caller: the full title is searched at TMDB first and only if
      * validation fails does the base title get tried.
      */
-    private function extractBaseTitle(string $title): string
+    private function extractBaseTitle(string $title): array
     {
         $title = trim($title);
+
+        // Extract year if present (e.g. "Inception (2010)", "Avatar - 2009").
+        // Use the LAST occurrence so titles containing a year token early
+        // (rare but possible) don't trick us.
+        $year = null;
+        if (preg_match_all('/\b(19\d{2}|20\d{2})\b/', $title, $yearMatches)) {
+            $year = (int) end($yearMatches[1]);
+        }
 
         // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
         $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', $title);
@@ -1239,17 +1248,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
         $cleaned = rtrim(trim($cleaned), '-–— ');
 
+        // Strip trailing year markers like "(2010)" or " - 2009"
+        $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
+        $cleaned = preg_replace('/\s*[-–—]\s*(?:19\d{2}|20\d{2})\s*$/', '', $cleaned);
+        $cleaned = rtrim(trim($cleaned), '-–— ');
+
         // Split at " - " / " – " / " — " (most common EPG episode separator)
         if (preg_match('/^(.{2,}?)\s+[-–—]\s+(.+)$/u', $cleaned, $m)) {
-            return trim($m[1]);
+            return ['title' => trim($m[1]), 'year' => $year];
         }
 
         // Split at ": " when right part is long (episode subtitle, not abbreviation like "LA")
         if (preg_match('/^(.{2,}?):\s+(.{8,})$/u', $cleaned, $m)) {
-            return trim($m[1]);
+            return ['title' => trim($m[1]), 'year' => $year];
         }
 
-        return $cleaned;
+        return ['title' => $cleaned, 'year' => $year];
     }
 
     /**
@@ -1258,15 +1272,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * Searches TV series first, then movies. Validates that the returned title
      * actually matches what we searched for (prevents "Sturm der Liebe" → "Fanaa").
      *
-     * @return array|null  TMDB data with '_media_type' set, or null if no good match
+     * @return array|null TMDB data with '_media_type' set, or null if no good match
      */
-    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle, ?string $forceMediaType = null): ?array
+    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle, ?string $forceMediaType = null, ?int $year = null): ?array
     {
         $searchNorm = mb_strtolower(trim($searchTitle));
 
         if ($forceMediaType !== 'movie') {
             // Try TV series first (EPG = primarily TV content)
-            $tvResult = $tmdb->searchTvSeries($searchTitle);
+            $tvResult = $tmdb->searchTvSeries($searchTitle, $year);
             if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
                 // Check against both the localized display name AND the original language name.
                 // When TMDB is configured with a non-English language (e.g. de-DE), the returned
@@ -1297,7 +1311,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         // Try movie search
-        $movieResult = $tmdb->searchMovie($searchTitle, tryFallback: true);
+        $movieResult = $tmdb->searchMovie($searchTitle, $year, tryFallback: true);
         if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
             $tmdbLocalTitle = $movieResult['title'] ?? '';
             $tmdbOriginalTitle = $movieResult['original_title'] ?? '';
@@ -1435,7 +1449,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * Detect an Emby category from keywords found in the programme title.
      * Used as a fallback when TMDB lookup fails (live sports, news, etc.).
      *
-     * @return string|null  The matched category, or null if no keywords match
+     * @return string|null The matched category, or null if no keywords match
      */
     private function detectCategoryFromTitle(string $title): ?string
     {
@@ -1445,7 +1459,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             foreach ($keywords as $keyword) {
                 // Use word boundary matching to avoid false positives
                 // e.g. "art" should not match inside "Karting"
-                $pattern = '/(?:^|[\s\-\/\|:.,;!?\(\[])' . preg_quote($keyword, '/') . '(?:$|[\s\-\/\|:.,;!?\)\]])/u';
+                $pattern = '/(?:^|[\s\-\/\|:.,;!?\(\[])'.preg_quote($keyword, '/').'(?:$|[\s\-\/\|:.,;!?\)\]])/u';
                 if (preg_match($pattern, $titleLower)) {
                     return $category;
                 }
