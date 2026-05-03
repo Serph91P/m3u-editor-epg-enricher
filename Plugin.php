@@ -386,6 +386,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Load TMDB lookup cache from disk
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
+        $imagesCache = $this->loadTmdbImagesCache();
 
         // If language changed, the TMDB lookup cache contains results in the old
         // language. Clear it so titles are re-searched with the new language.
@@ -462,6 +463,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
             if ($context->cancellationRequested()) {
                 $this->saveTmdbCache($tmdbCache);
+                $this->saveTmdbSeasonCache($tmdbSeasonCache);
+                $this->saveTmdbImagesCache($imagesCache);
                 // Merge new file states with existing ones before saving
                 $enrichmentState[$stateKey] = [
                     'settings_hash' => $settingsHash,
@@ -527,6 +530,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $keywordDetection,
                 $enrichEpisodeDetails,
                 $tmdbSeasonCache,
+                $imagesCache,
                 $context,
             );
 
@@ -566,6 +570,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Persist TMDB lookup cache
         $this->saveTmdbCache($tmdbCache);
         $this->saveTmdbSeasonCache($tmdbSeasonCache);
+        $this->saveTmdbImagesCache($imagesCache);
 
         // Persist enrichment state
         $enrichmentState[$stateKey] = [
@@ -659,6 +664,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
+        array &$imagesCache,
         PluginExecutionContext $context,
     ): array {
         $result = [
@@ -716,6 +722,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $keywordDetection,
                     $enrichEpisodeDetails,
                     $tmdbSeasonCache,
+                    $imagesCache,
                 );
 
                 if ($enrichResult['changed']) {
@@ -783,6 +790,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
+        array &$imagesCache,
     ): array {
         $result = [
             'changed' => false,
@@ -902,6 +910,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Enrich poster/icon
         $posterUrl = $tmdbData['poster_url'] ?? null;
         $backdropUrl = $tmdbData['backdrop_url'] ?? null;
+        $mediaType = $tmdbData['_media_type'] ?? null;
 
         if ($enrichPosters && $posterUrl && ($overwrite || ! $hasIcon)) {
             $programme['icon'] = $posterUrl;
@@ -941,9 +950,39 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
+        // Erweiterte images-pipeline: hole zusätzliche varianten + logo
+        if (($enrichPosters || $enrichBackdrops) && ! empty($tmdbData['tmdb_id']) && ! empty($mediaType)) {
+            $creds = $this->getTmdbCredentials();
+            if ($creds !== null) {
+                $imageSet = $this->fetchTmdbImages((int) $tmdbData['tmdb_id'], $mediaType, $imagesCache);
+                if ($imageSet !== null) {
+                    $candidates = $this->selectImageSet($imageSet, $creds['language']);
+                    $existingUrls = array_column($programme['images'] ?? [], 'url');
+                    foreach ($candidates as $img) {
+                        if (in_array($img['url'], $existingUrls, true)) {
+                            continue;
+                        }
+                        if ($img['type'] === 'poster' && ! $enrichPosters) {
+                            continue;
+                        }
+                        if ($img['type'] === 'backdrop' && ! $enrichBackdrops) {
+                            continue;
+                        }
+                        // logos sind opt-in via enrichBackdrops (L-orient assets)
+                        if ($img['type'] === 'logo' && ! $enrichBackdrops) {
+                            continue;
+                        }
+
+                        $programme['images'][] = $img;
+                        $existingUrls[] = $img['url'];
+                        $result['changed'] = true;
+                    }
+                }
+            }
+        }
+
         // Enrich category/genre
         $genres = $tmdbData['genres'] ?? '';
-        $mediaType = $tmdbData['_media_type'] ?? null;
         if ($enrichCategories && $genres !== '' && ($overwrite || ! $hasCategory)) {
             if ($mapEmbyGenres) {
                 $category = $this->mapToEmbyCategory($genres, $mediaType);
