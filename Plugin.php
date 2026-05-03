@@ -12,6 +12,7 @@ use App\Plugins\Support\PluginActionResult;
 use App\Plugins\Support\PluginExecutionContext;
 use App\Services\EpgCacheService;
 use App\Services\TmdbService;
+use App\Settings\GeneralSettings;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Storage;
 use ReflectionProperty;
@@ -1599,6 +1600,30 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return null;
+    }
+
+    /**
+     * Resolve TMDB api credentials from GeneralSettings.
+     * Returns null if not configured (caller should skip image fetch silently).
+     *
+     * @return array{key: string, language: string}|null
+     */
+    private function getTmdbCredentials(): ?array
+    {
+        try {
+            $settings = app(GeneralSettings::class);
+            $key = trim((string) ($settings->tmdb_api_key ?? ''));
+            if ($key === '') {
+                return null;
+            }
+            $language = $settings->tmdb_language ?? 'de-DE';
+
+            return ['key' => $key, 'language' => $language];
+        } catch (\Throwable $e) {
+            Log::warning('[EpgEnricher] Failed to resolve TMDB credentials', ['error' => $e->getMessage()]);
+
+            return null;
+        }
     }
 
     /**
