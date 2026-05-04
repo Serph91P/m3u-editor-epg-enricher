@@ -432,7 +432,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $fileStates = [];
         }
 
-        $cacheDir = "epg-cache/{$epg->uuid}/v1";
+        $cacheDir = $this->getActiveCacheDir($epg);
+        if ($cacheDir === null) {
+            return PluginActionResult::failure('Could not resolve EPG cache directory.');
+        }
         $currentDate = Carbon::parse($minDate);
         $endDate = Carbon::parse($maxDate);
         $totalDays = $currentDate->diffInDays($endDate) + 1;
@@ -1097,16 +1100,34 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Resolve the active cache version directory for an EPG.
+     * Prefers the newest version that has metadata.json, falls back to legacy versions.
+     */
+    private function getActiveCacheDir(Epg $epg): ?string
+    {
+        // Keep this list in sync with EpgCacheService::CACHE_VERSION + PREVIOUS_CACHE_VERSIONS
+        $versions = ['v2', 'v1'];
+        foreach ($versions as $version) {
+            $dir = "epg-cache/{$epg->uuid}/{$version}";
+            if (Storage::disk('local')->exists($dir.'/metadata.json')) {
+                return $dir;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Read EPG cache metadata.
      */
     private function readMetadata(Epg $epg): ?array
     {
-        $path = "epg-cache/{$epg->uuid}/v1/metadata.json";
-        if (! Storage::disk('local')->exists($path)) {
+        $dir = $this->getActiveCacheDir($epg);
+        if ($dir === null) {
             return null;
         }
 
-        return json_decode(Storage::disk('local')->get($path), true);
+        return json_decode(Storage::disk('local')->get($dir.'/metadata.json'), true);
     }
 
     /**

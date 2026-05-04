@@ -14,6 +14,7 @@ rm -f "$ARCHIVE_PATH" "$ARCHIVE_PATH.sha256"
 zip -r "$ARCHIVE_PATH" . \
   -x '.git/*' \
   -x '.github/*' \
+  -x '.hermes/*' \
   -x 'dist/*' \
   -x 'tests/*' \
   -x 'scripts/*' \
