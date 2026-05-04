@@ -39,7 +39,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape-fix';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape-fix-2';
     /**
      * Mapping of TMDB genre names (English + German) to Emby EPG categories.
      *
@@ -1074,7 +1074,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             if ($episodeDetails) {
                 $episodeOverview = trim((string) ($episodeDetails['overview'] ?? ''));
                 if ($episodeOverview !== '') {
-                    $overview = $episodeOverview;
+                    // Reject when TMDB returned the original-language fallback instead of
+                    // the user-configured locale. Plugin still uses the series overview
+                    // (already set above as $overview from $tmdbData) as the de-facto desc.
+                    $userLangFull = (string) (app(GeneralSettings::class)->tmdb_language ?? 'de-DE');
+                    $userIso = strtolower(substr($userLangFull, 0, 2));
+                    if ($this->looksLikeLanguage($episodeOverview, $userIso)) {
+                        $overview = $episodeOverview;
+                    } else {
+                        Log::info('[EpgEnricher] Rejected TMDB episode overview: language mismatch', [
+                            'expected' => $userIso,
+                            'sample' => mb_substr($episodeOverview, 0, 80),
+                        ]);
+                    }
                 }
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
@@ -2035,6 +2047,67 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return [null, null];
+    }
+
+    /**
+     * Cheap heuristic: does $text plausibly match the requested language?
+     * Used to reject TMDB overview fallbacks (e.g. Spanish text returned for de-DE).
+     * Returns true on inconclusive (short text, no markers) so we do not over-reject.
+     */
+    private function looksLikeLanguage(string $text, string $iso639_1): bool
+    {
+        $text = trim($text);
+        if (mb_strlen($text) < 30) {
+            return true; // too short to judge, accept
+        }
+        $lower = mb_strtolower($text);
+        $iso = strtolower($iso639_1);
+
+        // Marker characters / common stopwords per language (cheap, not exhaustive).
+        $markers = [
+            'de' => ['ä','ö','ü','ß',' der ',' die ',' das ',' und ',' ist ',' nicht ',' eine ',' einen ',' nach ',' wird '],
+            'en' => [' the ',' and ',' is ',' of ',' to ',' with ',' from ',' that ',' this ',' when ',' which '],
+            'es' => ['ñ','¿','¡',' el ',' la ',' los ',' las ',' que ',' una ',' por ',' con ',' para ',' del ',' está '],
+            'fr' => [' le ',' la ',' les ',' une ',' des ',' que ',' qui ',' avec ',' pour ',' dans ',' est ',' c\'est '],
+            'it' => [' il ',' la ',' che ',' una ',' con ',' per ',' del ',' degli ',' nella ',' sono '],
+            'pt' => ['ã',' o ',' a ',' os ',' as ',' que ',' uma ',' com ',' para ',' está ',' não '],
+        ];
+
+        $countMarkers = function (string $haystack, array $list): int {
+            $n = 0;
+            foreach ($list as $m) {
+                if (str_contains($haystack, $m)) {
+                    $n++;
+                }
+            }
+            return $n;
+        };
+
+        $expected = $markers[$iso] ?? null;
+        if ($expected === null) {
+            return true; // unknown language code, accept
+        }
+
+        $expectedHits = $countMarkers($lower, $expected);
+
+        // Score every other supported language and keep the max.
+        $maxOther = 0;
+        foreach ($markers as $code => $list) {
+            if ($code === $iso) {
+                continue;
+            }
+            $hits = $countMarkers($lower, $list);
+            if ($hits > $maxOther) {
+                $maxOther = $hits;
+            }
+        }
+
+        // Reject only when another language is strongly dominant.
+        // Threshold: other has >=3 hits AND at least 2 more than expected.
+        if ($maxOther >= 3 && $maxOther >= $expectedHits + 2) {
+            return false;
+        }
+        return true;
     }
 
     /**
