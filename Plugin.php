@@ -41,17 +41,21 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      */
     private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape-fix-2';
     /**
-     * Mapping of TMDB genre names (English + German) to EPG categories.
+     * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
-     * Emby supports 4 color-coded categories in the guide:
-     *   Movie, News, Kids, Sports
-     * Other categories (Series, Documentary, Music, Education) are valid
-     * but receive no color highlighting.
+     * The 8 names below are the union of what Emby, Jellyfin, Kodi (PVR), Plex,
+     * and TVHeadend recognize for color-coding / filtering in their guide UIs:
      *
-     * For ambiguous genres (e.g. "Action" can be a movie or TV series),
-     * the TMDB media type overrides the mapping in {@see mapToEpgCategory()}.
+     *   Color-coded in most clients: Movie, News, Sports, Kids
+     *   Plain (no color, but filterable): Series, Documentary, Music, Education
      *
-     * Covers every official TMDB genre for both Movies and TV shows.
+     * Adding new category strings here is a breaking change for downstream guide
+     * UIs (unrecognized values render as "Other" or get dropped by some clients).
+     * If a TMDB genre does not fit the 8 categories above, map it to the closest
+     * existing one. Do NOT introduce new ones without verifying client support.
+     *
+     * For ambiguous genres (e.g. "Action" can be a movie or TV series) the TMDB
+     * media_type overrides the static mapping; see {@see mapToEpgCategory()}.
      *
      * @var array<string, string>
      */
