@@ -1092,9 +1092,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $result['changed'] = true;
         }
 
-        // Phase A2: finalize images[] (sort, sync primary <icon>).
+        // Phase A2/A3: finalize images[] (sort, dedupe, sync primary <icon>).
         if (! empty($programme['images']) && is_array($programme['images'])) {
             $programme['images'] = $this->prioritizeImages($programme['images']);
+            $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
             // Sync primary <icon> so attribute-blind clients see the same first image.
             $primaryUrl = $programme['images'][0]['url'] ?? null;
             if ($primaryUrl !== null) {
@@ -1534,6 +1535,31 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         });
 
         return array_map(fn ($row) => $row[2], $indexed);
+    }
+
+    /**
+     * Remove duplicate entries from $programme['images'][] by URL.
+     * Keeps the first occurrence (which after prioritizeImages is the highest-scored).
+     *
+     * @param  array<int, array<string, mixed>>  $images
+     * @return array<int, array<string, mixed>>
+     */
+    private function dedupeImagesByUrl(array $images): array
+    {
+        $seen = [];
+        $out = [];
+        foreach ($images as $img) {
+            $url = $img['url'] ?? null;
+            if (! is_string($url) || $url === '') {
+                continue;
+            }
+            if (isset($seen[$url])) {
+                continue;
+            }
+            $seen[$url] = true;
+            $out[] = $img;
+        }
+        return array_values($out);
     }
 
     /**
