@@ -1092,6 +1092,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $result['changed'] = true;
         }
 
+        // Phase A2: finalize images[] (sort, sync primary <icon>).
+        if (! empty($programme['images']) && is_array($programme['images'])) {
+            $programme['images'] = $this->prioritizeImages($programme['images']);
+            // Sync primary <icon> so attribute-blind clients see the same first image.
+            $primaryUrl = $programme['images'][0]['url'] ?? null;
+            if ($primaryUrl !== null) {
+                $programme['icon'] = $primaryUrl;
+            }
+        }
+
         return $result;
     }
 
@@ -1471,6 +1481,59 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return $out;
+    }
+
+    /**
+     * Sort $programme['images'][] by orientation+type+width so the first usable
+     * landscape image becomes the primary. Attribute-blind clients (Emby,
+     * Tvheadend) only read the first <icon>; this guarantees they get a wide
+     * image. Attribute-aware clients (Kodi, Jellyfin, Plex) keep using
+     * type/orient/width to pick the right variant per view.
+     *
+     * Priority score:
+     *   backdrop    landscape -> 100 + width
+     *   fanart      landscape ->  90 + width
+     *   screenshot  landscape ->  60 + width
+     *   poster      portrait  ->  20 + width
+     *   logo                  ->   0 + width
+     *
+     * @param  array<int, array<string, mixed>>  $images
+     * @return array<int, array<string, mixed>>
+     */
+    private function prioritizeImages(array $images): array
+    {
+        if (empty($images)) {
+            return $images;
+        }
+
+        $score = function (array $img): int {
+            $type = strtolower((string) ($img['type'] ?? 'poster'));
+            $orient = strtoupper((string) ($img['orient'] ?? 'P'));
+            $width = (int) ($img['width'] ?? 0);
+            $base = match ($type) {
+                'backdrop' => $orient === 'L' ? 100 : 50,
+                'fanart' => $orient === 'L' ? 90 : 45,
+                'screenshot' => $orient === 'L' ? 60 : 30,
+                'poster' => 20,
+                'logo' => 0,
+                default => 10,
+            };
+            return $base + $width;
+        };
+
+        // Stable sort by score desc.
+        $indexed = [];
+        foreach ($images as $i => $img) {
+            $indexed[] = [$i, $score($img), $img];
+        }
+        usort($indexed, function ($a, $b) {
+            if ($a[1] === $b[1]) {
+                return $a[0] <=> $b[0];
+            }
+            return $b[1] <=> $a[1];
+        });
+
+        return array_map(fn ($row) => $row[2], $indexed);
     }
 
     /**
