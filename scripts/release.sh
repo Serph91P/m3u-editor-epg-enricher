@@ -161,10 +161,15 @@ TMPFILE="$(mktemp)"
 jq --arg v "$NEW_VERSION" '.version = $v' "$MANIFEST" > "$TMPFILE"
 mv "$TMPFILE" "$MANIFEST"
 
+# Bump ENRICHMENT_LOGIC_VERSION in Plugin.php so cached enrichment state
+# is invalidated on the next run. (Same script the GH Actions workflow uses.)
+info "Bumping ENRICHMENT_LOGIC_VERSION in Plugin.php..."
+bash "$ROOT_DIR/scripts/bump-logic-version.sh" "$TAG_NAME"
+
 # ── Commit, tag, push ────────────────────────────────────────────────────────
 
 info "Committing version bump..."
-git add "$MANIFEST"
+git add "$MANIFEST" Plugin.php
 git commit -m "chore: bump version to $NEW_VERSION"
 
 info "Creating tag $TAG_NAME..."
