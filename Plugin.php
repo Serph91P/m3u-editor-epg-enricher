@@ -22,6 +22,25 @@ use ReflectionProperty;
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 {
     /**
+     * Bumped whenever the enrichment output for the SAME inputs changes.
+     *
+     * Mixed into computeSettingsHash() so that updating the plugin code automatically
+     * invalidates per-file enrichment state. Users get the new behaviour on the next
+     * run without having to manually delete enrichment-state.json or toggle overwrite.
+     *
+     * Bump this when you change:
+     *   - which fields are written to $programme[] (icon, images[], category, desc, etc.)
+     *   - the structure/ordering/values of $programme['images'][] entries
+     *   - TMDB matching/scoring logic or category mapping
+     *   - episode resolution / still selection
+     *
+     * Do NOT bump for: pure refactors, logging changes, comment edits, perf-only
+     * changes that don't affect output.
+     *
+     * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
+     */
+    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape';
+    /**
      * Mapping of TMDB genre names (English + German) to Emby EPG categories.
      *
      * Emby supports 4 color-coded categories in the guide:
@@ -2006,6 +2025,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     private function computeSettingsHash(array $settings): string
     {
         $relevant = [
+            'logic_version' => self::ENRICHMENT_LOGIC_VERSION,
             'enrich_from_tmdb' => $settings['enrich_from_tmdb'] ?? true,
             'overwrite_existing' => $settings['overwrite_existing'] ?? false,
             'enrich_categories' => $settings['enrich_categories'] ?? true,
