@@ -5,3 +5,4 @@ playlist.m3u
 streamtv.xml
 *.m3u
 *.xml
+.hermes/

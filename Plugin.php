@@ -39,29 +39,42 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape-fix-2';
     /**
-     * Mapping of TMDB genre names (English + German) to Emby EPG categories.
+     * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
-     * Emby supports 4 color-coded categories in the guide:
-     *   Movie, News, Kids, Sports
-     * Other categories (Series, Documentary, Music, Education) are valid
-     * but receive no color highlighting.
+     * The 8 names below are the union of what Emby, Jellyfin, Kodi (PVR), Plex,
+     * and TVHeadend recognize for color-coding / filtering in their guide UIs:
      *
-     * For ambiguous genres (e.g. "Action" can be a movie or TV series),
-     * the TMDB media type overrides the mapping in {@see mapToEmbyCategory()}.
+     *   Color-coded in most clients: Movie, News, Sports, Kids
+     *   Plain (no color, but filterable): Series, Documentary, Music, Education
      *
-     * Covers every official TMDB genre for both Movies and TV shows.
+     * Adding new category strings here is a breaking change for downstream guide
+     * UIs (unrecognized values render as "Other" or get dropped by some clients).
+     * If a TMDB genre does not fit the 8 categories above, map it to the closest
+     * existing one. Do NOT introduce new ones without verifying client support.
+     *
+     * For ambiguous genres (e.g. "Action" can be a movie or TV series) the TMDB
+     * media_type overrides the static mapping; see {@see mapToEpgCategory()}.
      *
      * @var array<string, string>
      */
-    private const array EMBY_GENRE_MAP = [
+    private const array EPG_CATEGORY_MAP = [
         // ── News (color-coded) ──────────────────────────────────────
         'news' => 'News',
         'nachrichten' => 'News',
         'journalism' => 'News',
         'journalismus' => 'News',
         'current affairs' => 'News',
+        'tagesschau' => 'News',
+        'heute' => 'News',
+        'wetter' => 'News',
+        'politik' => 'News',
+        'politics' => 'News',
+        'magazin' => 'News',
+        'business' => 'News',
+        'wirtschaft' => 'News',
+        'finance' => 'News',
 
         // ── Sports (color-coded) ────────────────────────────────────
         'sport' => 'Sports',
@@ -69,6 +82,30 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'basketball' => 'Sports',
         'baseball' => 'Sports',
         'football' => 'Sports',
+        'tennis' => 'Sports',
+        'golf' => 'Sports',
+        'cycling' => 'Sports',
+        'radsport' => 'Sports',
+        'boxing' => 'Sports',
+        'boxen' => 'Sports',
+        'mma' => 'Sports',
+        'ufc' => 'Sports',
+        'darts' => 'Sports',
+        'snooker' => 'Sports',
+        'billard' => 'Sports',
+        'eishockey' => 'Sports',
+        'hockey' => 'Sports',
+        'handball' => 'Sports',
+        'volleyball' => 'Sports',
+        'ski' => 'Sports',
+        'biathlon' => 'Sports',
+        'wintersport' => 'Sports',
+        'leichtathletik' => 'Sports',
+        'athletics' => 'Sports',
+        'olympia' => 'Sports',
+        'olympics' => 'Sports',
+        'esports' => 'Sports',
+        'e-sport' => 'Sports',
 
         // ── Kids / Children (color-coded) ───────────────────────────
         'kids' => 'Kids',
@@ -76,6 +113,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'children' => 'Kids',
         'childrens' => 'Kids',
         'disney' => 'Kids',
+        'cartoon' => 'Kids',
+        'animated kids' => 'Kids',
+        'preschool' => 'Kids',
+        'vorschule' => 'Kids',
+        'jugend' => 'Kids',
+        'youth' => 'Kids',
+        'nickelodeon' => 'Kids',
+        'kika' => 'Kids',
 
         // ── Movie (color-coded) ─────────────────────────────────────
         // TMDB Movie-only genres
@@ -92,6 +137,21 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'kriegsfilm' => 'Movie',
         'tv movie' => 'Movie',
         'tv-film' => 'Movie',
+        'spielfilm' => 'Movie',
+        'film' => 'Movie',
+        'movie' => 'Movie',
+        'romantik' => 'Movie',
+        'romanze' => 'Movie',
+        'erotik' => 'Movie',
+        'erotic' => 'Movie',
+        'martial arts' => 'Movie',
+        'kampfsport-film' => 'Movie',
+        'historical drama' => 'Movie',
+        'historiendrama' => 'Movie',
+        'biopic' => 'Movie',
+        'biografie' => 'Movie',
+        'biography' => 'Movie',
+        'musical' => 'Movie',
 
         // Shared genres — mapped to Movie, overridden to Series by media type
         'comedy' => 'Movie',
@@ -114,6 +174,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'soap' => 'Series',
         'reality' => 'Series',
         'talk' => 'Series',
+        'serie' => 'Series',
+        'series' => 'Series',
+        'tv-serie' => 'Series',
+        'tv serie' => 'Series',
+        'sitcom' => 'Series',
+        'sketch' => 'Series',
+        'telenovela' => 'Series',
+        'soap opera' => 'Series',
+        'mini-series' => 'Series',
+        'miniserie' => 'Series',
+        'limited series' => 'Series',
+        'anime' => 'Series',
+        'game show' => 'Series',
+        'gameshow' => 'Series',
+        'spielshow' => 'Series',
+        'quiz' => 'Series',
+        'quizshow' => 'Series',
+        'cooking show' => 'Series',
+        'kochshow' => 'Series',
+        'lifestyle' => 'Series',
+        'reality-tv' => 'Series',
+        'doku-soap' => 'Series',
 
         // ── Documentary (no color) ──────────────────────────────────
         'documentary' => 'Documentary',
@@ -121,14 +203,47 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'dokumentation' => 'Documentary',
         'history' => 'Documentary',
         'historie' => 'Documentary',
+        'doku' => 'Documentary',
+        'docu' => 'Documentary',
+        'reportage' => 'Documentary',
+        'report' => 'Documentary',
+        'natur' => 'Documentary',
+        'nature' => 'Documentary',
+        'tier' => 'Documentary',
+        'tiere' => 'Documentary',
+        'animals' => 'Documentary',
+        'wildlife' => 'Documentary',
+        'wissenschaft' => 'Documentary',
+        'science' => 'Documentary',
+        'technik' => 'Documentary',
+        'technology' => 'Documentary',
+        'reise' => 'Documentary',
+        'travel' => 'Documentary',
+        'true crime' => 'Documentary',
+        'crime documentary' => 'Documentary',
+        'history channel' => 'Documentary',
+        'geschichte' => 'Documentary',
 
         // ── Music (no color) ────────────────────────────────────────
         'music' => 'Music',
         'musik' => 'Music',
+        'konzert' => 'Music',
+        'concert' => 'Music',
+        'musikvideo' => 'Music',
+        'music video' => 'Music',
+        'oper' => 'Music',
+        'opera' => 'Music',
+        'klassik' => 'Music',
+        'classical' => 'Music',
 
         // ── Education (no color) ────────────────────────────────────
         'education' => 'Education',
         'bildung' => 'Education',
+        'lehrfilm' => 'Education',
+        'tutorial' => 'Education',
+        'sprachkurs' => 'Education',
+        'language' => 'Education',
+        'wissensmagazin' => 'Education',
     ];
 
     /**
@@ -169,6 +284,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'eishockey', 'ice hockey', 'golf', 'rugby', 'cricket',
             'darts', 'snooker', 'sportschau', 'sport1',
             'ringen', 'wrestling', 'schwimmen', 'swimming',
+            // Additional broadcasters / disciplines
+            'sport-clips', 'sky sport', 'dazn', 'eurosport',
+            'reitsport', 'pferderennen', 'pferdesport',
+            'segeln', 'rudern', 'kanu', 'turnen', 'gymnastik',
+            'fechten', 'judo', 'karate', 'taekwondo',
         ],
         'News' => [
             'tagesschau', 'tagesthemen', 'heute', 'heute journal',
@@ -180,6 +300,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'presseclub', 'anne will', 'hart aber fair',
             'markus lanz', 'maischberger', 'sandra maischberger',
             'wetter', 'weather',
+            // Additional EPG title patterns
+            'zib', 'punkt 12', 'mittagsmagazin', 'logo!',
+            'maybrit illner',
         ],
         'Kids' => [
             'kika', 'kinder', 'kids', 'junior',
@@ -192,6 +315,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'bob the builder', 'feuerwehrmann sam', 'fireman sam',
             'bibi blocksberg', 'bibi und tina', 'benjamin blümchen',
             'die sendung mit der maus', 'löwenzahn', 'wickie',
+            // Additional kids EPG patterns
+            'sandmann', 'sendung mit der maus', 'maus', 'pixi', 'heidi',
         ],
         'Documentary' => [
             'terra x', 'planet erde', 'planet earth',
@@ -202,6 +327,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'galileo', 'abenteuer leben', 'wissen',
             'quarks', 'nano', 'scobel', 'leschs kosmos',
             'woher wissen wir das', '37 grad', 'reportage',
+            // Additional documentary title patterns
+            'planet wissen', 'welt der wunder', 'auf entdeckungsreise',
+            'expeditionen', 'mission erde', 'zdfinfo doku',
         ],
     ];
 
@@ -376,7 +504,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $enrichDescriptions = $settings['enrich_descriptions'] ?? true;
         $enrichPosters = $settings['enrich_posters'] ?? true;
         $enrichBackdrops = $settings['enrich_backdrops'] ?? true;
-        $mapEmbyGenres = $settings['map_emby_genres'] ?? false;
+        // Backcompat: old key map_emby_genres still honored for users who upgrade from <2026.05.
+        $mapGenresToEpgCategories = $settings['map_genres_to_epg_categories']
+            ?? $settings['map_emby_genres']
+            ?? false;
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
         $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
 
@@ -548,7 +679,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $enrichDescriptions,
                 $enrichPosters,
                 $enrichBackdrops,
-                $mapEmbyGenres,
+                $mapGenresToEpgCategories,
                 $keywordDetection,
                 $enrichEpisodeDetails,
                 $tmdbSeasonCache,
@@ -682,7 +813,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $enrichDescriptions,
         bool $enrichPosters,
         bool $enrichBackdrops,
-        bool $mapEmbyGenres,
+        bool $mapGenresToEpgCategories,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
@@ -740,7 +871,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $enrichDescriptions,
                     $enrichPosters,
                     $enrichBackdrops,
-                    $mapEmbyGenres,
+                    $mapGenresToEpgCategories,
                     $keywordDetection,
                     $enrichEpisodeDetails,
                     $tmdbSeasonCache,
@@ -808,7 +939,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $enrichDescriptions,
         bool $enrichPosters,
         bool $enrichBackdrops,
-        bool $mapEmbyGenres,
+        bool $mapGenresToEpgCategories,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
@@ -841,7 +972,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
         $isSeriesEpisode = $seriesSignals['is_series_episode'] || $hasEpisodicTitleKeyword;
         $isSeriesLikeCategory = in_array(mb_strtolower($existingCategory), ['series', 'kids'], true);
-        $needsCategoryFix = $mapEmbyGenres
+        $needsCategoryFix = $mapGenresToEpgCategories
             && $enrichCategories
             && $hasCategory
             && $isSeriesEpisode
@@ -860,7 +991,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // This prevents unnecessary TMDB lookups for live sports, news, etc. and avoids
         // wrong matches like "ALL IN - Die Bundesliga Highlight Show" → film "All In".
         $keywordCategory = null;
-        if ($keywordDetection && $mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
+        if ($keywordDetection && $mapGenresToEpgCategories && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
             $keywordCategory = $this->detectCategoryFromTitle($title);
             if ($keywordCategory !== null) {
                 $programme['category'] = $keywordCategory;
@@ -881,6 +1012,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $baseExtracted = $this->extractBaseTitle($title);
         $baseTitle = $baseExtracted['title'];
         $year = $baseExtracted['year'];
+        if ($year === null) {
+            $desc = trim((string) ($programme['desc'] ?? ''));
+            if ($desc !== '') {
+                // Look for a 4-digit year token anywhere in desc.
+                // Use the FIRST occurrence (production year typically appears early
+                // in EPG descriptions: "USA 2010, Action mit ..." / "Spielfilm, 2010").
+                if (preg_match('/\b(19\d{2}|20\d{2})\b/', $desc, $ym)) {
+                    $candidate = (int) $ym[1];
+                    $currentYear = (int) date('Y');
+                    // Sanity bound: do not accept future years beyond current+2.
+                    if ($candidate >= 1900 && $candidate <= $currentYear + 2) {
+                        $year = $candidate;
+                    }
+                }
+            }
+        }
         $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
         $cacheSuffix = ($forcedMediaType ? "|{$forcedMediaType}" : '').($year ? "|y{$year}" : '');
         $fullCacheKey = $this->normalizeCacheKey($title).$cacheSuffix;
@@ -924,7 +1071,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $this->logMissedTitle($title, $baseTitle, $year, $forcedMediaType);
             }
 
-            if ($mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
+            if ($mapGenresToEpgCategories && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
                 $programme['category'] = 'Series';
                 $result['category'] = true;
                 $result['changed'] = true;
@@ -1022,8 +1169,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Enrich category/genre
         $genres = $tmdbData['genres'] ?? '';
         if ($enrichCategories && $genres !== '' && ($overwrite || ! $hasCategory)) {
-            if ($mapEmbyGenres) {
-                $category = $this->mapToEmbyCategory($genres, $mediaType);
+            if ($mapGenresToEpgCategories) {
+                $category = $this->mapToEpgCategory($genres, $mediaType);
             } else {
                 // Take the first genre if comma-separated
                 $category = trim(explode(',', $genres)[0]);
@@ -1033,9 +1180,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $result['category'] = true;
                 $result['changed'] = true;
             }
-        } elseif ($mapEmbyGenres && $hasCategory) {
-            // Map existing category to Emby genre even if not enriching from TMDB
-            $mapped = $this->mapToEmbyCategory($programme['category'], $mediaType);
+        } elseif ($mapGenresToEpgCategories && $hasCategory) {
+            // Map existing category to canonical EPG category even if not enriching from TMDB
+            $mapped = $this->mapToEpgCategory($programme['category'], $mediaType);
             if ($mapped !== $programme['category']) {
                 $programme['category'] = $mapped;
                 $result['category'] = true;
@@ -1058,33 +1205,40 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             if ($episodeDetails) {
                 $episodeOverview = trim((string) ($episodeDetails['overview'] ?? ''));
                 if ($episodeOverview !== '') {
-                    $overview = $episodeOverview;
+                    // Reject when TMDB returned the original-language fallback instead of
+                    // the user-configured locale. Plugin still uses the series overview
+                    // (already set above as $overview from $tmdbData) as the de-facto desc.
+                    $userLangFull = (string) (app(GeneralSettings::class)->tmdb_language ?? 'de-DE');
+                    $userIso = strtolower(substr($userLangFull, 0, 2));
+                    if ($this->looksLikeLanguage($episodeOverview, $userIso)) {
+                        $overview = $episodeOverview;
+                    } else {
+                        Log::info('[EpgEnricher] Rejected TMDB episode overview: language mismatch', [
+                            'expected' => $userIso,
+                            'sample' => mb_substr($episodeOverview, 0, 80),
+                        ]);
+                    }
                 }
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
-                    // Episode still is more specific than the show's backdrop -> promote
-                    // it to the primary <icon> (overwrite if we set one earlier or per overwrite flag).
-                    if ($overwrite || ! $hasIcon || ($programme['icon'] ?? '') === ($backdropUrl ?? '___')) {
-                        $programme['icon'] = $stillUrl;
-                        $result['poster'] = true;
-                        $result['changed'] = true;
-                    }
-
+                    // Episode still is added to images[] only (type=screenshot). It must NOT
+                    // overwrite the primary <icon>, which is reserved for the series backdrop.
+                    // Attribute-blind clients (Emby, Tvheadend) read only the first <icon>;
+                    // promoting a portrait-feeling still there breaks the EPG grid.
                     $existingUrls = array_column($programme['images'] ?? [], 'url');
                     if (! in_array($stillUrl, $existingUrls, true)) {
-                        // Prepend so the episode still ranks above the show backdrop in images[].
                         if (! isset($programme['images']) || ! is_array($programme['images'])) {
                             $programme['images'] = [];
                         }
-                        array_unshift($programme['images'], [
+                        $programme['images'][] = [
                             'url' => $stillUrl,
                             'type' => 'screenshot',
                             'width' => 1280,
                             'height' => 720,
                             'orient' => 'L',
-                            'size' => 1,
-                        ]);
+                            'size' => 2,
+                        ];
                         $result['changed'] = true;
                     }
                 }
@@ -1095,6 +1249,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $programme['desc'] = $overview;
             $result['description'] = true;
             $result['changed'] = true;
+        }
+
+        // Phase A2/A3: finalize images[] (sort, dedupe, sync primary <icon>).
+        if (! empty($programme['images']) && is_array($programme['images'])) {
+            $programme['images'] = $this->prioritizeImages($programme['images']);
+            $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
+            // Sync primary <icon> so attribute-blind clients see the same first image.
+            $primaryUrl = $programme['images'][0]['url'] ?? null;
+            if ($primaryUrl !== null) {
+                $programme['icon'] = $primaryUrl;
+            }
         }
 
         return $result;
@@ -1479,6 +1644,84 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Sort $programme['images'][] by orientation+type+width so the first usable
+     * landscape image becomes the primary. Attribute-blind clients (Emby,
+     * Tvheadend) only read the first <icon>; this guarantees they get a wide
+     * image. Attribute-aware clients (Kodi, Jellyfin, Plex) keep using
+     * type/orient/width to pick the right variant per view.
+     *
+     * Priority score:
+     *   backdrop    landscape -> 100 + width
+     *   fanart      landscape ->  90 + width
+     *   screenshot  landscape ->  60 + width
+     *   poster      portrait  ->  20 + width
+     *   logo                  ->   0 + width
+     *
+     * @param  array<int, array<string, mixed>>  $images
+     * @return array<int, array<string, mixed>>
+     */
+    private function prioritizeImages(array $images): array
+    {
+        if (empty($images)) {
+            return $images;
+        }
+
+        $score = function (array $img): int {
+            $type = strtolower((string) ($img['type'] ?? 'poster'));
+            $orient = strtoupper((string) ($img['orient'] ?? 'P'));
+            $width = (int) ($img['width'] ?? 0);
+            $base = match ($type) {
+                'backdrop' => $orient === 'L' ? 100 : 50,
+                'fanart' => $orient === 'L' ? 90 : 45,
+                'screenshot' => $orient === 'L' ? 60 : 30,
+                'poster' => 20,
+                'logo' => 0,
+                default => 10,
+            };
+            return $base + $width;
+        };
+
+        // Stable sort by score desc.
+        $indexed = [];
+        foreach ($images as $i => $img) {
+            $indexed[] = [$i, $score($img), $img];
+        }
+        usort($indexed, function ($a, $b) {
+            if ($a[1] === $b[1]) {
+                return $a[0] <=> $b[0];
+            }
+            return $b[1] <=> $a[1];
+        });
+
+        return array_map(fn ($row) => $row[2], $indexed);
+    }
+
+    /**
+     * Remove duplicate entries from $programme['images'][] by URL.
+     * Keeps the first occurrence (which after prioritizeImages is the highest-scored).
+     *
+     * @param  array<int, array<string, mixed>>  $images
+     * @return array<int, array<string, mixed>>
+     */
+    private function dedupeImagesByUrl(array $images): array
+    {
+        $seen = [];
+        $out = [];
+        foreach ($images as $img) {
+            $url = $img['url'] ?? null;
+            if (! is_string($url) || $url === '') {
+                continue;
+            }
+            if (isset($seen[$url])) {
+                continue;
+            }
+            $seen[$url] = true;
+            $out[] = $img;
+        }
+        return array_values($out);
+    }
+
+    /**
      * Normalize a programme title into a stable cache key.
      */
     private function normalizeCacheKey(string $title): string
@@ -1497,8 +1740,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
-     * Map genre string(s) + TMDB media type to an Emby EPG category that
-     * triggers guide color coding.
+     * Map genre string(s) + TMDB media type to a canonical EPG category that
+     * triggers guide color coding in clients like Emby, Jellyfin, Kodi, Plex.
      *
      * Priority: scan ALL genres for specific categories (News, Sports, Kids)
      * first, then fall back to Movie/Series based on the TMDB media type.
@@ -1508,7 +1751,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * @param  string  $genres  Comma-separated genre string
      * @param  string|null  $mediaType  'tv' or 'movie' from TMDB lookup
      */
-    private function mapToEmbyCategory(string $genres, ?string $mediaType): string
+    private function mapToEpgCategory(string $genres, ?string $mediaType): string
     {
         $genreList = array_map('trim', explode(',', $genres));
         $genreKeys = array_map('mb_strtolower', $genreList);
@@ -1516,8 +1759,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Collect all mapped categories across every genre
         $mapped = [];
         foreach ($genreKeys as $key) {
-            if (isset(self::EMBY_GENRE_MAP[$key])) {
-                $mapped[self::EMBY_GENRE_MAP[$key]] = true;
+            if (isset(self::EPG_CATEGORY_MAP[$key])) {
+                $mapped[self::EPG_CATEGORY_MAP[$key]] = true;
             }
         }
 
@@ -1800,7 +2043,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
-     * Detect an Emby category from keywords found in the programme title.
+     * Detect an EPG category from keywords found in the programme title.
      * Used as a fallback when TMDB lookup fails (live sports, news, etc.).
      *
      * @return string|null The matched category, or null if no keywords match
@@ -1834,6 +2077,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
 
         [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+        $seFromText = false;
+        if ($season === null && $episode === null) {
+            $haystack = $subtitle.' '.trim((string) ($programme['desc'] ?? ''));
+            if (trim($haystack) !== '') {
+                [$season, $episode] = $this->parseSeasonEpisodeFromText($haystack);
+                if ($season !== null || $episode !== null) {
+                    $seFromText = true;
+                }
+            }
+        }
 
         $hasSubtitle = $subtitle !== '';
         $hasParsedEpisode = $season !== null || $episode !== null;
@@ -1842,7 +2095,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
 
         $confidence = 'none';
-        if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId)) {
+        if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId) && ! $seFromText) {
             $confidence = 'high';
         } elseif ($isSeriesEpisode) {
             $confidence = 'medium';
@@ -1890,6 +2143,102 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return [null, null];
+    }
+
+    /**
+     * Parse season/episode from arbitrary text (subtitle/desc) covering DE/EN/ES/FR markers.
+     *
+     * @return array{0: int|null, 1: int|null}
+     */
+    private function parseSeasonEpisodeFromText(string $text): array
+    {
+        $value = mb_strtolower(trim($text));
+        if ($value === '') {
+            return [null, null];
+        }
+
+        $patterns = [
+            '/\bs(\d{1,2})\s?e(\d{1,3})\b/i',
+            '/\b(\d{1,2})x(\d{1,3})\b/',
+            '/\bstaffel\s*(\d{1,2})[\s,.\-]+(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/iu',
+            '/\btemporada\s*(\d{1,2})[\s,.\-]+(?:cap[ií]tulo|episodio|ep\.?)\s*(\d{1,3})/iu',
+            '/\bseason\s*(\d{1,2})[\s,.\-]+episode\s*(\d{1,3})/i',
+            '/\bsaison\s*(\d{1,2})[\s,.\-]+(?:[ée]pisode|ep\.?)\s*(\d{1,3})/iu',
+            '/\bt(\d{1,2})\s*[\.\-x]\s*e?(\d{1,3})/i',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $value, $m)) {
+                return [(int) $m[1], (int) $m[2]];
+            }
+        }
+
+        if (preg_match('/(?:folge|episode|ep\.?|teil|cap[ií]tulo|episodio)\s*(\d{1,3})/iu', $value, $m)) {
+            return [null, (int) $m[1]];
+        }
+
+        return [null, null];
+    }
+
+    /**
+     * Cheap heuristic: does $text plausibly match the requested language?
+     * Used to reject TMDB overview fallbacks (e.g. Spanish text returned for de-DE).
+     * Returns true on inconclusive (short text, no markers) so we do not over-reject.
+     */
+    private function looksLikeLanguage(string $text, string $iso639_1): bool
+    {
+        $text = trim($text);
+        if (mb_strlen($text) < 30) {
+            return true; // too short to judge, accept
+        }
+        $lower = mb_strtolower($text);
+        $iso = strtolower($iso639_1);
+
+        // Marker characters / common stopwords per language (cheap, not exhaustive).
+        $markers = [
+            'de' => ['ä','ö','ü','ß',' der ',' die ',' das ',' und ',' ist ',' nicht ',' eine ',' einen ',' nach ',' wird '],
+            'en' => [' the ',' and ',' is ',' of ',' to ',' with ',' from ',' that ',' this ',' when ',' which '],
+            'es' => ['ñ','¿','¡',' el ',' la ',' los ',' las ',' que ',' una ',' por ',' con ',' para ',' del ',' está '],
+            'fr' => [' le ',' la ',' les ',' une ',' des ',' que ',' qui ',' avec ',' pour ',' dans ',' est ',' c\'est '],
+            'it' => [' il ',' la ',' che ',' una ',' con ',' per ',' del ',' degli ',' nella ',' sono '],
+            'pt' => ['ã',' o ',' a ',' os ',' as ',' que ',' uma ',' com ',' para ',' está ',' não '],
+        ];
+
+        $countMarkers = function (string $haystack, array $list): int {
+            $n = 0;
+            foreach ($list as $m) {
+                if (str_contains($haystack, $m)) {
+                    $n++;
+                }
+            }
+            return $n;
+        };
+
+        $expected = $markers[$iso] ?? null;
+        if ($expected === null) {
+            return true; // unknown language code, accept
+        }
+
+        $expectedHits = $countMarkers($lower, $expected);
+
+        // Score every other supported language and keep the max.
+        $maxOther = 0;
+        foreach ($markers as $code => $list) {
+            if ($code === $iso) {
+                continue;
+            }
+            $hits = $countMarkers($lower, $list);
+            if ($hits > $maxOther) {
+                $maxOther = $hits;
+            }
+        }
+
+        // Reject only when another language is strongly dominant.
+        // Threshold: other has >=3 hits AND at least 2 more than expected.
+        if ($maxOther >= 3 && $maxOther >= $expectedHits + 2) {
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -2032,7 +2381,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'enrich_descriptions' => $settings['enrich_descriptions'] ?? true,
             'enrich_posters' => $settings['enrich_posters'] ?? true,
             'enrich_backdrops' => $settings['enrich_backdrops'] ?? true,
-            'map_emby_genres' => $settings['map_emby_genres'] ?? false,
+            'map_genres_to_epg_categories' => $settings['map_genres_to_epg_categories']
+                ?? $settings['map_emby_genres']
+                ?? false,
             'keyword_category_detection' => $settings['keyword_category_detection'] ?? true,
             'enrich_episode_details' => $settings['enrich_episode_details'] ?? true,
             'tmdb_language' => $settings['tmdb_language'] ?? '',
