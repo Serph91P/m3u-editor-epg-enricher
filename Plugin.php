@@ -12,7 +12,10 @@ use App\Plugins\Support\PluginActionResult;
 use App\Plugins\Support\PluginExecutionContext;
 use App\Services\EpgCacheService;
 use App\Services\TmdbService;
+use App\Settings\GeneralSettings;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use ReflectionProperty;
 
@@ -358,7 +361,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
         $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
 
-
         // Load TMDB service if enrichment enabled
         $tmdb = null;
         if ($enrichTmdb) {
@@ -384,6 +386,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Load TMDB lookup cache from disk
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
+        $imagesCache = $this->loadTmdbImagesCache();
 
         // If language changed, the TMDB lookup cache contains results in the old
         // language. Clear it so titles are re-searched with the new language.
@@ -429,7 +432,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $fileStates = [];
         }
 
-        $cacheDir = "epg-cache/{$epg->uuid}/v1";
+        $cacheDir = $this->getActiveCacheDir($epg);
+        if ($cacheDir === null) {
+            return PluginActionResult::failure('Could not resolve EPG cache directory.');
+        }
         $currentDate = Carbon::parse($minDate);
         $endDate = Carbon::parse($maxDate);
         $totalDays = $currentDate->diffInDays($endDate) + 1;
@@ -460,6 +466,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
             if ($context->cancellationRequested()) {
                 $this->saveTmdbCache($tmdbCache);
+                $this->saveTmdbSeasonCache($tmdbSeasonCache);
+                $this->saveTmdbImagesCache($imagesCache);
                 // Merge new file states with existing ones before saving
                 $enrichmentState[$stateKey] = [
                     'settings_hash' => $settingsHash,
@@ -525,6 +533,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $keywordDetection,
                 $enrichEpisodeDetails,
                 $tmdbSeasonCache,
+                $imagesCache,
                 $context,
             );
 
@@ -564,6 +573,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Persist TMDB lookup cache
         $this->saveTmdbCache($tmdbCache);
         $this->saveTmdbSeasonCache($tmdbSeasonCache);
+        $this->saveTmdbImagesCache($imagesCache);
 
         // Persist enrichment state
         $enrichmentState[$stateKey] = [
@@ -657,6 +667,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
+        array &$imagesCache,
         PluginExecutionContext $context,
     ): array {
         $result = [
@@ -714,6 +725,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $keywordDetection,
                     $enrichEpisodeDetails,
                     $tmdbSeasonCache,
+                    $imagesCache,
                 );
 
                 if ($enrichResult['changed']) {
@@ -781,6 +793,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
+        array &$imagesCache,
     ): array {
         $result = [
             'changed' => false,
@@ -846,9 +859,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // ── Extract base title ─────────────────────────────────────────
         // EPG titles are often "Series Name - Episode Title" or "Show: Subtitle".
         // Extract the base show name for fallback TMDB search.
-        $baseTitle = $this->extractBaseTitle($title);
+        $baseExtracted = $this->extractBaseTitle($title);
+        $baseTitle = $baseExtracted['title'];
+        $year = $baseExtracted['year'];
         $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
-        $cacheSuffix = $forcedMediaType ? "|{$forcedMediaType}" : '';
+        $cacheSuffix = ($forcedMediaType ? "|{$forcedMediaType}" : '').($year ? "|y{$year}" : '');
         $fullCacheKey = $this->normalizeCacheKey($title).$cacheSuffix;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).$cacheSuffix : null;
 
@@ -865,11 +880,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
-            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType);
+            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType, $year);
             $matchedViaBase = false;
 
             if (! $tmdbData && $baseTitle !== $title) {
-                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType);
+                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType, $year);
                 $matchedViaBase = $tmdbData !== null;
             }
 
@@ -886,6 +901,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         if (! $tmdbData) {
+            if (! $result['cache_hit']) {
+                $this->logMissedTitle($title, $baseTitle, $year, $forcedMediaType);
+            }
+
             if ($mapEmbyGenres && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
                 $programme['category'] = 'Series';
                 $result['category'] = true;
@@ -898,14 +917,27 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Enrich poster/icon
         $posterUrl = $tmdbData['poster_url'] ?? null;
         $backdropUrl = $tmdbData['backdrop_url'] ?? null;
+        $mediaType = $tmdbData['_media_type'] ?? null;
 
-        if ($enrichPosters && $posterUrl && ($overwrite || ! $hasIcon)) {
-            $programme['icon'] = $posterUrl;
+        // Primary <icon> in XMLTV: prefer landscape (backdrop) over portrait (poster).
+        // Reason: emby/jellyfin/plex/tvheadend xmltv importers read only the FIRST <icon>
+        // and ignore non-standard type/orient/size attributes. Their EPG grid cells are
+        // landscape, so a portrait poster as primary icon gets cropped/stretched.
+        // For tv episodes we'll override with the episode still further below if available.
+        $primaryIconUrl = null;
+        if ($enrichBackdrops && $backdropUrl) {
+            $primaryIconUrl = $backdropUrl;
+        } elseif ($enrichPosters && $posterUrl) {
+            $primaryIconUrl = $posterUrl;
+        }
+
+        if ($primaryIconUrl !== null && ($overwrite || ! $hasIcon)) {
+            $programme['icon'] = $primaryIconUrl;
             $result['poster'] = true;
             $result['changed'] = true;
         }
 
-        // Add backdrop to images array
+        // Add backdrop to images array (size=1: primary landscape for EPG grid)
         if ($enrichBackdrops && $backdropUrl) {
             $existingUrls = array_column($programme['images'] ?? [], 'url');
             if (! in_array($backdropUrl, $existingUrls, true)) {
@@ -915,13 +947,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     'width' => 1920,
                     'height' => 1080,
                     'orient' => 'L',
-                    'size' => 3,
+                    'size' => 1,
                 ];
                 $result['changed'] = true;
             }
         }
 
-        // Add poster to images array if not already the icon
+        // Add poster to images array (size=2: portrait for info/details views)
         if ($enrichPosters && $posterUrl) {
             $existingUrls = array_column($programme['images'] ?? [], 'url');
             if (! in_array($posterUrl, $existingUrls, true)) {
@@ -937,9 +969,39 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
+        // Erweiterte images-pipeline: hole zusätzliche varianten + logo
+        if (($enrichPosters || $enrichBackdrops) && ! empty($tmdbData['tmdb_id']) && ! empty($mediaType)) {
+            $creds = $this->getTmdbCredentials();
+            if ($creds !== null) {
+                $imageSet = $this->fetchTmdbImages((int) $tmdbData['tmdb_id'], $mediaType, $imagesCache);
+                if ($imageSet !== null) {
+                    $candidates = $this->selectImageSet($imageSet, $creds['language']);
+                    $existingUrls = array_column($programme['images'] ?? [], 'url');
+                    foreach ($candidates as $img) {
+                        if (in_array($img['url'], $existingUrls, true)) {
+                            continue;
+                        }
+                        if ($img['type'] === 'poster' && ! $enrichPosters) {
+                            continue;
+                        }
+                        if ($img['type'] === 'backdrop' && ! $enrichBackdrops) {
+                            continue;
+                        }
+                        // logos sind opt-in via enrichBackdrops (L-orient assets)
+                        if ($img['type'] === 'logo' && ! $enrichBackdrops) {
+                            continue;
+                        }
+
+                        $programme['images'][] = $img;
+                        $existingUrls[] = $img['url'];
+                        $result['changed'] = true;
+                    }
+                }
+            }
+        }
+
         // Enrich category/genre
         $genres = $tmdbData['genres'] ?? '';
-        $mediaType = $tmdbData['_media_type'] ?? null;
         if ($enrichCategories && $genres !== '' && ($overwrite || ! $hasCategory)) {
             if ($mapEmbyGenres) {
                 $category = $this->mapToEmbyCategory($genres, $mediaType);
@@ -982,16 +1044,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
+                    // Episode still is more specific than the show's backdrop -> promote
+                    // it to the primary <icon> (overwrite if we set one earlier or per overwrite flag).
+                    if ($overwrite || ! $hasIcon || ($programme['icon'] ?? '') === ($backdropUrl ?? '___')) {
+                        $programme['icon'] = $stillUrl;
+                        $result['poster'] = true;
+                        $result['changed'] = true;
+                    }
+
                     $existingUrls = array_column($programme['images'] ?? [], 'url');
                     if (! in_array($stillUrl, $existingUrls, true)) {
-                        $programme['images'][] = [
+                        // Prepend so the episode still ranks above the show backdrop in images[].
+                        if (! isset($programme['images']) || ! is_array($programme['images'])) {
+                            $programme['images'] = [];
+                        }
+                        array_unshift($programme['images'], [
                             'url' => $stillUrl,
                             'type' => 'screenshot',
                             'width' => 1280,
                             'height' => 720,
                             'orient' => 'L',
-                            'size' => 2,
-                        ];
+                            'size' => 1,
+                        ]);
                         $result['changed'] = true;
                     }
                 }
@@ -1044,8 +1118,27 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'enrichment_state_epgs' => $trackedEpgs,
             'enrichment_state_files' => $trackedFiles,
             'last_enriched_at' => $lastEnrichedAt,
+            'top_missed_titles' => $this->topMissedTitles(20),
             'timestamp' => now()->toIso8601String(),
         ]);
+    }
+
+    /**
+     * Resolve the active cache version directory for an EPG.
+     * Prefers the newest version that has metadata.json, falls back to legacy versions.
+     */
+    private function getActiveCacheDir(Epg $epg): ?string
+    {
+        // Keep this list in sync with EpgCacheService::CACHE_VERSION + PREVIOUS_CACHE_VERSIONS
+        $versions = ['v2', 'v1'];
+        foreach ($versions as $version) {
+            $dir = "epg-cache/{$epg->uuid}/{$version}";
+            if (Storage::disk('local')->exists($dir.'/metadata.json')) {
+                return $dir;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -1053,12 +1146,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      */
     private function readMetadata(Epg $epg): ?array
     {
-        $path = "epg-cache/{$epg->uuid}/v1/metadata.json";
-        if (! Storage::disk('local')->exists($path)) {
+        $dir = $this->getActiveCacheDir($epg);
+        if ($dir === null) {
             return null;
         }
 
-        return json_decode(Storage::disk('local')->get($path), true);
+        return json_decode(Storage::disk('local')->get($dir.'/metadata.json'), true);
     }
 
     /**
@@ -1121,6 +1214,249 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'plugin-data/epg-enricher/tmdb-season-cache.json',
             json_encode($cache, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
         );
+    }
+
+    /**
+     * Load TMDB images endpoint cache from disk.
+     * Key = "{media_type}:{tmdb_id}".
+     *
+     * @return array<string, array|null>
+     */
+    private function loadTmdbImagesCache(): array
+    {
+        $path = storage_path('app/plugin-data/epg-enricher/tmdb-images-cache.json');
+        if (! file_exists($path)) {
+            return [];
+        }
+        $raw = file_get_contents($path);
+        if ($raw === false) {
+            return [];
+        }
+        $decoded = json_decode($raw, true);
+
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    /**
+     * Save TMDB images endpoint cache to disk.
+     *
+     * @param  array<string, array|null>  $cache
+     */
+    private function saveTmdbImagesCache(array $cache): void
+    {
+        $dir = storage_path('app/plugin-data/epg-enricher');
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $path = $dir.'/tmdb-images-cache.json';
+        @file_put_contents($path, json_encode($cache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * Append a missed (no-TMDB-match) title to the JSONL log for later tuning.
+     */
+    private function logMissedTitle(string $title, string $baseTitle, ?int $year, ?string $forcedMediaType): void
+    {
+        $dir = storage_path('app/plugin-data/epg-enricher');
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $line = json_encode([
+            'ts' => date('c'),
+            'title' => $title,
+            'base' => $baseTitle,
+            'year' => $year,
+            'forced_type' => $forcedMediaType,
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        @file_put_contents($dir.'/missed-titles.jsonl', $line."\n", FILE_APPEND | LOCK_EX);
+    }
+
+    /**
+     * Aggregate the missed-titles log into a top-N count list.
+     *
+     * @return array<int, array{title: string, count: int, last_seen: string}>
+     */
+    private function topMissedTitles(int $limit = 20): array
+    {
+        $path = storage_path('app/plugin-data/epg-enricher/missed-titles.jsonl');
+        if (! file_exists($path)) {
+            return [];
+        }
+        $counts = [];
+        $lastSeen = [];
+        $handle = @fopen($path, 'r');
+        if (! $handle) {
+            return [];
+        }
+        while (($line = fgets($handle)) !== false) {
+            $entry = json_decode(trim($line), true);
+            if (! is_array($entry) || empty($entry['title'])) {
+                continue;
+            }
+            $key = (string) $entry['title'];
+            $counts[$key] = ($counts[$key] ?? 0) + 1;
+            $lastSeen[$key] = $entry['ts'] ?? '';
+        }
+        fclose($handle);
+        arsort($counts);
+        $out = [];
+        foreach (array_slice($counts, 0, $limit, true) as $title => $count) {
+            $out[] = [
+                'title' => $title,
+                'count' => $count,
+                'last_seen' => $lastSeen[$title] ?? '',
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Fetch /movie/{id}/images or /tv/{id}/images from TMDB.
+     *
+     * @return array{posters: array, backdrops: array, logos: array}|null
+     */
+    private function fetchTmdbImages(int $tmdbId, string $mediaType, array &$cache): ?array
+    {
+        $cacheKey = "{$mediaType}:{$tmdbId}";
+        if (array_key_exists($cacheKey, $cache)) {
+            return $cache[$cacheKey];
+        }
+
+        $creds = $this->getTmdbCredentials();
+        if ($creds === null) {
+            return null;
+        }
+
+        $endpoint = $mediaType === 'movie' ? "movie/{$tmdbId}/images" : "tv/{$tmdbId}/images";
+        $shortLang = explode('-', $creds['language'])[0] ?? 'en';
+
+        try {
+            $response = Http::timeout(15)->get(
+                "https://api.themoviedb.org/3/{$endpoint}",
+                [
+                    'api_key' => $creds['key'],
+                    // null = sprach-neutrale assets (wichtig für logos)
+                    'include_image_language' => "{$shortLang},en,null",
+                ]
+            );
+
+            if (! $response->successful()) {
+                $cache[$cacheKey] = null;
+
+                return null;
+            }
+
+            $data = $response->json();
+            $result = [
+                'posters' => is_array($data['posters'] ?? null) ? $data['posters'] : [],
+                'backdrops' => is_array($data['backdrops'] ?? null) ? $data['backdrops'] : [],
+                'logos' => is_array($data['logos'] ?? null) ? $data['logos'] : [],
+            ];
+            $cache[$cacheKey] = $result;
+
+            return $result;
+        } catch (\Throwable $e) {
+            Log::warning('[EpgEnricher] TMDB images fetch failed', [
+                'tmdb_id' => $tmdbId,
+                'media_type' => $mediaType,
+                'error' => $e->getMessage(),
+            ]);
+            $cache[$cacheKey] = null;
+
+            return null;
+        }
+    }
+
+    /**
+     * Select the best image variants per type from a TMDB images response.
+     * Returns programme-ready image entries (url + type + width + height + orient + size).
+     *
+     * @param  array{posters: array, backdrops: array, logos: array}  $images
+     * @return array<int, array{url: string, type: string, width: int, height: int, orient: string, size: int}>
+     */
+    private function selectImageSet(array $images, string $userLang): array
+    {
+        $shortLang = explode('-', $userLang)[0] ?? 'en';
+        $out = [];
+
+        $rank = function (array $img, array $langPriority): int {
+            $iso = $img['iso_639_1'] ?? null;
+            foreach ($langPriority as $idx => $code) {
+                if ($iso === $code || ($code === null && $iso === null)) {
+                    return $idx;
+                }
+            }
+
+            return count($langPriority);
+        };
+
+        $sortBy = function (array $a, array $b, array $langPriority) use ($rank): int {
+            $ra = $rank($a, $langPriority);
+            $rb = $rank($b, $langPriority);
+            if ($ra !== $rb) {
+                return $ra <=> $rb;
+            }
+
+            // Höhere vote_average zuerst
+            return ($b['vote_average'] ?? 0) <=> ($a['vote_average'] ?? 0);
+        };
+
+        // Backdrops zuerst (landscape primary, size=1) — sprach-neutral bevorzugt
+        $backdrops = $images['backdrops'] ?? [];
+        $langPrioBack = [null, $shortLang, 'en'];
+        usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
+        foreach (array_slice($backdrops, 0, 2) as $b) {
+            if (empty($b['file_path'])) {
+                continue;
+            }
+            $out[] = [
+                'url' => 'https://image.tmdb.org/t/p/w1280'.$b['file_path'],
+                'type' => 'backdrop',
+                'width' => 1280,
+                'height' => (int) round(1280 / max($b['aspect_ratio'] ?? 1.778, 0.1)),
+                'orient' => 'L',
+                'size' => 1,
+            ];
+        }
+
+        // Posters: user-lang bevorzugt (portrait, size=2)
+        $posters = $images['posters'] ?? [];
+        $langPrioPoster = [$shortLang, 'en', null];
+        usort($posters, fn ($a, $b) => $sortBy($a, $b, $langPrioPoster));
+        foreach (array_slice($posters, 0, 2) as $p) {
+            if (empty($p['file_path'])) {
+                continue;
+            }
+            $out[] = [
+                'url' => 'https://image.tmdb.org/t/p/w500'.$p['file_path'],
+                'type' => 'poster',
+                'width' => 500,
+                'height' => (int) round(500 / max($p['aspect_ratio'] ?? 0.667, 0.1)),
+                'orient' => 'P',
+                'size' => 2,
+            ];
+        }
+
+        // Logos: user-lang→en→null (landscape transparent, size=3)
+        $logos = $images['logos'] ?? [];
+        $langPrioLogo = [$shortLang, 'en', null];
+        usort($logos, fn ($a, $b) => $sortBy($a, $b, $langPrioLogo));
+        foreach (array_slice($logos, 0, 1) as $l) {
+            if (empty($l['file_path'])) {
+                continue;
+            }
+            $out[] = [
+                'url' => 'https://image.tmdb.org/t/p/w500'.$l['file_path'],
+                'type' => 'logo',
+                'width' => 500,
+                'height' => (int) round(500 / max($l['aspect_ratio'] ?? 2.5, 0.1)),
+                'orient' => 'L',
+                'size' => 3,
+            ];
+        }
+
+        return $out;
     }
 
     /**
@@ -1228,9 +1564,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * by the caller: the full title is searched at TMDB first and only if
      * validation fails does the base title get tried.
      */
-    private function extractBaseTitle(string $title): string
+    private function extractBaseTitle(string $title): array
     {
         $title = trim($title);
+
+        // Extract year if present (e.g. "Inception (2010)", "Avatar - 2009").
+        // Use the LAST occurrence so titles containing a year token early
+        // (rare but possible) don't trick us.
+        $year = null;
+        if (preg_match_all('/\b(19\d{2}|20\d{2})\b/', $title, $yearMatches)) {
+            $year = (int) end($yearMatches[1]);
+        }
 
         // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
         $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', $title);
@@ -1239,17 +1583,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
         $cleaned = rtrim(trim($cleaned), '-–— ');
 
+        // Strip trailing year markers like "(2010)" or " - 2009"
+        $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
+        $cleaned = preg_replace('/\s*[-–—]\s*(?:19\d{2}|20\d{2})\s*$/', '', $cleaned);
+        $cleaned = rtrim(trim($cleaned), '-–— ');
+
         // Split at " - " / " – " / " — " (most common EPG episode separator)
         if (preg_match('/^(.{2,}?)\s+[-–—]\s+(.+)$/u', $cleaned, $m)) {
-            return trim($m[1]);
+            return ['title' => trim($m[1]), 'year' => $year];
         }
 
         // Split at ": " when right part is long (episode subtitle, not abbreviation like "LA")
         if (preg_match('/^(.{2,}?):\s+(.{8,})$/u', $cleaned, $m)) {
-            return trim($m[1]);
+            return ['title' => trim($m[1]), 'year' => $year];
         }
 
-        return $cleaned;
+        return ['title' => $cleaned, 'year' => $year];
     }
 
     /**
@@ -1258,15 +1607,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * Searches TV series first, then movies. Validates that the returned title
      * actually matches what we searched for (prevents "Sturm der Liebe" → "Fanaa").
      *
-     * @return array|null  TMDB data with '_media_type' set, or null if no good match
+     * @return array|null TMDB data with '_media_type' set, or null if no good match
      */
-    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle, ?string $forceMediaType = null): ?array
+    private function searchTmdbWithValidation(TmdbService $tmdb, string $searchTitle, ?string $forceMediaType = null, ?int $year = null): ?array
     {
         $searchNorm = mb_strtolower(trim($searchTitle));
 
         if ($forceMediaType !== 'movie') {
             // Try TV series first (EPG = primarily TV content)
-            $tvResult = $tmdb->searchTvSeries($searchTitle);
+            $tvResult = $tmdb->searchTvSeries($searchTitle, $year);
             if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
                 // Check against both the localized display name AND the original language name.
                 // When TMDB is configured with a non-English language (e.g. de-DE), the returned
@@ -1297,7 +1646,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         // Try movie search
-        $movieResult = $tmdb->searchMovie($searchTitle, tryFallback: true);
+        $movieResult = $tmdb->searchMovie($searchTitle, $year, tryFallback: true);
         if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
             $tmdbLocalTitle = $movieResult['title'] ?? '';
             $tmdbOriginalTitle = $movieResult['original_title'] ?? '';
@@ -1435,7 +1784,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * Detect an Emby category from keywords found in the programme title.
      * Used as a fallback when TMDB lookup fails (live sports, news, etc.).
      *
-     * @return string|null  The matched category, or null if no keywords match
+     * @return string|null The matched category, or null if no keywords match
      */
     private function detectCategoryFromTitle(string $title): ?string
     {
@@ -1445,7 +1794,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             foreach ($keywords as $keyword) {
                 // Use word boundary matching to avoid false positives
                 // e.g. "art" should not match inside "Karting"
-                $pattern = '/(?:^|[\s\-\/\|:.,;!?\(\[])' . preg_quote($keyword, '/') . '(?:$|[\s\-\/\|:.,;!?\)\]])/u';
+                $pattern = '/(?:^|[\s\-\/\|:.,;!?\(\[])'.preg_quote($keyword, '/').'(?:$|[\s\-\/\|:.,;!?\)\]])/u';
                 if (preg_match($pattern, $titleLower)) {
                     return $category;
                 }
@@ -1585,6 +1934,30 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         return null;
+    }
+
+    /**
+     * Resolve TMDB api credentials from GeneralSettings.
+     * Returns null if not configured (caller should skip image fetch silently).
+     *
+     * @return array{key: string, language: string}|null
+     */
+    private function getTmdbCredentials(): ?array
+    {
+        try {
+            $settings = app(GeneralSettings::class);
+            $key = trim((string) ($settings->tmdb_api_key ?? ''));
+            if ($key === '') {
+                return null;
+            }
+            $language = $settings->tmdb_language ?? 'de-DE';
+
+            return ['key' => $key, 'language' => $language];
+        } catch (\Throwable $e) {
+            Log::warning('[EpgEnricher] Failed to resolve TMDB credentials', ['error' => $e->getMessage()]);
+
+            return null;
+        }
     }
 
     /**
