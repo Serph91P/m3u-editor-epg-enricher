@@ -1918,6 +1918,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
 
         [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+        $seFromText = false;
+        if ($season === null && $episode === null) {
+            $haystack = $subtitle.' '.trim((string) ($programme['desc'] ?? ''));
+            if (trim($haystack) !== '') {
+                [$season, $episode] = $this->parseSeasonEpisodeFromText($haystack);
+                if ($season !== null || $episode !== null) {
+                    $seFromText = true;
+                }
+            }
+        }
 
         $hasSubtitle = $subtitle !== '';
         $hasParsedEpisode = $season !== null || $episode !== null;
@@ -1926,7 +1936,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
 
         $confidence = 'none';
-        if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId)) {
+        if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId) && ! $seFromText) {
             $confidence = 'high';
         } elseif ($isSeriesEpisode) {
             $confidence = 'medium';
@@ -1970,6 +1980,41 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return [(int) $m[1], (int) $m[2]];
         }
         if (preg_match('/(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/u', $value, $m)) {
+            return [null, (int) $m[1]];
+        }
+
+        return [null, null];
+    }
+
+    /**
+     * Parse season/episode from arbitrary text (subtitle/desc) covering DE/EN/ES/FR markers.
+     *
+     * @return array{0: int|null, 1: int|null}
+     */
+    private function parseSeasonEpisodeFromText(string $text): array
+    {
+        $value = mb_strtolower(trim($text));
+        if ($value === '') {
+            return [null, null];
+        }
+
+        $patterns = [
+            '/\bs(\d{1,2})\s?e(\d{1,3})\b/i',
+            '/\b(\d{1,2})x(\d{1,3})\b/',
+            '/\bstaffel\s*(\d{1,2})[\s,.\-]+(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/iu',
+            '/\btemporada\s*(\d{1,2})[\s,.\-]+(?:cap[ií]tulo|episodio|ep\.?)\s*(\d{1,3})/iu',
+            '/\bseason\s*(\d{1,2})[\s,.\-]+episode\s*(\d{1,3})/i',
+            '/\bsaison\s*(\d{1,2})[\s,.\-]+(?:[ée]pisode|ep\.?)\s*(\d{1,3})/iu',
+            '/\bt(\d{1,2})\s*[\.\-x]\s*e?(\d{1,3})/i',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $value, $m)) {
+                return [(int) $m[1], (int) $m[2]];
+            }
+        }
+
+        if (preg_match('/(?:folge|episode|ep\.?|teil|cap[ií]tulo|episodio)\s*(\d{1,3})/iu', $value, $m)) {
             return [null, (int) $m[1]];
         }
 
