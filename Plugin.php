@@ -919,13 +919,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $backdropUrl = $tmdbData['backdrop_url'] ?? null;
         $mediaType = $tmdbData['_media_type'] ?? null;
 
-        if ($enrichPosters && $posterUrl && ($overwrite || ! $hasIcon)) {
-            $programme['icon'] = $posterUrl;
+        // Primary <icon> in XMLTV: prefer landscape (backdrop) over portrait (poster).
+        // Reason: emby/jellyfin/plex/tvheadend xmltv importers read only the FIRST <icon>
+        // and ignore non-standard type/orient/size attributes. Their EPG grid cells are
+        // landscape, so a portrait poster as primary icon gets cropped/stretched.
+        // For tv episodes we'll override with the episode still further below if available.
+        $primaryIconUrl = null;
+        if ($enrichBackdrops && $backdropUrl) {
+            $primaryIconUrl = $backdropUrl;
+        } elseif ($enrichPosters && $posterUrl) {
+            $primaryIconUrl = $posterUrl;
+        }
+
+        if ($primaryIconUrl !== null && ($overwrite || ! $hasIcon)) {
+            $programme['icon'] = $primaryIconUrl;
             $result['poster'] = true;
             $result['changed'] = true;
         }
 
-        // Add backdrop to images array
+        // Add backdrop to images array (size=1: primary landscape for EPG grid)
         if ($enrichBackdrops && $backdropUrl) {
             $existingUrls = array_column($programme['images'] ?? [], 'url');
             if (! in_array($backdropUrl, $existingUrls, true)) {
@@ -935,13 +947,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     'width' => 1920,
                     'height' => 1080,
                     'orient' => 'L',
-                    'size' => 3,
+                    'size' => 1,
                 ];
                 $result['changed'] = true;
             }
         }
 
-        // Add poster to images array if not already the icon
+        // Add poster to images array (size=2: portrait for info/details views)
         if ($enrichPosters && $posterUrl) {
             $existingUrls = array_column($programme['images'] ?? [], 'url');
             if (! in_array($posterUrl, $existingUrls, true)) {
@@ -1032,16 +1044,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
+                    // Episode still is more specific than the show's backdrop -> promote
+                    // it to the primary <icon> (overwrite if we set one earlier or per overwrite flag).
+                    if ($overwrite || ! $hasIcon || ($programme['icon'] ?? '') === ($backdropUrl ?? '___')) {
+                        $programme['icon'] = $stillUrl;
+                        $result['poster'] = true;
+                        $result['changed'] = true;
+                    }
+
                     $existingUrls = array_column($programme['images'] ?? [], 'url');
                     if (! in_array($stillUrl, $existingUrls, true)) {
-                        $programme['images'][] = [
+                        // Prepend so the episode still ranks above the show backdrop in images[].
+                        if (! isset($programme['images']) || ! is_array($programme['images'])) {
+                            $programme['images'] = [];
+                        }
+                        array_unshift($programme['images'], [
                             'url' => $stillUrl,
                             'type' => 'screenshot',
                             'width' => 1280,
                             'height' => 720,
                             'orient' => 'L',
-                            'size' => 2,
-                        ];
+                            'size' => 1,
+                        ]);
                         $result['changed'] = true;
                     }
                 }
@@ -1378,7 +1402,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return ($b['vote_average'] ?? 0) <=> ($a['vote_average'] ?? 0);
         };
 
-        // Posters: user-lang bevorzugt
+        // Backdrops zuerst (landscape primary, size=1) — sprach-neutral bevorzugt
+        $backdrops = $images['backdrops'] ?? [];
+        $langPrioBack = [null, $shortLang, 'en'];
+        usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
+        foreach (array_slice($backdrops, 0, 2) as $b) {
+            if (empty($b['file_path'])) {
+                continue;
+            }
+            $out[] = [
+                'url' => 'https://image.tmdb.org/t/p/w1280'.$b['file_path'],
+                'type' => 'backdrop',
+                'width' => 1280,
+                'height' => (int) round(1280 / max($b['aspect_ratio'] ?? 1.778, 0.1)),
+                'orient' => 'L',
+                'size' => 1,
+            ];
+        }
+
+        // Posters: user-lang bevorzugt (portrait, size=2)
         $posters = $images['posters'] ?? [];
         $langPrioPoster = [$shortLang, 'en', null];
         usort($posters, fn ($a, $b) => $sortBy($a, $b, $langPrioPoster));
@@ -1396,25 +1438,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             ];
         }
 
-        // Backdrops: sprach-neutral bevorzugt
-        $backdrops = $images['backdrops'] ?? [];
-        $langPrioBack = [null, $shortLang, 'en'];
-        usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
-        foreach (array_slice($backdrops, 0, 2) as $b) {
-            if (empty($b['file_path'])) {
-                continue;
-            }
-            $out[] = [
-                'url' => 'https://image.tmdb.org/t/p/w1280'.$b['file_path'],
-                'type' => 'backdrop',
-                'width' => 1280,
-                'height' => (int) round(1280 / max($b['aspect_ratio'] ?? 1.778, 0.1)),
-                'orient' => 'L',
-                'size' => 3,
-            ];
-        }
-
-        // Logos: user-lang→en→null
+        // Logos: user-lang→en→null (landscape transparent, size=3)
         $logos = $images['logos'] ?? [];
         $langPrioLogo = [$shortLang, 'en', null];
         usort($logos, fn ($a, $b) => $sortBy($a, $b, $langPrioLogo));
@@ -1428,7 +1452,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 'width' => 500,
                 'height' => (int) round(500 / max($l['aspect_ratio'] ?? 2.5, 0.1)),
                 'orient' => 'L',
-                'size' => 1,
+                'size' => 3,
             ];
         }
 
