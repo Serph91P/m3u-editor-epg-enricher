@@ -107,18 +107,18 @@
       "collapsed": true,
       "fields": [
         {
-          "id": "map_emby_genres",
+          "id": "map_genres_to_epg_categories",
           "type": "boolean",
-          "label": "Map genres to Emby EPG colors",
+          "label": "Map genres to EPG categories (color-coding)",
           "default": false,
-          "helper_text": "Normalize TMDB genres to Emby-compatible category names (e.g. Movie, News, Sports, Kids) so Emby can color-code programmes in its guide."
+          "helper_text": "Normalize TMDB genres to canonical EPG category names (Movie, Series, News, Sports, Kids, Documentary, Music, Education) so clients like Emby, Jellyfin, Kodi, and Plex can color-code and filter the guide."
         },
         {
           "id": "keyword_category_detection",
           "type": "boolean",
           "label": "Detect categories from title keywords",
           "default": true,
-          "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to Emby EPG colors' is also enabled."
+          "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to EPG categories' is also enabled."
         }
       ]
     },
