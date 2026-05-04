@@ -148,12 +148,16 @@ jobs:
           jq --arg v "${{ steps.version.outputs.new }}" '.version = $v' plugin.json > plugin.json.tmp
           mv plugin.json.tmp plugin.json
 
+      - name: Bump ENRICHMENT_LOGIC_VERSION in Plugin.php
+        if: steps.bump.outputs.type != 'none'
+        run: bash scripts/bump-logic-version.sh "${{ steps.version.outputs.tag }}"
+
       - name: Commit and tag
         if: steps.bump.outputs.type != 'none'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add plugin.json
+          git add plugin.json Plugin.php
           git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
           git push origin HEAD "${{ steps.version.outputs.tag }}"
