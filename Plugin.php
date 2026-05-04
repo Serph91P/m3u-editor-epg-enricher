@@ -1063,28 +1063,23 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
-                    // Episode still is more specific than the show's backdrop -> promote
-                    // it to the primary <icon> (overwrite if we set one earlier or per overwrite flag).
-                    if ($overwrite || ! $hasIcon || ($programme['icon'] ?? '') === ($backdropUrl ?? '___')) {
-                        $programme['icon'] = $stillUrl;
-                        $result['poster'] = true;
-                        $result['changed'] = true;
-                    }
-
+                    // Episode still is added to images[] only (type=screenshot). It must NOT
+                    // overwrite the primary <icon>, which is reserved for the series backdrop.
+                    // Attribute-blind clients (Emby, Tvheadend) read only the first <icon>;
+                    // promoting a portrait-feeling still there breaks the EPG grid.
                     $existingUrls = array_column($programme['images'] ?? [], 'url');
                     if (! in_array($stillUrl, $existingUrls, true)) {
-                        // Prepend so the episode still ranks above the show backdrop in images[].
                         if (! isset($programme['images']) || ! is_array($programme['images'])) {
                             $programme['images'] = [];
                         }
-                        array_unshift($programme['images'], [
+                        $programme['images'][] = [
                             'url' => $stillUrl,
                             'type' => 'screenshot',
                             'width' => 1280,
                             'height' => 720,
                             'orient' => 'L',
-                            'size' => 1,
-                        ]);
+                            'size' => 2,
+                        ];
                         $result['changed'] = true;
                     }
                 }
