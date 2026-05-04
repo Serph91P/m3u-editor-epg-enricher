@@ -39,7 +39,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-images-landscape-fix';
     /**
      * Mapping of TMDB genre names (English + German) to Emby EPG categories.
      *
