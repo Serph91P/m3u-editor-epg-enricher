@@ -881,6 +881,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $baseExtracted = $this->extractBaseTitle($title);
         $baseTitle = $baseExtracted['title'];
         $year = $baseExtracted['year'];
+        if ($year === null) {
+            $desc = trim((string) ($programme['desc'] ?? ''));
+            if ($desc !== '') {
+                // Look for a 4-digit year token anywhere in desc.
+                // Use the FIRST occurrence (production year typically appears early
+                // in EPG descriptions: "USA 2010, Action mit ..." / "Spielfilm, 2010").
+                if (preg_match('/\b(19\d{2}|20\d{2})\b/', $desc, $ym)) {
+                    $candidate = (int) $ym[1];
+                    $currentYear = (int) date('Y');
+                    // Sanity bound: do not accept future years beyond current+2.
+                    if ($candidate >= 1900 && $candidate <= $currentYear + 2) {
+                        $year = $candidate;
+                    }
+                }
+            }
+        }
         $forcedMediaType = $isSeriesEpisode ? 'tv' : null;
         $cacheSuffix = ($forcedMediaType ? "|{$forcedMediaType}" : '').($year ? "|y{$year}" : '');
         $fullCacheKey = $this->normalizeCacheKey($title).$cacheSuffix;
