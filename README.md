@@ -8,7 +8,7 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 - **TMDB Artwork** - Adds poster and backdrop images to programmes missing artwork
 - **Genre/Category** - Fills in missing programme genres from TMDB data
 - **Descriptions** - Adds missing programme descriptions/overviews from TMDB
-- **EPG Category Mapping** - Maps genres to canonical EPG categories (News, Sports, Kids, Movie, etc.) for color-coded guides in Emby, Jellyfin, Kodi, and Plex
+- **EPG Category Mapping** - Maps genres to compact Emby compatible categories or detailed Kodi guide color genres from m3u-editor issue 347
 - **Gracenote-aware** - Respects existing Schedules Direct / Gracenote metadata and only fills gaps
 - **Title Cache** - Caches TMDB lookups to disk to avoid redundant API calls across runs
 
@@ -26,7 +26,8 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 | Overwrite existing | Off | Replace existing metadata even if already present (e.g. from Schedules Direct) |
 | Enrich categories | On | Fill missing genre/category from TMDB |
 | Enrich descriptions | On | Fill missing descriptions from TMDB |
-| Map genres to EPG categories | Off | Normalize genres to canonical EPG categories (Movie, Series, News, Sports, Kids, Documentary, Music, Education) for guide color coding in Emby, Jellyfin, Kodi, Plex |
+| Map genres to Emby compatible categories | Off | Normalize genres to compact Emby-style categories (Movie, Series, News, Sports, Kids, Documentary, Music, Education) |
+| Map genres to Kodi guide color genres | Off | Normalize genres to the detailed Kodi labels from m3u-editor issue 347 (Basketball, Public Affairs, Comedy-Drama, Science Fiction, Cooking, Game Show, etc.). This takes precedence over the Emby compatible mapping when both are enabled. |
 | Auto-run on cache | On | Run automatically after EPG cache generation |
 
 ## How It Works

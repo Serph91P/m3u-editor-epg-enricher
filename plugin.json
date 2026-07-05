@@ -109,9 +109,16 @@
         {
           "id": "map_genres_to_epg_categories",
           "type": "boolean",
-          "label": "Map genres to EPG categories (color-coding)",
+          "label": "Map genres to Emby compatible EPG categories",
           "default": false,
-          "helper_text": "Normalize TMDB genres to canonical EPG category names (Movie, Series, News, Sports, Kids, Documentary, Music, Education) so clients like Emby, Jellyfin, Kodi, and Plex can color-code and filter the guide."
+          "helper_text": "Normalize TMDB genres to the compact category names used by Emby-style guide coloring: Movie, Series, News, Sports, Kids, Documentary, Music, Education."
+        },
+        {
+          "id": "map_genres_to_kodi_guide_genres",
+          "type": "boolean",
+          "label": "Map genres to Kodi guide color genres",
+          "default": false,
+          "helper_text": "Use the detailed Kodi genre labels from m3u-editor issue 347, such as Basketball, Public Affairs, Comedy-Drama, Science Fiction, Cooking, and Game Show. When enabled, this takes precedence over the compact Emby compatible category option."
         },
         {
           "id": "keyword_category_detection",
