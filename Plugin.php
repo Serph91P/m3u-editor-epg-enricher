@@ -39,7 +39,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.05.04-v1.12.0';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.07.05-kodi-genres';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -244,6 +244,133 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'sprachkurs' => 'Education',
         'language' => 'Education',
         'wissensmagazin' => 'Education',
+    ];
+
+    /**
+     * Detailed Kodi guide genre labels from m3u-editor issue 347.
+     *
+     * These are intentionally separate from the compact Emby compatible
+     * category map above. Kodi skins can color many more genre labels, while
+     * Emby style guide coloring works best with the compact category set.
+     *
+     * @var array<string, string>
+     */
+    private const array KODI_GUIDE_GENRE_MAP = [
+        'sport' => 'Sport',
+        'sports' => 'Sport',
+        'sports event' => 'Sports Event',
+        'sports talk' => 'Sports Talk',
+        'archery' => 'Archery',
+        'rodeo' => 'Rodeo',
+        'card games' => 'Card Games',
+        'martial arts' => 'Martial Arts',
+        'basketball' => 'Basketball',
+        'baseball' => 'Baseball',
+        'hockey' => 'Hockey',
+        'football' => 'Football',
+        'boxing' => 'Boxing',
+        'golf' => 'Golf',
+        'auto racing' => 'Auto Racing',
+        'motorsport' => 'Auto Racing',
+        'playoff sports' => 'Playoff Sports',
+        'hunting' => 'Hunting',
+        'gymnastics' => 'Gymnastics',
+        'shooting' => 'Shooting',
+        'sports non-event' => 'Sports non-event',
+        'news' => 'News',
+        'public affairs' => 'Public Affairs',
+        'newsmagazine' => 'Newsmagazine',
+        'politics' => 'Public Affairs',
+        'entertainment' => 'Entertainment',
+        'community' => 'Community',
+        'talk' => 'Talk',
+        'interview' => 'Interview',
+        'weather' => 'Weather',
+        'comedy' => 'Comedy',
+        'comedy-drama' => 'Comedy-Drama',
+        'comedy drama' => 'Comedy-Drama',
+        'romance-comedy' => 'Romance-Comedy',
+        'romance comedy' => 'Romance-Comedy',
+        'sitcom' => 'Sitcom',
+        'comedy-romance' => 'Comedy-Romance',
+        'comedy romance' => 'Comedy-Romance',
+        'musical' => 'Musical',
+        'music' => 'Music',
+        'musical comedy' => 'Musical Comedy',
+        'documentary' => 'Documentary',
+        'history' => 'History',
+        'biography' => 'Biography',
+        'educational' => 'Educational',
+        'education' => 'Educational',
+        'animals' => 'Animals',
+        'nature' => 'Nature',
+        'health' => 'Health',
+        'animation' => 'Animation',
+        'animated' => 'Animated',
+        'anime' => 'Anime',
+        'children' => 'Children',
+        'kids' => 'Children',
+        'cartoon' => 'Cartoon',
+        'family' => 'Family',
+        'movie' => 'Movie',
+        'film' => 'Movie',
+        'drama' => 'Drama',
+        'romance' => 'Romance',
+        'historical drama' => 'Historical Drama',
+        'outdoors' => 'Outdoors',
+        'special' => 'Special',
+        'reality' => 'Reality',
+        'suspense' => 'Suspense',
+        'horror' => 'Horror',
+        'horror suspense' => 'Horror Suspense',
+        'paranormal' => 'Paranormal',
+        'thriller' => 'Thriller',
+        'fantasy' => 'Fantasy',
+        'action' => 'Action',
+        'adventure' => 'Adventure',
+        'action and adventure' => 'Action and Adventure',
+        'action adventure' => 'Action and Adventure',
+        'action & adventure' => 'Action and Adventure',
+        'crime' => 'Crime',
+        'crime drama' => 'Crime Drama',
+        'mystery' => 'Mystery',
+        'science fiction' => 'Science Fiction',
+        'sci-fi' => 'Science Fiction',
+        'sci fi' => 'Science Fiction',
+        'series' => 'Series',
+        'western' => 'Western',
+        'soap' => 'Soap',
+        'variety' => 'Variety',
+        'war' => 'War',
+        'law' => 'Law',
+        'adults only' => 'Adults Only',
+        'auto' => 'Auto',
+        'collectibles' => 'Collectibles',
+        'travel' => 'Travel',
+        'shopping' => 'Shopping',
+        'house garden' => 'House Garden',
+        'home and garden' => 'Home and Garden',
+        'gardening' => 'Gardening',
+        'fitness health' => 'Fitness Health',
+        'fitness' => 'Fitness',
+        'home improvement' => 'Home Improvement',
+        'how-to' => 'How-To',
+        'how to' => 'How-To',
+        'cooking' => 'Cooking',
+        'fashion' => 'Fashion',
+        'aviation' => 'Aviation',
+        'dance' => 'Dance',
+        'auction' => 'Auction',
+        'art' => 'Art',
+        'exercise' => 'Exercise',
+        'parenting' => 'Parenting',
+        'consumer' => 'Consumer',
+        'game show' => 'Game Show',
+        'gameshow' => 'Game Show',
+        'other' => 'Other',
+        'unknown' => 'Unknown',
+        'religious' => 'Religious',
+        'anthology' => 'Anthology',
     ];
 
     /**
@@ -508,6 +635,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $mapGenresToEpgCategories = $settings['map_genres_to_epg_categories']
             ?? $settings['map_emby_genres']
             ?? false;
+        $mapGenresToKodiGuideGenres = $settings['map_genres_to_kodi_guide_genres'] ?? false;
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
         $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
 
@@ -680,6 +808,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $enrichPosters,
                 $enrichBackdrops,
                 $mapGenresToEpgCategories,
+                $mapGenresToKodiGuideGenres,
                 $keywordDetection,
                 $enrichEpisodeDetails,
                 $tmdbSeasonCache,
@@ -814,6 +943,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $enrichPosters,
         bool $enrichBackdrops,
         bool $mapGenresToEpgCategories,
+        bool $mapGenresToKodiGuideGenres,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
@@ -872,6 +1002,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     $enrichPosters,
                     $enrichBackdrops,
                     $mapGenresToEpgCategories,
+                    $mapGenresToKodiGuideGenres,
                     $keywordDetection,
                     $enrichEpisodeDetails,
                     $tmdbSeasonCache,
@@ -940,6 +1071,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         bool $enrichPosters,
         bool $enrichBackdrops,
         bool $mapGenresToEpgCategories,
+        bool $mapGenresToKodiGuideGenres,
         bool $keywordDetection,
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
@@ -972,7 +1104,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
         $isSeriesEpisode = $seriesSignals['is_series_episode'] || $hasEpisodicTitleKeyword;
         $isSeriesLikeCategory = in_array(mb_strtolower($existingCategory), ['series', 'kids'], true);
-        $needsCategoryFix = $mapGenresToEpgCategories
+        $categoryMappingEnabled = $mapGenresToEpgCategories || $mapGenresToKodiGuideGenres;
+        $needsCategoryFix = $categoryMappingEnabled
             && $enrichCategories
             && $hasCategory
             && $isSeriesEpisode
@@ -991,10 +1124,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // This prevents unnecessary TMDB lookups for live sports, news, etc. and avoids
         // wrong matches like "ALL IN - Die Bundesliga Highlight Show" → film "All In".
         $keywordCategory = null;
-        if ($keywordDetection && $mapGenresToEpgCategories && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
+        if ($keywordDetection && $categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
             $keywordCategory = $this->detectCategoryFromTitle($title);
             if ($keywordCategory !== null) {
-                $programme['category'] = $keywordCategory;
+                $programme['category'] = $mapGenresToKodiGuideGenres
+                    ? $this->mapToKodiGuideGenre($keywordCategory, null)
+                    : $keywordCategory;
                 $result['category'] = true;
                 $result['changed'] = true;
             }
@@ -1071,8 +1206,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $this->logMissedTitle($title, $baseTitle, $year, $forcedMediaType);
             }
 
-            if ($mapGenresToEpgCategories && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
-                $programme['category'] = 'Series';
+            if ($categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
+                $programme['category'] = $mapGenresToKodiGuideGenres
+                    ? $this->mapToKodiGuideGenre('Series', 'tv')
+                    : 'Series';
                 $result['category'] = true;
                 $result['changed'] = true;
             }
@@ -1169,7 +1306,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Enrich category/genre
         $genres = $tmdbData['genres'] ?? '';
         if ($enrichCategories && $genres !== '' && ($overwrite || ! $hasCategory)) {
-            if ($mapGenresToEpgCategories) {
+            if ($mapGenresToKodiGuideGenres) {
+                $category = $this->mapToKodiGuideGenre($genres, $mediaType);
+            } elseif ($mapGenresToEpgCategories) {
                 $category = $this->mapToEpgCategory($genres, $mediaType);
             } else {
                 // Take the first genre if comma-separated
@@ -1180,9 +1319,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $result['category'] = true;
                 $result['changed'] = true;
             }
-        } elseif ($mapGenresToEpgCategories && $hasCategory) {
-            // Map existing category to canonical EPG category even if not enriching from TMDB
-            $mapped = $this->mapToEpgCategory($programme['category'], $mediaType);
+        } elseif (($mapGenresToKodiGuideGenres || $mapGenresToEpgCategories) && $hasCategory) {
+            // Map existing category even if not enriching from TMDB.
+            $mapped = $mapGenresToKodiGuideGenres
+                ? $this->mapToKodiGuideGenre($programme['category'], $mediaType)
+                : $this->mapToEpgCategory($programme['category'], $mediaType);
             if ($mapped !== $programme['category']) {
                 $programme['category'] = $mapped;
                 $result['category'] = true;
@@ -1814,6 +1955,44 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
+     * Map TMDB or provider genres to detailed Kodi guide color labels.
+     *
+     * @param  string  $genres  Comma-separated genre string
+     * @param  string|null  $mediaType  Reserved for future client-specific tuning
+     */
+    private function mapToKodiGuideGenre(string $genres, ?string $mediaType): string
+    {
+        $genreList = array_values(array_filter(array_map('trim', explode(',', $genres)), fn ($genre) => $genre !== ''));
+        $genreKeys = array_map('mb_strtolower', $genreList);
+        $genreSet = array_fill_keys($genreKeys, true);
+
+        $comboMatches = [
+            [['comedy', 'drama'], 'Comedy-Drama'],
+            [['romance', 'comedy'], 'Romance-Comedy'],
+            [['comedy', 'romance'], 'Comedy-Romance'],
+            [['horror', 'suspense'], 'Horror Suspense'],
+            [['action', 'adventure'], 'Action and Adventure'],
+            [['crime', 'drama'], 'Crime Drama'],
+            [['fitness', 'health'], 'Fitness Health'],
+            [['home', 'garden'], 'Home and Garden'],
+        ];
+        foreach ($comboMatches as [$keys, $label]) {
+            if (count(array_intersect_key($genreSet, array_flip($keys))) === count($keys)) {
+                return $label;
+            }
+        }
+
+        foreach ($genreKeys as $key) {
+            if (isset(self::KODI_GUIDE_GENRE_MAP[$key])) {
+                return self::KODI_GUIDE_GENRE_MAP[$key];
+            }
+        }
+
+        return $genreList[0] ?? $genres;
+    }
+
+
+    /**
      * Extract the base series/show name from an EPG title.
      *
      * EPG titles commonly include episode information after a separator:
@@ -2384,6 +2563,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'map_genres_to_epg_categories' => $settings['map_genres_to_epg_categories']
                 ?? $settings['map_emby_genres']
                 ?? false,
+            'map_genres_to_kodi_guide_genres' => $settings['map_genres_to_kodi_guide_genres'] ?? false,
             'keyword_category_detection' => $settings['keyword_category_detection'] ?? true,
             'enrich_episode_details' => $settings['enrich_episode_details'] ?? true,
             'tmdb_language' => $settings['tmdb_language'] ?? '',
