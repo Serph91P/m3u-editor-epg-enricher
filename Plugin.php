@@ -1848,9 +1848,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $type = strtolower(trim((string) ($image['type'] ?? '')));
         $orient = strtoupper(trim((string) ($image['orient'] ?? '')));
 
-        return ! empty($image['url'])
-            && $orient === 'L'
-            && in_array($type, ['backdrop', 'fanart', 'screenshot'], true);
+        if (empty($image['url'])
+            || $orient !== 'L'
+            || ! in_array($type, ['backdrop', 'fanart', 'screenshot'], true)) {
+            return false;
+        }
+
+        $width = $image['width'] ?? null;
+        $height = $image['height'] ?? null;
+        if (is_numeric($width) && is_numeric($height) && (float) $width > 0 && (float) $height > 0) {
+            return (float) $width > (float) $height;
+        }
+
+        return true;
     }
 
     /**
