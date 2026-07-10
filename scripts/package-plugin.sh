@@ -12,7 +12,9 @@ cd "$ROOT_DIR"
 rm -f "$ARCHIVE_PATH" "$ARCHIVE_PATH.sha256"
 
 zip -r "$ARCHIVE_PATH" . \
+  -x '.git' \
   -x '.git/*' \
+  -x '.gitignore' \
   -x '.github/*' \
   -x '.hermes/*' \
   -x 'dist/*' \

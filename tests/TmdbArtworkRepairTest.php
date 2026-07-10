@@ -1,0 +1,399 @@
+<?php
+
+namespace {
+    function storage_path(string $path = ''): string
+    {
+        return '/dev/null';
+    }
+
+    function app(string $class): object
+    {
+        return $GLOBALS['tmdbTestSettings'];
+    }
+}
+
+namespace App\Plugins\Contracts {
+    interface EpgProcessorPluginInterface {}
+    interface HookablePluginInterface {}
+}
+
+namespace App\Plugins\Support {
+    class PluginActionResult {}
+    class PluginExecutionContext {}
+}
+
+namespace App\Settings {
+    class GeneralSettings
+    {
+        public string $tmdb_api_key = '';
+        public string $tmdb_language = 'de-DE';
+    }
+}
+
+namespace Illuminate\Support\Facades {
+    class FakeHttpResponse
+    {
+        public function __construct(private bool $successful, private array $data = []) {}
+
+        public function successful(): bool
+        {
+            return $this->successful;
+        }
+
+        public function json(): array
+        {
+            return $this->data;
+        }
+    }
+
+    class Http
+    {
+        public static array $calls = [];
+        public static array $responses = [];
+
+        public static function timeout(int $seconds): self
+        {
+            return new self();
+        }
+
+        public function get(string $url, array $query): FakeHttpResponse
+        {
+            self::$calls[] = ['url' => $url, 'query' => $query];
+
+            return array_shift(self::$responses);
+        }
+    }
+
+    class Log
+    {
+        public static function warning(string $message, array $context = []): void {}
+    }
+}
+
+namespace App\Services {
+    class TmdbService
+    {
+        public int $tvSearches = 0;
+        public int $movieSearches = 0;
+
+        public function __construct(private string $scenario) {}
+
+        public function searchTvSeries(string $name, ?int $year = null): ?array
+        {
+            $this->tvSearches++;
+
+            return match ($this->scenario) {
+                'long-walk' => [
+                    'tmdb_id' => 100,
+                    'name' => 'The Long Walk',
+                    'original_name' => 'The Long Walk',
+                    'first_air_date' => '2024-01-01',
+                ],
+                'illuminati' => [
+                    'tmdb_id' => 101,
+                    'name' => 'Secret Society',
+                    'original_name' => 'Secret Society',
+                    'first_air_date' => '2015-01-01',
+                ],
+                'bares' => [
+                    'tmdb_id' => 102,
+                    'name' => 'Bares fuer Rares',
+                    'original_name' => 'Bares fuer Rares',
+                    'first_air_date' => '2013-08-03',
+                ],
+                'ambiguous' => [
+                    'tmdb_id' => 103,
+                    'name' => 'Crossroads',
+                    'original_name' => 'Crossroads',
+                    'first_air_date' => '2020-01-01',
+                ],
+                default => null,
+            };
+        }
+
+        public function getTvSeriesDetails(int $tmdbId): ?array
+        {
+            return match ($this->scenario) {
+                'long-walk' => [
+                    'overview' => 'An unrelated reality competition.',
+                    'poster_url' => 'https://fixture.invalid/tv-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/tv-backdrop.jpg',
+                ],
+                'illuminati' => ['overview' => 'A modern secret society drama.'],
+                'bares' => [
+                    'overview' => 'People offer antiques and curiosities to expert dealers.',
+                    'poster_url' => 'https://fixture.invalid/bares-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/bares-backdrop.jpg',
+                    'genres' => 'Reality',
+                ],
+                'ambiguous' => [
+                    'overview' => 'Several lives meet at a crossroads.',
+                    'poster_url' => 'https://fixture.invalid/crossroads-tv-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/crossroads-tv-backdrop.jpg',
+                ],
+                default => null,
+            };
+        }
+
+        public function searchMovie(string $title, ?int $year = null, bool $tryFallback = true, bool $skipYearExtraction = false): ?array
+        {
+            $this->movieSearches++;
+
+            return match ($this->scenario) {
+                'long-walk' => [
+                    'tmdb_id' => 200,
+                    'title' => 'The Long Walk',
+                    'original_title' => 'The Long Walk',
+                    'release_date' => '2025-09-11',
+                ],
+                'illuminati' => [
+                    'tmdb_id' => 201,
+                    'title' => 'Angels & Demons',
+                    'original_title' => 'Angels & Demons',
+                    'release_date' => '2009-05-13',
+                ],
+                'bares' => [
+                    'tmdb_id' => 202,
+                    'title' => 'Bares fuer Rares',
+                    'original_title' => 'Bares fuer Rares',
+                    'release_date' => '2013-01-01',
+                ],
+                'ambiguous' => [
+                    'tmdb_id' => 203,
+                    'title' => 'Crossroads',
+                    'original_title' => 'Crossroads',
+                    'release_date' => '2020-01-01',
+                ],
+                default => null,
+            };
+        }
+
+        public function getMovieDetails(int $tmdbId): ?array
+        {
+            return match ($this->scenario) {
+                'long-walk' => [
+                    'overview' => 'In a deadly annual contest, young men must keep walking.',
+                    'poster_url' => 'https://fixture.invalid/movie-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/movie-backdrop.jpg',
+                    'cast' => ['Cooper Hoffman', 'David Jonsson'],
+                    'director' => ['Francis Lawrence'],
+                ],
+                'illuminati' => [
+                    'overview' => 'Robert Langdon investigates a threat against the Vatican.',
+                    'poster_url' => 'https://fixture.invalid/illuminati-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/illuminati-backdrop.jpg',
+                    'cast' => ['Tom Hanks', 'Ewan McGregor', 'Ayelet Zurer'],
+                    'director' => ['Ron Howard'],
+                ],
+                'bares' => [
+                    'poster_url' => 'https://fixture.invalid/bares-movie-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/bares-movie-backdrop.jpg',
+                ],
+                'ambiguous' => [
+                    'overview' => 'Several lives meet at a crossroads.',
+                    'poster_url' => 'https://fixture.invalid/crossroads-movie-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/crossroads-movie-backdrop.jpg',
+                ],
+                default => null,
+            };
+        }
+
+        public function getTvAlternativeTitles(int $tmdbId): array
+        {
+            return [];
+        }
+
+        public function getMovieAlternativeTitles(int $tmdbId): array
+        {
+            return match ($this->scenario) {
+                'long-walk' => [['title' => 'The Long Walk - Der Todesmarsch', 'iso_3166_1' => 'DE']],
+                'illuminati' => [['title' => 'Illuminati', 'iso_3166_1' => 'DE']],
+                default => [],
+            };
+        }
+    }
+}
+
+namespace Tests {
+    require_once __DIR__.'/../Plugin.php';
+
+    use App\Services\TmdbService;
+    use App\Settings\GeneralSettings;
+    use AppLocalPlugins\EpgEnricher\Plugin;
+    use Illuminate\Support\Facades\FakeHttpResponse;
+    use Illuminate\Support\Facades\Http;
+    use ReflectionClass;
+    use ReflectionMethod;
+
+    function assertSameValue(mixed $expected, mixed $actual, string $message): void
+    {
+        if ($expected !== $actual) {
+            fwrite(STDERR, $message."\nExpected: ".var_export($expected, true)."\nActual: ".var_export($actual, true)."\n");
+            exit(1);
+        }
+    }
+
+    function assertTrueValue(bool $condition, string $message): void
+    {
+        if (! $condition) {
+            fwrite(STDERR, $message."\n");
+            exit(1);
+        }
+    }
+
+    function enrich(Plugin $plugin, ReflectionMethod $method, array &$programme, TmdbService $tmdb, array &$cache): array
+    {
+        $seasonCache = [];
+        $imagesCache = [];
+
+        return $method->invokeArgs($plugin, [
+            &$programme,
+            $tmdb,
+            &$cache,
+            false,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            &$seasonCache,
+            &$imagesCache,
+        ]);
+    }
+
+    $GLOBALS['tmdbTestSettings'] = new GeneralSettings();
+    $plugin = new Plugin();
+    $reflection = new ReflectionClass($plugin);
+    $method = $reflection->getMethod('enrichProgrammeFromTmdb');
+    $method->setAccessible(true);
+
+    $longWalk = [
+        'title' => 'The Long Walk - Der Todesmarsch',
+        'desc' => 'USA 2025. Bei einem Todesmarsch darf niemand stehen bleiben.',
+        'category' => 'Movie',
+        'icon' => 'https://provider.invalid/unknown.jpg',
+        'images' => [
+            ['url' => 'https://provider.invalid/unknown.jpg'],
+            ['url' => 'https://provider.invalid/unknown.jpg'],
+            ['url' => 'https://provider.invalid/logo.png', 'type' => 'logo', 'orient' => 'L', 'width' => 4000, 'height' => 800],
+        ],
+    ];
+    $longWalkCache = [];
+    $longWalkTmdb = new TmdbService('long-walk');
+    $longWalkResult = enrich($plugin, $method, $longWalk, $longWalkTmdb, $longWalkCache);
+
+    assertSameValue('https://fixture.invalid/movie-backdrop.jpg', $longWalk['icon'], 'Movie backdrop should repair an untrusted provider icon.');
+    assertSameValue(
+        [
+            'https://fixture.invalid/movie-backdrop.jpg',
+            'https://fixture.invalid/movie-poster.jpg',
+            'https://provider.invalid/unknown.jpg',
+            'https://provider.invalid/logo.png',
+        ],
+        array_column($longWalk['images'], 'url'),
+        'Landscape, poster, unknown and logo ordering should be stable and duplicate-free.'
+    );
+    assertSameValue('backdrop', $longWalk['images'][0]['type'], 'Primary image should be a landscape backdrop.');
+    assertTrueValue(in_array('https://fixture.invalid/movie-poster.jpg', array_column($longWalk['images'], 'url'), true), 'Portrait poster should remain in images.');
+    assertTrueValue($longWalkResult['changed'], 'Artwork repair should report a changed programme.');
+
+    $stableLongWalk = $longWalk;
+    enrich($plugin, $method, $longWalk, $longWalkTmdb, $longWalkCache);
+    assertSameValue($stableLongWalk, $longWalk, 'A second enrichment pass should preserve deterministic image order.');
+
+    $illuminatiCache = [];
+    $illuminatiTmdb = new TmdbService('illuminati');
+    $illuminati = [
+        'title' => 'Illuminati',
+        'desc' => 'Thriller 2009 von Ron Howard mit Tom Hanks, Ewan McGregor und Ayelet Zurer.',
+        'category' => 'Movie',
+        'icon' => 'https://provider.invalid/illuminati-unknown.jpg',
+    ];
+    enrich($plugin, $method, $illuminati, $illuminatiTmdb, $illuminatiCache);
+    assertSameValue('https://fixture.invalid/illuminati-backdrop.jpg', $illuminati['icon'], 'Strong German alternative-title evidence should match Angels & Demons.');
+
+    $weakIlluminati = [
+        'title' => 'Illuminati',
+        'desc' => 'Mystery thriller from 2009.',
+        'category' => 'Movie',
+        'icon' => 'https://provider.invalid/weak-unknown.jpg',
+    ];
+    $weakBefore = $weakIlluminati;
+    enrich($plugin, $method, $weakIlluminati, $illuminatiTmdb, $illuminatiCache);
+    assertSameValue($weakBefore, $weakIlluminati, 'Alternative-title matches without description corroboration should fail closed.');
+    assertSameValue(2, count($illuminatiCache), 'Lookup cache should separate descriptions that affect identity confidence.');
+
+    $bares = [
+        'title' => 'Bares fuer Rares',
+        'subtitle' => 'Ein seltenes Fundstueck',
+        'episode_num' => '0.0',
+        'desc' => 'Deutschland 2013. Eine Folge der Antiquitaetensendung.',
+        'category' => 'Series',
+        'icon' => 'https://provider.invalid/bares-unknown.jpg',
+    ];
+    $baresCache = [];
+    $baresTmdb = new TmdbService('bares');
+    enrich($plugin, $method, $bares, $baresTmdb, $baresCache);
+    assertSameValue('https://fixture.invalid/bares-backdrop.jpg', $bares['icon'], 'Episodic signals should force the TV landscape backdrop.');
+    assertTrueValue(in_array('https://fixture.invalid/bares-poster.jpg', array_column($bares['images'], 'url'), true), 'TV portrait poster should remain in images.');
+    assertSameValue(0, $baresTmdb->movieSearches, 'Strong episodic evidence should not search movies.');
+
+    $provider = [
+        'title' => 'Provider Programme',
+        'desc' => 'Complete provider description.',
+        'category' => 'Series',
+        'icon' => 'https://provider.invalid/trusted-landscape.jpg',
+        'images' => [
+            [
+                'url' => 'https://provider.invalid/trusted-landscape.jpg',
+                'type' => 'fanart',
+                'orient' => 'L',
+                'width' => 1920,
+                'height' => 1080,
+            ],
+        ],
+    ];
+    $providerBefore = $provider;
+    $providerCache = [];
+    $providerTmdb = new TmdbService('none');
+    $providerResult = enrich($plugin, $method, $provider, $providerTmdb, $providerCache);
+    assertSameValue($providerBefore, $provider, 'Trusted provider landscape artwork should be preserved.');
+    assertSameValue(0, $providerTmdb->tvSearches + $providerTmdb->movieSearches, 'Trusted complete provider metadata should retain the no-op fast path.');
+    assertSameValue(false, $providerResult['changed'], 'Provider no-op should not report a change.');
+
+    $ambiguous = [
+        'title' => 'Crossroads',
+        'desc' => 'A 2020 drama about several lives meeting at a crossroads.',
+        'category' => 'Drama',
+        'icon' => 'https://provider.invalid/crossroads-unknown.jpg',
+    ];
+    $ambiguousBefore = $ambiguous;
+    $ambiguousCache = [];
+    enrich($plugin, $method, $ambiguous, new TmdbService('ambiguous'), $ambiguousCache);
+    assertSameValue($ambiguousBefore, $ambiguous, 'Ambiguous TV and movie candidates should leave the programme unchanged.');
+
+    $fetchImages = $reflection->getMethod('fetchTmdbImages');
+    $fetchImages->setAccessible(true);
+    $imageCache = [];
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
+    Http::$responses[] = new FakeHttpResponse(false);
+    $failedFetch = $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
+    assertSameValue(null, $failedFetch, 'Transient image failures should return null.');
+    assertSameValue([], $imageCache, 'Transient null image responses should not be cached.');
+
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
+    $GLOBALS['tmdbTestSettings']->tmdb_language = 'en-US';
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
+    assertSameValue(
+        ['movie:99:de-de', 'movie:99:en-us'],
+        array_keys($imageCache),
+        'Image cache identity should include the selected TMDB language.'
+    );
+
+    echo "TMDB artwork repair tests passed.\n";
+}
