@@ -97,8 +97,8 @@ namespace App\Services {
                 ],
                 'bares' => [
                     'tmdb_id' => 102,
-                    'name' => 'Bares fuer Rares',
-                    'original_name' => 'Bares fuer Rares',
+                    'name' => 'Bares für Rares',
+                    'original_name' => 'Bares für Rares',
                     'first_air_date' => '2013-08-03',
                 ],
                 'ambiguous' => [
@@ -121,7 +121,7 @@ namespace App\Services {
                 ],
                 'illuminati' => ['overview' => 'A modern secret society drama.'],
                 'bares' => [
-                    'overview' => 'People offer antiques and curiosities to expert dealers.',
+                    'overview' => 'Horst Lichter präsentiert seltene Fundstücke, die anschließend von Händlern ersteigert werden können.',
                     'poster_url' => 'https://fixture.invalid/bares-poster.jpg',
                     'backdrop_url' => 'https://fixture.invalid/bares-backdrop.jpg',
                     'genres' => 'Reality',
@@ -154,8 +154,8 @@ namespace App\Services {
                 ],
                 'bares' => [
                     'tmdb_id' => 202,
-                    'title' => 'Bares fuer Rares',
-                    'original_title' => 'Bares fuer Rares',
+                    'title' => 'Bares für Rares',
+                    'original_title' => 'Bares für Rares',
                     'release_date' => '2013-01-01',
                 ],
                 'ambiguous' => [
@@ -186,6 +186,7 @@ namespace App\Services {
                     'director' => ['Ron Howard'],
                 ],
                 'bares' => [
+                    'overview' => 'Ein deutscher Film über außergewöhnliche Antiquitäten und ihre Geschichte.',
                     'poster_url' => 'https://fixture.invalid/bares-movie-poster.jpg',
                     'backdrop_url' => 'https://fixture.invalid/bares-movie-backdrop.jpg',
                 ],
@@ -304,6 +305,37 @@ namespace Tests {
     enrich($plugin, $method, $longWalk, $longWalkTmdb, $longWalkCache);
     assertSameValue($stableLongWalk, $longWalk, 'A second enrichment pass should preserve deterministic image order.');
 
+    foreach ([['portrait', 500, 750], ['square', 750, 750]] as [$geometry, $width, $height]) {
+        $conflictingArtwork = [
+            'title' => 'The Long Walk - Der Todesmarsch',
+            'desc' => 'USA 2025. Bei einem Todesmarsch darf niemand stehen bleiben.',
+            'category' => 'Movie',
+            'icon' => 'https://provider.invalid/'.$geometry.'-fanart.jpg',
+            'images' => [
+                [
+                    'url' => 'https://provider.invalid/'.$geometry.'-fanart.jpg',
+                    'type' => 'fanart',
+                    'orient' => 'L',
+                    'width' => $width,
+                    'height' => $height,
+                ],
+            ],
+        ];
+        $conflictingCache = [];
+        $conflictingTmdb = new TmdbService('long-walk');
+        enrich($plugin, $method, $conflictingArtwork, $conflictingTmdb, $conflictingCache);
+
+        assertSameValue(
+            'https://fixture.invalid/movie-backdrop.jpg',
+            $conflictingArtwork['icon'],
+            ucfirst($geometry).' fanart with conflicting geometry should be repaired by the TMDB backdrop.'
+        );
+        assertTrueValue(
+            $conflictingTmdb->tvSearches + $conflictingTmdb->movieSearches > 0,
+            ucfirst($geometry).' conflicting geometry should not retain the no-op fast path.'
+        );
+    }
+
     $illuminatiCache = [];
     $illuminatiTmdb = new TmdbService('illuminati');
     $illuminati = [
@@ -327,10 +359,10 @@ namespace Tests {
     assertSameValue(2, count($illuminatiCache), 'Lookup cache should separate descriptions that affect identity confidence.');
 
     $bares = [
-        'title' => 'Bares fuer Rares',
-        'subtitle' => 'Ein seltenes Fundstueck',
+        'title' => 'Bares für Rares',
+        'subtitle' => 'Ein außergewöhnliches Fundstück',
         'episode_num' => '0.0',
-        'desc' => 'Deutschland 2013. Eine Folge der Antiquitaetensendung.',
+        'desc' => 'Horst Lichter begrüßt Menschen, die seltene Fundstücke und Antiquitäten von Experten schätzen lassen.',
         'category' => 'Series',
         'icon' => 'https://provider.invalid/bares-unknown.jpg',
     ];
@@ -339,6 +371,7 @@ namespace Tests {
     enrich($plugin, $method, $bares, $baresTmdb, $baresCache);
     assertSameValue('https://fixture.invalid/bares-backdrop.jpg', $bares['icon'], 'Episodic signals should force the TV landscape backdrop.');
     assertTrueValue(in_array('https://fixture.invalid/bares-poster.jpg', array_column($bares['images'], 'url'), true), 'TV portrait poster should remain in images.');
+    assertSameValue(1, $baresTmdb->tvSearches, 'The exact Unicode title should resolve through the TV artwork path.');
     assertSameValue(0, $baresTmdb->movieSearches, 'Strong episodic evidence should not search movies.');
 
     $provider = [
