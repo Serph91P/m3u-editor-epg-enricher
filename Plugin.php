@@ -8,8 +8,10 @@ use App\Models\EpgChannel;
 use App\Models\Playlist;
 use App\Plugins\Contracts\EpgProcessorPluginInterface;
 use App\Plugins\Contracts\HookablePluginInterface;
+use App\Plugins\Contracts\PluginSelectOptionsProviderInterface;
 use App\Plugins\Support\PluginActionResult;
 use App\Plugins\Support\PluginExecutionContext;
+use App\Plugins\Support\PluginSelectOptionsContext;
 use App\Services\EpgCacheService;
 use App\Services\TmdbService;
 use App\Settings\GeneralSettings;
@@ -19,7 +21,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use ReflectionProperty;
 
-class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
+class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, PluginSelectOptionsProviderInterface
 {
     private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 300;
 
@@ -485,6 +487,23 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     ];
 
     /**
+     * Provide owned playlists that contain channels eligible for enrichment.
+     *
+     * @return array<string, string>
+     */
+    public function selectOptions(string $provider, PluginSelectOptionsContext $context): array
+    {
+        if ($provider !== 'enrichable_playlists' || ! $context->user) {
+            return [];
+        }
+
+        return $this->enrichablePlaylistQuery($context->user)
+            ->orderBy('name')
+            ->pluck('name', 'id')
+            ->all();
+    }
+
+    /**
      * Handle manual actions triggered from the plugin UI.
      */
     public function runAction(string $action, array $payload, PluginExecutionContext $context): PluginActionResult
@@ -513,15 +532,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         $epgId = $payload['epg_id'] ?? null;
         $userId = $payload['user_id'] ?? null;
-        $playlistIds = $payload['playlist_ids'] ?? [];
 
         if (! $epgId || ! $userId) {
             return PluginActionResult::failure('Missing epg_id or user_id in hook payload.');
         }
 
+        if (! $context->user || (int) $userId !== (int) $context->user->getKey()) {
+            return PluginActionResult::failure('Hook user does not match the execution user.');
+        }
+
+        $playlistIds = $this->ownedEnrichablePlaylistIds(
+            $context->user,
+            $this->normalizePlaylistIds($payload['playlist_ids'] ?? []),
+        );
+
+        if (empty($playlistIds)) {
+            return PluginActionResult::success('No owned, enrichable playlists in hook payload - skipping.');
+        }
+
         // Filter playlists if the user restricted auto-run to specific ones
-        $allowedPlaylistIds = $context->settings['auto_run_playlists'] ?? [];
-        if (! empty($allowedPlaylistIds)) {
+        $configuredPlaylistIds = $context->settings['auto_run_playlists'] ?? [];
+        if ($configuredPlaylistIds !== []) {
+            $allowedPlaylistIds = $this->normalizePlaylistIds($configuredPlaylistIds);
+            $allowedPlaylistIds = $this->ownedEnrichablePlaylistIds($context->user, $allowedPlaylistIds);
             $playlistIds = array_values(array_intersect($playlistIds, $allowedPlaylistIds));
             if (empty($playlistIds)) {
                 return PluginActionResult::success('No matching playlists for auto-run - skipping.');
@@ -540,13 +573,20 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     {
         $playlistId = $payload['playlist_id'] ?? null;
 
-        if (! $playlistId) {
+        if (! is_numeric($playlistId) || (int) $playlistId < 1) {
             return PluginActionResult::failure('Playlist is required.');
         }
 
-        $playlist = Playlist::find($playlistId);
+        if (! $context->user) {
+            return PluginActionResult::failure('An execution user is required to enrich a playlist.');
+        }
+
+        $playlistId = (int) $playlistId;
+        $playlist = $this->enrichablePlaylistQuery($context->user)
+            ->whereKey($playlistId)
+            ->first();
         if (! $playlist) {
-            return PluginActionResult::failure("Playlist [{$playlistId}] not found.");
+            return PluginActionResult::failure("Playlist [{$playlistId}] is not owned or is not enrichable.");
         }
 
         // Resolve distinct EPG IDs from the playlist's enabled channels
@@ -601,6 +641,48 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         return PluginActionResult::success($summary, $combinedStats);
     }
 
+    private function enrichablePlaylistQuery(object $user)
+    {
+        return Playlist::query()
+            ->where('user_id', $user->getKey())
+            ->whereHas('channels', function ($query): void {
+                $query->where('enabled', true)
+                    ->whereNotNull('epg_channel_id')
+                    ->whereHas('epgChannel');
+            });
+    }
+
+    /**
+     * @param  array<int>  $playlistIds
+     * @return array<int>
+     */
+    private function ownedEnrichablePlaylistIds(object $user, array $playlistIds): array
+    {
+        if (empty($playlistIds)) {
+            return [];
+        }
+
+        return $this->enrichablePlaylistQuery($user)
+            ->whereKey($playlistIds)
+            ->pluck('id')
+            ->all();
+    }
+
+    /**
+     * @return array<int>
+     */
+    private function normalizePlaylistIds(mixed $playlistIds): array
+    {
+        if (! is_array($playlistIds)) {
+            return [];
+        }
+
+        return array_values(array_unique(array_map(
+            'intval',
+            array_filter($playlistIds, fn ($id): bool => is_numeric($id) && (int) $id > 0),
+        )));
+    }
+
     /**
      * Core enrichment logic. Reads cached JSONL, enriches with TMDB, writes back.
      * Only processes channels that are mapped in the given playlists.
@@ -608,6 +690,35 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * @param  array<int>  $playlistIds  Playlist IDs to scope enrichment to
      */
     private function doEnrich(int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
+    {
+        $disk = Storage::disk('local');
+        $disk->makeDirectory('plugin-data/epg-enricher');
+        $lock = fopen($disk->path("plugin-data/epg-enricher/epg-{$epgId}.lock"), 'c');
+
+        if ($lock === false) {
+            return PluginActionResult::failure("Could not create enrichment lock for EPG [{$epgId}].");
+        }
+
+        if (! flock($lock, LOCK_EX | LOCK_NB)) {
+            fclose($lock);
+
+            return PluginActionResult::success("Enrichment for EPG [{$epgId}] is already in progress - skipping.");
+        }
+
+        try {
+            return $this->doEnrichLocked($epgId, $playlistIds, $context);
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+
+    /**
+     * Run enrichment while the caller holds the EPG-specific lock.
+     *
+     * @param  array<int>  $playlistIds
+     */
+    private function doEnrichLocked(int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
     {
         $epg = Epg::find($epgId);
         if (! $epg) {

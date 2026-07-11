@@ -146,10 +146,9 @@
         },
         {
           "id": "auto_run_playlists",
-          "type": "model_select",
+          "type": "select",
           "label": "Limit auto-run to these playlists",
-          "model": "App\\Models\\Playlist",
-          "scope": "owned",
+          "options_provider": "enrichable_playlists",
           "multiple": true,
           "required": false,
           "helper_text": "Only enrich these playlists during auto-run. Leave empty to enrich all playlists."
@@ -166,10 +165,9 @@
       "fields": [
         {
           "id": "playlist_id",
-          "type": "model_select",
+          "type": "select",
           "label": "Playlist",
-          "model": "App\\Models\\Playlist",
-          "scope": "owned",
+          "options_provider": "enrichable_playlists",
           "required": true
         }
       ]
