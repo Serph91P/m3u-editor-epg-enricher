@@ -829,6 +829,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $stats['descriptions_added'] += $result['descriptions'];
             $stats['tmdb_lookups'] += $result['lookups'];
             $stats['tmdb_cache_hits'] += $result['cache_hits'];
+            if ($result['cancelled']) {
+                $this->saveTmdbCache($tmdbCache);
+                $this->saveTmdbSeasonCache($tmdbSeasonCache);
+                $this->saveTmdbImagesCache($imagesCache);
+                $enrichmentState[$stateKey] = [
+                    'settings_hash' => $settingsHash,
+                    'channels_hash' => $channelsHash,
+                    'files' => array_merge($fileStates, $newFileStates),
+                ];
+                $this->saveEnrichmentState($enrichmentState);
+
+                return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
+            }
             if (! $result['modified']) {
                 $stats['days_unchanged']++;
             }
@@ -935,7 +948,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      * Process a single date's JSONL file: enrich only targeted playlist channels.
      *
      * @param  array<string>  $targetChannelIds  EPG channel_id strings to enrich
-     * @return array{enriched: int, skipped: int, posters: int, categories: int, descriptions: int, lookups: int, cache_hits: int, modified: bool}
+     * @return array{enriched: int, skipped: int, posters: int, categories: int, descriptions: int, lookups: int, cache_hits: int, modified: bool, cancelled: bool}
      */
     private function processDateFile(
         string $jsonlFile,
@@ -969,6 +982,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             'lookups' => 0,
             'cache_hits' => 0,
             'modified' => false,
+            'cancelled' => false,
         ];
 
         $fullPath = Storage::disk('local')->path($jsonlFile);
@@ -983,6 +997,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             while (($line = fgets($handle)) !== false) {
                 if ($context->cancellationRequested()) {
                     fclose($handle);
+                    $result['cancelled'] = true;
 
                     return $result;
                 }
