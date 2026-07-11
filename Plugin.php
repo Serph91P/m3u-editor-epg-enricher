@@ -982,7 +982,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         if (($handle = fopen($fullPath, 'r')) !== false) {
             while (($line = fgets($handle)) !== false) {
                 if ($context->cancellationRequested()) {
-                    break;
+                    fclose($handle);
+
+                    return $result;
                 }
 
                 $line = trim($line);

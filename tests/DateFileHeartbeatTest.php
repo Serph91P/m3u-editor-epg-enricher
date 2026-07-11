@@ -73,6 +73,7 @@ namespace Tests {
         array $targetChannels,
         PluginExecutionContext $context,
         callable $clock,
+        bool $enableKeywordCategory = false,
     ): array {
         $tmdbCache = [];
         $seasonCache = [];
@@ -84,13 +85,13 @@ namespace Tests {
             new TmdbService(),
             &$tmdbCache,
             false,
+            $enableKeywordCategory,
             false,
             false,
             false,
+            $enableKeywordCategory,
             false,
-            false,
-            false,
-            false,
+            $enableKeywordCategory,
             false,
             &$seasonCache,
             &$imagesCache,
@@ -136,18 +137,23 @@ namespace Tests {
     );
     assertSameValue([35, 50], array_column($context->heartbeats, 'progress'), 'Intra-day progress should advance within the current day.');
 
-    $nonTargetRecords = str_repeat(json_encode([
+    $cancelFile = json_encode([
+        'channel' => 'target',
+        'programme' => ['title' => 'Wimbledon'],
+    ], JSON_UNESCAPED_SLASHES)."\n".str_repeat(json_encode([
         'channel' => 'other',
         'programme' => ['title' => 'Untargeted'],
-    ])."\n", 20);
-    file_put_contents($tempDir.'/cancel.jsonl', $nonTargetRecords);
+    ], JSON_UNESCAPED_SLASHES)."\n", 20);
+    file_put_contents($tempDir.'/cancel.jsonl', $cancelFile);
     $cancelContext = new PluginExecutionContext();
     $cancelContext->cancelAfterChecks = 3;
-    $cancelTimes = [0.0];
-    runDateFile($plugin, $method, 'cancel.jsonl', ['target'], $cancelContext, function () use (&$cancelTimes): float {
+    $cancelTimes = [0.0, 1.0];
+    $cancelResult = runDateFile($plugin, $method, 'cancel.jsonl', ['target'], $cancelContext, function () use (&$cancelTimes): float {
         return array_shift($cancelTimes);
-    });
+    }, true);
     assertSameValue(3, $cancelContext->cancellationChecks, 'Cancellation should be checked for every record, independently of heartbeat timing.');
+    assertSameValue(1, $cancelResult['updated'], 'The cancellation fixture should modify a programme before cancellation.');
+    assertSameValue($cancelFile, file_get_contents($tempDir.'/cancel.jsonl'), 'Cancellation should leave the original date file byte-for-byte unchanged.');
 
     $smallFile = json_encode([
         'channel' => 'target',
