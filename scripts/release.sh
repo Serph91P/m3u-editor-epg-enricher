@@ -71,7 +71,7 @@ case "$BUMP_TYPE" in
     minor) NEW_VERSION="$MAJOR.$((MINOR + 1)).0" ;;
     major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
     *)
-        # Explicit version — validate format
+        # Explicit version: validate format
         if [[ ! "$BUMP_TYPE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             die "Invalid version '$BUMP_TYPE'. Use patch, minor, major, or X.Y.Z."
         fi
