@@ -46,7 +46,7 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 ## Version History
 
 ### 1.9.0
-- **Breaking**: Removed TheSportsDB integration — SportsDB enrichment is now a separate plugin: [m3u-editor-epg-sportsdb](https://github.com/Serph91P/m3u-editor-epg-sportsdb)
+- **Breaking**: Removed TheSportsDB integration. SportsDB enrichment is now a separate plugin: [m3u-editor-epg-sportsdb](https://github.com/Serph91P/m3u-editor-epg-sportsdb)
 - Removed settings: "Enrich sport events from TheSportsDB", "TheSportsDB API key", "TheSportsDB country filter"
 
 ### 1.8.1
