@@ -3,9 +3,16 @@
 namespace App\Plugins\Contracts {
     interface EpgProcessorPluginInterface {}
     interface HookablePluginInterface {}
+
+    interface PluginSelectOptionsProviderInterface
+    {
+        public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array;
+    }
 }
 
 namespace App\Plugins\Support {
+    class PluginSelectOptionsContext {}
+
     class PluginActionResult {}
     class PluginExecutionContext {}
 }
