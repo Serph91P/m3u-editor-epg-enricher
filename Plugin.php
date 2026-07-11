@@ -609,6 +609,35 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
      */
     private function doEnrich(int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
     {
+        $disk = Storage::disk('local');
+        $disk->makeDirectory('plugin-data/epg-enricher');
+        $lock = fopen($disk->path("plugin-data/epg-enricher/epg-{$epgId}.lock"), 'c');
+
+        if ($lock === false) {
+            return PluginActionResult::failure("Could not create enrichment lock for EPG [{$epgId}].");
+        }
+
+        if (! flock($lock, LOCK_EX | LOCK_NB)) {
+            fclose($lock);
+
+            return PluginActionResult::success("Enrichment for EPG [{$epgId}] is already in progress - skipping.");
+        }
+
+        try {
+            return $this->doEnrichLocked($epgId, $playlistIds, $context);
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+
+    /**
+     * Run enrichment while the caller holds the EPG-specific lock.
+     *
+     * @param  array<int>  $playlistIds
+     */
+    private function doEnrichLocked(int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
+    {
         $epg = Epg::find($epgId);
         if (! $epg) {
             return PluginActionResult::failure("EPG [{$epgId}] not found.");
