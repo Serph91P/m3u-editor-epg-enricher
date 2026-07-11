@@ -21,6 +21,8 @@ use ReflectionProperty;
 
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 {
+    private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 300;
+
     /**
      * Bumped whenever the enrichment output for the SAME inputs changes.
      *
@@ -153,7 +155,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'biography' => 'Movie',
         'musical' => 'Movie',
 
-        // Shared genres — mapped to Movie, overridden to Series by media type
+        // Shared genres: mapped to Movie, overridden to Series by media type
         'comedy' => 'Movie',
         'komödie' => 'Movie',
         'crime' => 'Movie',
@@ -165,7 +167,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         'family' => 'Movie',
         'familie' => 'Movie',
 
-        // ── Series (no color — TV-exclusive TMDB genres) ────────────
+        // ── Series (no color; TV-exclusive TMDB genres) ────────────
         'action & adventure' => 'Series',
         'action & abenteuer' => 'Series',
         'sci-fi & fantasy' => 'Series',
@@ -794,7 +796,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             $context->info("Processing {$dateStr} ({$dayIndex}/{$totalDays})...");
             $context->heartbeat(
                 "Processing {$dateStr} ({$dayIndex}/{$totalDays})...",
-                progress: (int) (($dayIndex / $totalDays) * 100)
+                progress: (int) ((($dayIndex - 1) / $totalDays) * 100)
             );
 
             $result = $this->processDateFile(
@@ -814,6 +816,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                 $tmdbSeasonCache,
                 $imagesCache,
                 $context,
+                $dayIndex,
+                $totalDays,
+                $dateStr,
             );
 
             $stats['programmes_processed'] += $result['processed'];
@@ -949,6 +954,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         array &$tmdbSeasonCache,
         array &$imagesCache,
         PluginExecutionContext $context,
+        int $dayIndex = 1,
+        int $totalDays = 1,
+        string $date = '',
+        ?callable $clock = null,
     ): array {
         $result = [
             'processed' => 0,
@@ -964,11 +973,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
 
         $fullPath = Storage::disk('local')->path($jsonlFile);
         $targetSet = array_flip($targetChannelIds);
+        $fileSize = filesize($fullPath);
+        $clock ??= static fn (): float => microtime(true);
+        $lastHeartbeatAt = $clock();
 
         // Read all records, enrich only targeted channels
         $enrichedLines = [];
         if (($handle = fopen($fullPath, 'r')) !== false) {
             while (($line = fgets($handle)) !== false) {
+                if ($context->cancellationRequested()) {
+                    break;
+                }
+
                 $line = trim($line);
                 if ($line === '') {
                     continue;
@@ -1027,8 +1043,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
                     'programme' => $programme,
                 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-                if ($context->cancellationRequested()) {
-                    break;
+                $now = $clock();
+                if ($now - $lastHeartbeatAt >= self::DATE_FILE_HEARTBEAT_INTERVAL_SECONDS) {
+                    $fileProgress = $fileSize > 0 ? min(1, ftell($handle) / $fileSize) : 1;
+                    $progress = (int) ((($dayIndex - 1 + $fileProgress) / $totalDays) * 100);
+                    $context->heartbeat(
+                        "Processing {$date} ({$dayIndex}/{$totalDays}) - {$result['processed']} programmes processed",
+                        progress: $progress,
+                    );
+                    $lastHeartbeatAt = $now;
                 }
             }
             fclose($handle);
@@ -1142,7 +1165,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         }
 
         // If keyword detection identified a non-media category (Sports, News),
-        // skip TMDB lookup entirely — these are live broadcasts, not TMDB content.
+        // skip TMDB lookup entirely; these are live broadcasts, not TMDB content.
         if ($keywordCategory !== null && in_array($keywordCategory, ['Sports', 'News'], true)) {
             return $result;
         }
@@ -1189,7 +1212,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         $fullCacheKey = $this->normalizeCacheKey($title).'|'.$evidenceHash;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).'|'.$evidenceHash : null;
 
-        // Check TMDB lookup cache — try full title first, then base title
+        // Check TMDB lookup cache: try full title first, then base title
         if (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
@@ -1770,7 +1793,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return ($b['vote_average'] ?? 0) <=> ($a['vote_average'] ?? 0);
         };
 
-        // Backdrops zuerst (landscape primary, size=1) — sprach-neutral bevorzugt
+        // Backdrops zuerst (landscape primary, size=1), sprach-neutral bevorzugt
         $backdrops = $images['backdrops'] ?? [];
         $langPrioBack = [null, $shortLang, 'en'];
         usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
@@ -1980,12 +2003,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             }
         }
 
-        // Priority 1: Sports — always unambiguous
+        // Priority 1: Sports, always unambiguous
         if (isset($mapped['Sports'])) {
             return 'Sports';
         }
 
-        // Priority 2: Kids — check explicit "Kids" mapping OR the kids-adjacent
+        // Priority 2: Kids, check explicit "Kids" mapping OR the kids-adjacent
         // genres (animation, family) which are mapped to Movie in the generic map
         // but should become Kids when the TMDB content is a TV show for children.
         if (isset($mapped['Kids'])) {
@@ -1997,14 +2020,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return 'Kids';
         }
 
-        // Priority 3: News — but only when it's actually news/journalism content.
+        // Priority 3: News, but only when it's actually news/journalism content.
         // TV series that merely touch political themes (e.g. M*A*S*H with
         // "War & Politics") should NOT be tagged as News.
         if (isset($mapped['News']) && $mediaType !== 'tv') {
             return 'News';
         }
 
-        // Priority 4: Documentary — before the generic media type fallback
+        // Priority 4: Documentary, before the generic media type fallback
         if (isset($mapped['Documentary'])) {
             return 'Documentary';
         }
@@ -2018,7 +2041,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             return 'Series';
         }
 
-        // Priority 6: no media type available — use the first mapped category
+        // Priority 6: no media type available; use the first mapped category
         foreach (['Movie', 'Series', 'Music', 'Education', 'News'] as $cat) {
             if (isset($mapped[$cat])) {
                 return $cat;
@@ -2095,17 +2118,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
         // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
         $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', $title);
         $cleaned = preg_replace('/\s*S\d{1,2}E\d{1,2}\s*$/i', '', $cleaned);
-        $cleaned = preg_replace('/\s*[-–—]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
+        $cleaned = preg_replace('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
         $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
-        $cleaned = rtrim(trim($cleaned), '-–— ');
+        $cleaned = rtrim(trim($cleaned), "-\u{2013}\u{2014} ");
 
         // Strip trailing year markers like "(2010)" or " - 2009"
         $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
-        $cleaned = preg_replace('/\s*[-–—]\s*(?:19\d{2}|20\d{2})\s*$/', '', $cleaned);
-        $cleaned = rtrim(trim($cleaned), '-–— ');
+        $cleaned = preg_replace('/\s*[-\x{2013}\x{2014}]\s*(?:19\d{2}|20\d{2})\s*$/u', '', $cleaned);
+        $cleaned = rtrim(trim($cleaned), "-\u{2013}\u{2014} ");
 
-        // Split at " - " / " – " / " — " (most common EPG episode separator)
-        if (preg_match('/^(.{2,}?)\s+[-–—]\s+(.+)$/u', $cleaned, $m)) {
+        // Split at spaced hyphen, en dash, or em dash (common EPG episode separators)
+        if (preg_match('/^(.{2,}?)\s+[-\x{2013}\x{2014}]\s+(.+)$/u', $cleaned, $m)) {
             return ['title' => trim($m[1]), 'year' => $year];
         }
 
@@ -2277,7 +2300,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
     }
 
     /**
-     * Compute a similarity score (0.0–1.0) between an EPG search title and a TMDB result title.
+     * Compute a similarity score (0.0-1.0) between an EPG search title and a TMDB result title.
      *
      * Uses multiple strategies to handle real-world mismatches:
      *   - Exact match (after normalization)
@@ -2313,13 +2336,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface
             if ($ratio >= 0.3) {
                 return max(0.6, $ratio);
             }
-            // Very short substring in very long title — fall through to token matching
+            // Very short substring in very long title; fall through to token matching
         }
 
         // Bidirectional token overlap scoring.
         // Forward: how many search tokens appear in the TMDB result?
         // Reverse: how many TMDB tokens appear in the search title?
-        // Use the minimum — both sides must have reasonable coverage.
+        // Use the minimum; both sides must have reasonable coverage.
         $searchTokens = preg_split('/[\s\-:.,]+/u', $searchNorm, -1, PREG_SPLIT_NO_EMPTY);
         $tmdbTokens = preg_split('/[\s\-:.,]+/u', $tmdbNorm, -1, PREG_SPLIT_NO_EMPTY);
 
