@@ -15,9 +15,16 @@ namespace {
 namespace App\Plugins\Contracts {
     interface EpgProcessorPluginInterface {}
     interface HookablePluginInterface {}
+
+    interface PluginSelectOptionsProviderInterface
+    {
+        public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array;
+    }
 }
 
 namespace App\Plugins\Support {
+    class PluginSelectOptionsContext {}
+
     class PluginActionResult
     {
         public function __construct(public bool $success, public string $message, public array $data = []) {}
@@ -39,12 +46,28 @@ namespace App\Plugins\Support {
             'auto_run_on_cache' => true,
             'enrich_from_tmdb' => false,
         ];
+        public object $user;
+
+        public function __construct()
+        {
+            $this->user = new \App\Models\User(1);
+        }
 
         public function heartbeat(string $message, ?int $progress = null): void {}
     }
 }
 
 namespace App\Models {
+    class User
+    {
+        public function __construct(public int $id) {}
+
+        public function getKey(): int
+        {
+            return $this->id;
+        }
+    }
+
     class FakeCollection
     {
         public function __construct(private array $values) {}
@@ -86,6 +109,11 @@ namespace App\Models {
         {
             return 1;
         }
+
+        public function first(): Playlist
+        {
+            return new Playlist();
+        }
     }
 
     class Channel
@@ -123,9 +151,9 @@ namespace App\Models {
         public int $id = 10;
         public string $name = 'Fixture playlist';
 
-        public static function find(int $id): self
+        public static function query(): FakeQuery
         {
-            return new self();
+            return new FakeQuery();
         }
     }
 }
