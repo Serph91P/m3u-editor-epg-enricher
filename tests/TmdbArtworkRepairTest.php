@@ -108,6 +108,30 @@ namespace App\Services {
                     'original_name' => 'Bares für Rares',
                     'first_air_date' => '2013-08-03',
                 ],
+                'ghosts' => [
+                    'tmdb_id' => 104,
+                    'name' => 'Ghosts',
+                    'original_name' => 'Ghosts',
+                    'first_air_date' => '2019-04-15',
+                ],
+                'same-name-ghosts' => [
+                    'tmdb_id' => $year === 2021 ? 108 : 107,
+                    'name' => 'Ghosts',
+                    'original_name' => 'Ghosts',
+                    'first_air_date' => ($year === 2021 ? '2021' : '2019').'-01-01',
+                ],
+                'german-series' => [
+                    'tmdb_id' => 105,
+                    'name' => 'Die Landarztpraxis',
+                    'original_name' => 'Die Landarztpraxis',
+                    'first_air_date' => '2023-10-16',
+                ],
+                'ulrich-wetzel' => [
+                    'tmdb_id' => 106,
+                    'name' => $name,
+                    'original_name' => $name,
+                    'first_air_date' => '2022-10-10',
+                ],
                 'ambiguous' => [
                     'tmdb_id' => 103,
                     'name' => 'Crossroads',
@@ -137,6 +161,27 @@ namespace App\Services {
                     'overview' => 'Several lives meet at a crossroads.',
                     'poster_url' => 'https://fixture.invalid/crossroads-tv-poster.jpg',
                     'backdrop_url' => 'https://fixture.invalid/crossroads-tv-backdrop.jpg',
+                ],
+                'ghosts' => [
+                    'overview' => 'A young couple inherit a country estate occupied by ghosts.',
+                    'poster_url' => 'https://fixture.invalid/ghosts-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/ghosts-backdrop.jpg',
+                    'genres' => 'Comedy',
+                ],
+                'same-name-ghosts' => [
+                    'overview' => 'A comedy about ghosts.',
+                    'poster_url' => 'https://fixture.invalid/ghosts-'.$tmdbId.'-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/ghosts-'.$tmdbId.'-backdrop.jpg',
+                    'genres' => 'Comedy',
+                ],
+                'german-series' => [
+                    'overview' => 'Eine Ärztin beginnt ein neues Leben in Wiesenkirchen.',
+                    'poster_url' => 'https://fixture.invalid/landarztpraxis-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/landarztpraxis-backdrop.jpg',
+                ],
+                'ulrich-wetzel' => [
+                    'overview' => 'A reality court programme.',
+                    'backdrop_url' => 'https://fixture.invalid/court-tv-backdrop.jpg',
                 ],
                 default => null,
             };
@@ -171,6 +216,18 @@ namespace App\Services {
                     'original_title' => 'Crossroads',
                     'release_date' => '2020-01-01',
                 ],
+                'boston' => [
+                    'tmdb_id' => 204,
+                    'title' => 'Boston',
+                    'original_title' => 'Boston',
+                    'release_date' => '2017-11-17',
+                ],
+                'ulrich-wetzel' => [
+                    'tmdb_id' => 205,
+                    'title' => $title,
+                    'original_title' => $title,
+                    'release_date' => '2022-10-10',
+                ],
                 default => null,
             };
         }
@@ -201,6 +258,15 @@ namespace App\Services {
                     'overview' => 'Several lives meet at a crossroads.',
                     'poster_url' => 'https://fixture.invalid/crossroads-movie-poster.jpg',
                     'backdrop_url' => 'https://fixture.invalid/crossroads-movie-backdrop.jpg',
+                ],
+                'boston' => [
+                    'overview' => 'The story of the Boston Marathon bombing and its aftermath.',
+                    'poster_url' => 'https://fixture.invalid/boston-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/boston-backdrop.jpg',
+                ],
+                'ulrich-wetzel' => [
+                    'overview' => 'A reality court programme.',
+                    'backdrop_url' => 'https://fixture.invalid/court-movie-backdrop.jpg',
                 ],
                 default => null,
             };
@@ -381,6 +447,58 @@ namespace Tests {
     assertSameValue(1, $baresTmdb->tvSearches, 'The exact Unicode title should resolve through the TV artwork path.');
     assertSameValue(0, $baresTmdb->movieSearches, 'Strong episodic evidence should not search movies.');
 
+    $ghostsCache = [];
+    $ghostsTmdb = new TmdbService('ghosts');
+    foreach ([
+        ['Weihnachtsgeister', 'Die Bewohner bereiten Weihnachten vor.', '1.5'],
+        ['Der Fahrgeist', 'Ein Ausflug bringt die Geister durcheinander.', '1.6'],
+        ['Es bleibt in der Familie', 'Ein unerwarteter Besuch sorgt für Unruhe.', '1.7'],
+    ] as $index => [$episodeTitle, $description, $episodeNum]) {
+        $ghosts = [
+            'title' => 'Ghosts - '.$episodeTitle,
+            'desc' => $description,
+            'episode_num' => $episodeNum,
+            'category' => 'Series',
+        ];
+        $ghostsResult = enrich($plugin, $method, $ghosts, $ghostsTmdb, $ghostsCache);
+
+        assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $ghosts['icon'] ?? null, $episodeTitle.' should reuse the validated Ghosts series artwork.');
+        assertSameValue($index === 0, $ghostsResult['lookup'], $episodeTitle.' should only search TMDB when validating the shared base series.');
+        assertSameValue($index > 0, $ghostsResult['cache_hit'], $episodeTitle.' should report reuse of the validated base-series cache.');
+    }
+    assertSameValue(2, $ghostsTmdb->tvSearches, 'Ghosts should search the full first episode title and then the base series once.');
+    assertSameValue(0, $ghostsTmdb->movieSearches, 'Ghosts episode evidence should keep matching on TV.');
+
+    $sameNameGhostsCache = [];
+    $sameNameGhostsTmdb = new TmdbService('same-name-ghosts');
+    foreach ([2019 => 107, 2021 => 108] as $year => $tmdbId) {
+        $sameNameGhosts = [
+            'title' => 'Ghosts - Episode '.$year,
+            'desc' => 'Comedy series from '.$year.' about a haunted home.',
+            'episode_num' => '1.1',
+            'category' => 'Series',
+        ];
+        $sameNameGhostsResult = enrich($plugin, $method, $sameNameGhosts, $sameNameGhostsTmdb, $sameNameGhostsCache);
+
+        assertSameValue(
+            'https://fixture.invalid/ghosts-'.$tmdbId.'-backdrop.jpg',
+            $sameNameGhosts['icon'] ?? null,
+            'Ghosts '.$year.' should use artwork from the series with the matching year.'
+        );
+        assertSameValue(true, $sameNameGhostsResult['lookup'], 'Ghosts '.$year.' should validate its year-specific series identity.');
+    }
+
+    $germanSeries = [
+        'title' => 'Die Landarztpraxis',
+        'subtitle' => 'Familienbande',
+        'episode_num' => '1.42',
+        'desc' => 'Isa kämpft in Wiesenkirchen um ihre Familie.',
+        'category' => 'Series',
+    ];
+    $germanSeriesCache = [];
+    enrich($plugin, $method, $germanSeries, new TmdbService('german-series'), $germanSeriesCache);
+    assertSameValue('https://fixture.invalid/landarztpraxis-backdrop.jpg', $germanSeries['icon'] ?? null, 'An exact German series title should use its TV backdrop.');
+
     $provider = [
         'title' => 'Provider Programme',
         'desc' => 'Complete provider description.',
@@ -414,6 +532,36 @@ namespace Tests {
     $ambiguousCache = [];
     enrich($plugin, $method, $ambiguous, new TmdbService('ambiguous'), $ambiguousCache);
     assertSameValue($ambiguousBefore, $ambiguous, 'Ambiguous TV and movie candidates should leave the programme unchanged.');
+
+    $courtShow = [
+        'title' => 'Ulrich Wetzel - Das Strafgericht',
+        'subtitle' => 'Der verschwundene Ring',
+        'desc' => 'Vor Gericht stehen sich widersprüchliche Aussagen gegenüber.',
+        'category' => 'Series',
+    ];
+    $courtShowBefore = $courtShow;
+    $courtShowCache = [];
+    enrich($plugin, $method, $courtShow, new TmdbService('ulrich-wetzel'), $courtShowCache);
+    assertSameValue($courtShowBefore, $courtShow, 'An unresolved court-show media-type tie should fail closed after full and base-title validation.');
+
+    $boston = [
+        'title' => 'Boston',
+        'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
+        'category' => 'Documentary',
+        'icon' => 'https://provider.invalid/boston-portrait.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/boston-portrait.jpg',
+            'type' => 'poster',
+            'orient' => 'P',
+            'width' => 800,
+            'height' => 1200,
+        ]],
+    ];
+    $bostonCache = [];
+    enrich($plugin, $method, $boston, new TmdbService('boston'), $bostonCache);
+    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $boston['icon'], 'Boston should replace a portrait-only icon with the validated landscape backdrop.');
+    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $boston['images'][0]['url'] ?? null, 'Boston landscape artwork should be the first images entry.');
+    assertTrueValue(in_array('https://provider.invalid/boston-portrait.jpg', array_column($boston['images'], 'url'), true), 'Boston source portrait artwork should remain available after the backdrop.');
 
     $fetchImages = $reflection->getMethod('fetchTmdbImages');
     $fetchImages->setAccessible(true);

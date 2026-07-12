@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.07.10-v1.13.2';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.07.12-artwork-cache';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -1339,8 +1339,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $evidenceHash = hash('sha256', json_encode($lookupEvidence, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
         $fullCacheKey = $this->normalizeCacheKey($title).'|'.$evidenceHash;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).'|'.$evidenceHash : null;
+        $seriesBaseCacheKey = ($baseTitle !== $title && $hasStrongSeriesSignals)
+            ? '__series_base|'.self::ENRICHMENT_LOGIC_VERSION.'|'.$this->normalizeCacheKey($baseTitle).'|year:'.($year ?? 'unknown')
+            : null;
 
-        // Check TMDB lookup cache: try full title first, then base title
+        // Keep description-sensitive entries isolated. Only strongly episodic records may
+        // reuse a separately validated, exact primary TV-series match across episode titles.
         if (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
@@ -1348,6 +1352,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $result['cache_hit'] = true;
             $tmdbData = $cache[$baseCacheKey];
             $cache[$fullCacheKey] = $tmdbData; // Promote to full key for faster hits
+        } elseif ($seriesBaseCacheKey !== null
+            && isset($cache[$seriesBaseCacheKey])
+            && $this->isReusableBaseSeriesMatch($cache[$seriesBaseCacheKey], $baseTitle)) {
+            $result['cache_hit'] = true;
+            $tmdbData = $cache[$seriesBaseCacheKey];
+            $cache[$fullCacheKey] = $tmdbData;
         } else {
             $result['lookup'] = true;
 
@@ -1364,12 +1374,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             // Cache under full title key
             $cache[$fullCacheKey] = $tmdbData;
 
-            // If the match came via the base title, also cache under base key
-            // so other episodes of the same show benefit from the cache.
-            // e.g. "Sturm der Liebe - Ep A" and "Sturm der Liebe - Ep B"
-            // both share the "sturm der liebe" base cache entry.
+            // Preserve the evidence-specific base entry and separately record exact primary
+            // TV-series identities that are safe to reuse across strongly episodic titles.
             if ($matchedViaBase && $baseCacheKey !== null) {
                 $cache[$baseCacheKey] = $tmdbData;
+            }
+            if ($matchedViaBase
+                && $seriesBaseCacheKey !== null
+                && $this->isReusableBaseSeriesMatch($tmdbData, $baseTitle)) {
+                $cache[$seriesBaseCacheKey] = $tmdbData;
             }
         }
 
@@ -2425,6 +2438,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
 
         return trim(preg_replace('/\s+/', ' ', $normalized));
+    }
+
+    private function isReusableBaseSeriesMatch(mixed $tmdbData, string $baseTitle): bool
+    {
+        if (! is_array($tmdbData) || ($tmdbData['_media_type'] ?? null) !== 'tv') {
+            return false;
+        }
+
+        $baseTitle = $this->normalizeIdentityText($baseTitle);
+        foreach (['name', 'original_name'] as $field) {
+            if ($this->normalizeIdentityText((string) ($tmdbData[$field] ?? '')) === $baseTitle) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
