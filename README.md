@@ -28,12 +28,12 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 | Enrich descriptions | On | Fill missing descriptions from TMDB |
 | Map genres to Emby compatible categories | Off | Normalize genres to compact Emby-style categories (Movie, Series, News, Sports, Kids, Documentary, Music, Education) |
 | Map genres to Kodi guide color genres | Off | Normalize genres to the detailed Kodi labels from m3u-editor issue 347 (Basketball, Public Affairs, Comedy-Drama, Science Fiction, Cooking, Game Show, etc.). This takes precedence over the Emby compatible mapping when both are enabled. |
-| Auto-run on cache | On | Run automatically after EPG cache generation |
+| Auto-run on cache | On | After a related EPG cache is generated, enrich all EPG sources used by each eligible selected playlist |
 
 ## How It Works
 
 1. After the EPG cache is generated (hook: `epg.cache.generated`), or when triggered manually
-2. Resolves which EPG channel IDs are actually used in your playlists
+2. Resolves every EPG source and channel ID used by each eligible selected playlist
 3. Reads each day's cached programme JSONL files, but only processes targeted channels
 4. For each programme missing artwork/genres/descriptions:
    - Checks the local TMDB title cache
