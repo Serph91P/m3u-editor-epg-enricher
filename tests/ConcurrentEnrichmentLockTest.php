@@ -95,13 +95,48 @@ namespace App\Models {
 
     class FakeQuery
     {
+        private array $playlistIds = [10];
+
+        public function __construct(private ?string $model = null) {}
+
+        public function whereIn(string $column, mixed $values): self
+        {
+            if ($column === 'playlist_id') {
+                $this->playlistIds = (array) $values;
+            }
+
+            return $this;
+        }
+
+        public function whereKey(int|array $ids): self
+        {
+            $this->playlistIds = (array) $ids;
+
+            return $this;
+        }
+
         public function __call(string $name, array $arguments): self
         {
             return $this;
         }
 
-        public function pluck(string $column): FakeCollection
+        public function pluck(string $column, ?string $key = null): FakeCollection
         {
+            if ($this->model === Playlist::class) {
+                $values = $column === 'name'
+                    ? array_fill_keys($this->playlistIds, 'Fixture playlist')
+                    : $this->playlistIds;
+
+                return new FakeCollection($values);
+            }
+
+            if ($this->model === Channel::class && $column === 'epg_channels.epg_id') {
+                return new FakeCollection(array_map(
+                    fn (int $playlistId): int => $playlistId === 20 ? 2 : 1,
+                    $this->playlistIds,
+                ));
+            }
+
             return new FakeCollection([1]);
         }
 
@@ -112,7 +147,7 @@ namespace App\Models {
 
         public function first(): Playlist
         {
-            return new Playlist();
+            return new Playlist((int) $this->playlistIds[0]);
         }
     }
 
@@ -120,7 +155,7 @@ namespace App\Models {
     {
         public static function query(): FakeQuery
         {
-            return new FakeQuery();
+            return new FakeQuery(self::class);
         }
     }
 
@@ -142,18 +177,23 @@ namespace App\Models {
     {
         public static function query(): FakeQuery
         {
-            return new FakeQuery();
+            return new FakeQuery(self::class);
         }
     }
 
     class Playlist
     {
-        public int $id = 10;
+        public int $id;
         public string $name = 'Fixture playlist';
+
+        public function __construct(int $id = 10)
+        {
+            $this->id = $id;
+        }
 
         public static function query(): FakeQuery
         {
-            return new FakeQuery();
+            return new FakeQuery(self::class);
         }
     }
 }
@@ -248,7 +288,7 @@ namespace Tests {
     $differentEpgResult = $plugin->runHook('epg.cache.generated', [
         'epg_id' => 2,
         'user_id' => 1,
-        'playlist_ids' => [10],
+        'playlist_ids' => [20],
     ], $context);
     assertTrueValue(! $differentEpgResult->success, 'A lock for one EPG must not skip a different EPG.');
 

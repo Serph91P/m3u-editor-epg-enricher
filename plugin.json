@@ -151,7 +151,7 @@
           "options_provider": "enrichable_playlists",
           "multiple": true,
           "required": false,
-          "helper_text": "Only enrich these playlists during auto-run. Leave empty to enrich all playlists."
+          "helper_text": "When a related EPG cache is generated, fully enrich all EPG sources used by these playlists. Leave empty to include all related playlists."
         }
       ]
     }
