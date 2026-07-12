@@ -561,9 +561,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
-        $context->heartbeat("EPG cache generated (ID: {$epgId}). Running enrichment for playlist channels.");
+        $playlists = $this->enrichablePlaylistQuery($context->user)
+            ->whereKey($playlistIds)
+            ->orderBy('name')
+            ->pluck('name', 'id')
+            ->all();
 
-        return $this->doEnrich($epgId, $playlistIds, $context);
+        $context->heartbeat("EPG cache generated (ID: {$epgId}). Running playlist-scoped enrichment.");
+
+        return $this->enrichPlaylists($playlists, $context);
     }
 
     /**
@@ -589,9 +595,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return PluginActionResult::failure("Playlist [{$playlistId}] is not owned or is not enrichable.");
         }
 
-        // Resolve distinct EPG IDs from the playlist's enabled channels
+        return $this->enrichPlaylists([$playlist->id => $playlist->name], $context);
+    }
+
+    /**
+     * Enrich every distinct EPG source referenced by the selected playlists.
+     *
+     * @param  array<int, string>  $playlists  Playlist names keyed by ID
+     */
+    private function enrichPlaylists(array $playlists, PluginExecutionContext $context): PluginActionResult
+    {
+        $playlistIds = array_map('intval', array_keys($playlists));
         $epgIds = Channel::query()
-            ->where('playlist_id', $playlist->id)
+            ->whereIn('playlist_id', $playlistIds)
             ->where('enabled', true)
             ->whereNotNull('epg_channel_id')
             ->whereHas('epgChannel')
@@ -601,30 +617,30 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ->all();
 
         if (empty($epgIds)) {
-            return PluginActionResult::success("No active channels with EPG mappings in '{$playlist->name}' - nothing to enrich.");
+            return PluginActionResult::success('No active channels with EPG mappings in '.$this->playlistLabel($playlists).' - nothing to enrich.');
         }
 
-        $playlistIds = [$playlist->id];
         $totalChannels = $this->countTargetChannels($epgIds, $playlistIds);
-        $context->heartbeat("Starting EPG enrichment for playlist '{$playlist->name}' ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
+        $playlistLabel = $this->playlistLabel($playlists);
+        $context->heartbeat("Starting EPG enrichment for {$playlistLabel} ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
 
-        // Enrich each EPG source referenced by this playlist
         $combinedStats = [];
-        $lastResult = null;
+        $notices = [];
 
         foreach ($epgIds as $epgId) {
-            $lastResult = $this->doEnrich($epgId, $playlistIds, $context);
+            $result = $this->doEnrich($epgId, $playlistIds, $context);
 
-            if (! $lastResult->success) {
-                return $lastResult;
+            if (! $result->success) {
+                return $result;
             }
 
-            // If doEnrich returned early (e.g. TMDB disabled), propagate directly
-            if (empty($lastResult->data)) {
-                return $lastResult;
+            if (empty($result->data)) {
+                $notices[] = $result->message;
+
+                continue;
             }
 
-            foreach ($lastResult->data as $key => $value) {
+            foreach ($result->data as $key => $value) {
                 if (is_int($value)) {
                     $combinedStats[$key] = ($combinedStats[$key] ?? 0) + $value;
                 } else {
@@ -633,12 +649,30 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
-        $summary = "Enrichment complete for playlist '{$playlist->name}': "
+        $notice = implode(' ', array_unique($notices));
+        if (empty($combinedStats)) {
+            return PluginActionResult::success("Enrichment finished for {$playlistLabel}: {$notice}");
+        }
+
+        $summary = "Enrichment complete for {$playlistLabel}: "
             .($combinedStats['programmes_updated'] ?? 0).'/'
             .($combinedStats['programmes_processed'] ?? 0).' programmes updated '
             ."across {$totalChannels} active channels.";
+        if ($notice !== '') {
+            $summary .= " {$notice}";
+        }
 
         return PluginActionResult::success($summary, $combinedStats);
+    }
+
+    /**
+     * @param  array<int, string>  $playlists
+     */
+    private function playlistLabel(array $playlists): string
+    {
+        $names = array_map(fn (string $name): string => "'{$name}'", array_values($playlists));
+
+        return (count($names) === 1 ? 'playlist ' : 'playlists ').implode(', ', $names);
     }
 
     private function enrichablePlaylistQuery(object $user)

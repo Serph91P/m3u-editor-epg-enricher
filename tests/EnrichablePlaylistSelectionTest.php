@@ -43,6 +43,7 @@ namespace App\Plugins\Support {
         public array $settings = [
             'auto_run_on_cache' => true,
             'auto_run_playlists' => [10, 20, 999],
+            'enrich_from_tmdb' => false,
         ];
 
         public function __construct(public ?object $user) {}
@@ -195,28 +196,127 @@ namespace App\Models {
 
     class ChannelQuery
     {
+        private array $rows;
+
+        public function __construct()
+        {
+            $this->rows = Channel::$rows;
+        }
+
         public function whereIn(string $column, mixed $values): self
         {
             if ($column === 'playlist_id') {
                 Channel::$resolvedPlaylistIds = $values;
             }
 
+            $values = (array) $values;
+            $this->rows = array_values(array_filter(
+                $this->rows,
+                fn (array $row): bool => in_array($row[$column] ?? null, $values, true),
+            ));
+
             return $this;
         }
 
-        public function __call(string $name, array $arguments): self
+        public function where(string $column, mixed $value): self
         {
+            $this->rows = array_values(array_filter(
+                $this->rows,
+                fn (array $row): bool => ($row[$column] ?? null) === $value,
+            ));
+
+            return $this;
+        }
+
+        public function whereNotNull(string $column): self
+        {
+            $this->rows = array_values(array_filter(
+                $this->rows,
+                fn (array $row): bool => ($row[$column] ?? null) !== null,
+            ));
+
+            return $this;
+        }
+
+        public function whereHas(string $relation, ?callable $callback = null): self
+        {
+            return $this;
+        }
+
+        public function join(string ...$arguments): self
+        {
+            return $this;
+        }
+
+        public function distinct(): self
+        {
+            return $this;
+        }
+
+        public function count(): int
+        {
+            return count($this->rows);
+        }
+
+        public function pluck(string $column): FakeCollection
+        {
+            return new FakeCollection(array_values(array_unique(array_map(
+                fn (array $row): mixed => $column === 'epg_channels.epg_id'
+                    ? $row['epg_id']
+                    : ($row[$column] ?? null),
+                $this->rows,
+            ))));
+        }
+    }
+
+    class EpgChannelQuery
+    {
+        private array $rows;
+        private ?int $epgId = null;
+
+        public function __construct()
+        {
+            $this->rows = EpgChannel::$rows;
+        }
+
+        public function where(string $column, mixed $value): self
+        {
+            if ($column === 'epg_id') {
+                $this->epgId = (int) $value;
+            }
+
+            $this->rows = array_values(array_filter(
+                $this->rows,
+                fn (array $row): bool => $row[$column] === $value,
+            ));
+
+            return $this;
+        }
+
+        public function whereIn(string $column, mixed $values): self
+        {
+            $values = is_object($values) && method_exists($values, 'all') ? $values->all() : (array) $values;
+            $this->rows = array_values(array_filter(
+                $this->rows,
+                fn (array $row): bool => in_array($row[$column], $values, true),
+            ));
+
             return $this;
         }
 
         public function pluck(string $column): FakeCollection
         {
-            return new FakeCollection([]);
+            if ($column === 'channel_id' && $this->epgId !== null) {
+                EpgChannel::$resolvedChannels[$this->epgId] = array_column($this->rows, 'id');
+            }
+
+            return new FakeCollection(array_column($this->rows, $column));
         }
     }
 
     class Channel
     {
+        public static array $rows = [];
         public static array $resolvedPlaylistIds = [];
 
         public static function query(): ChannelQuery
@@ -227,19 +327,25 @@ namespace App\Models {
 
     class Epg
     {
+        public static array $findIds = [];
         public string $name = 'Fixture EPG';
 
         public static function find(int $id): self
         {
+            self::$findIds[] = $id;
+
             return new self();
         }
     }
 
     class EpgChannel
     {
-        public static function query(): ChannelQuery
+        public static array $rows = [];
+        public static array $resolvedChannels = [];
+
+        public static function query(): EpgChannelQuery
         {
-            return new ChannelQuery();
+            return new EpgChannelQuery();
         }
     }
 }
@@ -291,6 +397,8 @@ namespace Tests {
     require_once __DIR__.'/../Plugin.php';
 
     use App\Models\Channel;
+    use App\Models\Epg;
+    use App\Models\EpgChannel;
     use App\Models\Playlist;
     use App\Models\User;
     use App\Plugins\Contracts\PluginSelectOptionsProviderInterface;
@@ -370,6 +478,45 @@ namespace Tests {
     ], $manualContext);
     assertSameValue(true, $craftedSettingsResult->success, 'Malformed configured IDs should produce a clean hook skip.');
     assertSameValue([], Channel::$resolvedPlaylistIds, 'Malformed configured IDs must not broaden enrichment to all playlists.');
+
+    Playlist::$rows = [
+        (object) ['id' => 10, 'user_id' => 1, 'name' => 'First selected', 'eligible' => true],
+        (object) ['id' => 11, 'user_id' => 1, 'name' => 'Second selected', 'eligible' => true],
+        (object) ['id' => 12, 'user_id' => 1, 'name' => 'Not selected', 'eligible' => true],
+    ];
+    Channel::$rows = [
+        ['playlist_id' => 10, 'enabled' => true, 'epg_channel_id' => 101, 'epg_id' => 1],
+        ['playlist_id' => 10, 'enabled' => true, 'epg_channel_id' => 102, 'epg_id' => 2],
+        ['playlist_id' => 10, 'enabled' => true, 'epg_channel_id' => 103, 'epg_id' => 2],
+        ['playlist_id' => 11, 'enabled' => true, 'epg_channel_id' => 104, 'epg_id' => 2],
+        ['playlist_id' => 12, 'enabled' => true, 'epg_channel_id' => 105, 'epg_id' => 3],
+    ];
+    EpgChannel::$rows = [
+        ['id' => 101, 'epg_id' => 1, 'channel_id' => 'epg-a'],
+        ['id' => 102, 'epg_id' => 2, 'channel_id' => 'epg-b-one'],
+        ['id' => 103, 'epg_id' => 2, 'channel_id' => 'epg-b-two'],
+        ['id' => 104, 'epg_id' => 2, 'channel_id' => 'epg-b-three'],
+        ['id' => 105, 'epg_id' => 3, 'channel_id' => 'epg-c'],
+    ];
+    Epg::$findIds = [];
+    EpgChannel::$resolvedChannels = [];
+    $manualContext->settings['auto_run_playlists'] = [10, 11];
+    $playlistScopedResult = $plugin->runHook('epg.cache.generated', [
+        'epg_id' => 1,
+        'user_id' => 1,
+        'playlist_ids' => [10, 10, 11, 12],
+    ], $manualContext);
+    assertSameValue(true, $playlistScopedResult->success, 'Playlist-scoped auto-run should complete cleanly.');
+    assertTrueValue(
+        str_contains($playlistScopedResult->message, "playlists 'First selected', 'Second selected'"),
+        'Auto-run summaries must name every selected playlist.',
+    );
+    assertSameValue([1, 2], Epg::$findIds, 'Auto-run must enrich every distinct EPG referenced by selected playlists, but no unselected playlist EPG.');
+    assertSameValue(
+        [1 => [101], 2 => [102, 103, 104]],
+        EpgChannel::$resolvedChannels,
+        'Each EPG must target only channels from selected playlists.',
+    );
 
     foreach (glob($tempDir.'/plugin-data/epg-enricher/*') as $file) {
         unlink($file);
