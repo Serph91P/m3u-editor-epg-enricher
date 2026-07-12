@@ -1340,7 +1340,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $fullCacheKey = $this->normalizeCacheKey($title).'|'.$evidenceHash;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).'|'.$evidenceHash : null;
         $seriesBaseCacheKey = ($baseTitle !== $title && $hasStrongSeriesSignals)
-            ? '__series_base|'.self::ENRICHMENT_LOGIC_VERSION.'|'.$this->normalizeCacheKey($baseTitle)
+            ? '__series_base|'.self::ENRICHMENT_LOGIC_VERSION.'|'.$this->normalizeCacheKey($baseTitle).'|year:'.($year ?? 'unknown')
             : null;
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may

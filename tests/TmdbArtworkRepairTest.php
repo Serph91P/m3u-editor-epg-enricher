@@ -114,6 +114,12 @@ namespace App\Services {
                     'original_name' => 'Ghosts',
                     'first_air_date' => '2019-04-15',
                 ],
+                'same-name-ghosts' => [
+                    'tmdb_id' => $year === 2021 ? 108 : 107,
+                    'name' => 'Ghosts',
+                    'original_name' => 'Ghosts',
+                    'first_air_date' => ($year === 2021 ? '2021' : '2019').'-01-01',
+                ],
                 'german-series' => [
                     'tmdb_id' => 105,
                     'name' => 'Die Landarztpraxis',
@@ -160,6 +166,12 @@ namespace App\Services {
                     'overview' => 'A young couple inherit a country estate occupied by ghosts.',
                     'poster_url' => 'https://fixture.invalid/ghosts-poster.jpg',
                     'backdrop_url' => 'https://fixture.invalid/ghosts-backdrop.jpg',
+                    'genres' => 'Comedy',
+                ],
+                'same-name-ghosts' => [
+                    'overview' => 'A comedy about ghosts.',
+                    'poster_url' => 'https://fixture.invalid/ghosts-'.$tmdbId.'-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/ghosts-'.$tmdbId.'-backdrop.jpg',
                     'genres' => 'Comedy',
                 ],
                 'german-series' => [
@@ -456,6 +468,25 @@ namespace Tests {
     }
     assertSameValue(2, $ghostsTmdb->tvSearches, 'Ghosts should search the full first episode title and then the base series once.');
     assertSameValue(0, $ghostsTmdb->movieSearches, 'Ghosts episode evidence should keep matching on TV.');
+
+    $sameNameGhostsCache = [];
+    $sameNameGhostsTmdb = new TmdbService('same-name-ghosts');
+    foreach ([2019 => 107, 2021 => 108] as $year => $tmdbId) {
+        $sameNameGhosts = [
+            'title' => 'Ghosts - Episode '.$year,
+            'desc' => 'Comedy series from '.$year.' about a haunted home.',
+            'episode_num' => '1.1',
+            'category' => 'Series',
+        ];
+        $sameNameGhostsResult = enrich($plugin, $method, $sameNameGhosts, $sameNameGhostsTmdb, $sameNameGhostsCache);
+
+        assertSameValue(
+            'https://fixture.invalid/ghosts-'.$tmdbId.'-backdrop.jpg',
+            $sameNameGhosts['icon'] ?? null,
+            'Ghosts '.$year.' should use artwork from the series with the matching year.'
+        );
+        assertSameValue(true, $sameNameGhostsResult['lookup'], 'Ghosts '.$year.' should validate its year-specific series identity.');
+    }
 
     $germanSeries = [
         'title' => 'Die Landarztpraxis',
