@@ -1,7 +1,7 @@
 {
   "id": "epg-enricher",
   "name": "EPG Enricher",
-  "version": "1.13.6",
+  "version": "1.13.7",
   "api_version": "1.0.0",
   "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Only processes channels that are mapped in your playlists, complementing existing Schedules Direct / Gracenote metadata where data is missing.",
   "repository": "Serph91P/m3u-editor-epg-enricher",
@@ -125,7 +125,7 @@
           "type": "boolean",
           "label": "Detect categories from title keywords",
           "default": true,
-          "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to EPG categories' is also enabled."
+          "helper_text": "Detect Sports, News, Kids, and Documentary categories directly from programme titles. Active when either the Emby compatible or Kodi guide genre mapper is enabled."
         }
       ]
     },
