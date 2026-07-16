@@ -4,7 +4,7 @@
 
 **Goal:** Plugin liefert pro Programme mehrere artwork-varianten (poster, backdrop, logo, still) in unterschiedlichen größen/sprachen damit jeder client passend rendern kann; titel-jahr wird für besseren TMDB-match extrahiert; verfehlte titel werden geloggt für späteres tuning.
 
-**Architecture:** Erweitert `enrichProgrammeFromTmdb()` in `Plugin.php`. Neue private helper für TMDB `/movie/{id}/images` + `/tv/{id}/images` calls (eigenes Http::get da TmdbService keinen public getter hat — api_key via `app(\\App\\Settings\\GeneralSettings::class)->tmdb_api_key`). Bilder-cache als zweite cache-datei `tmdb-images-cache.json` (per tmdb_id+type, niemals per titel — bilder ändern sich kaum). Year-extraction in `extractBaseTitle()` integriert (rückgabe-shape erweitert auf `[base, year]` oder via callable signature-änderung). Miss-log appendet jsonl unter `plugin-data/epg-enricher/missed-titles.jsonl` und neue health_check-aktion liest top-N raus.
+**Architecture:** Erweitert `enrichProgrammeFromTmdb()` in `Plugin.php`. Neue private helper für TMDB `/movie/{id}/images` + `/tv/{id}/images` calls (eigenes Http::get da TmdbService keinen public getter hat - api_key via `app(\\App\\Settings\\GeneralSettings::class)->tmdb_api_key`). Bilder-cache als zweite cache-datei `tmdb-images-cache.json` (per tmdb_id+type, niemals per titel - bilder ändern sich kaum). Year-extraction in `extractBaseTitle()` integriert (rückgabe-shape erweitert auf `[base, year]` oder via callable signature-änderung). Miss-log appendet jsonl unter `plugin-data/epg-enricher/missed-titles.jsonl` und neue health_check-aktion liest top-N raus.
 
 **Tech Stack:** PHP 8.5, Laravel `Http::`, hauptapp services (`TmdbService`, `GeneralSettings`), keine neuen composer-deps.
 
@@ -16,14 +16,14 @@
 
 - Repo: `~/Dokumente/private projekte/m3u-editor-epg-enricher`
 - Einziges relevantes file: `Plugin.php` (~1691 LOC)
-- Hauptapp-XMLTV-output (read-only ref): `~/Dokumente/private projekte/m3u-editor/app/Http/Controllers/EpgGenerateController.php` Z.347-364 — erwartet `$programme['images'][i]` mit keys: `url, type, width, height, orient, size`. **type** kann frei sein (poster/backdrop/screenshot/logo) — wird nur als attribut emittiert.
+- Hauptapp-XMLTV-output (read-only ref): `~/Dokumente/private projekte/m3u-editor/app/Http/Controllers/EpgGenerateController.php` Z.347-364 - erwartet `$programme['images'][i]` mit keys: `url, type, width, height, orient, size`. **type** kann frei sein (poster/backdrop/screenshot/logo) - wird nur als attribut emittiert.
 - TmdbService base url: `https://api.themoviedb.org/3`, image base: `https://image.tmdb.org/t/p/{size}`
 - TMDB image-sizes: posters `w92, w154, w185, w342, w500, w780, original` · backdrops `w300, w780, w1280, original` · logos `w45, w92, w154, w185, w300, w500, original` · stills `w92, w185, w300, original`
 - Sprache aus settings: `$settings['tmdb_language'] ?? 'de-DE'` (siehe Plugin.php Z.1593 `setTmdbLanguage`)
 - **WICHTIG**: kein `php artisan test`, kein pest im plugin. Manuelle verifizierung via dispatch + lesen der JSONL output.
-- **Kein** test-framework eingerichtet — TDD entfällt. Stattdessen: kleine **smoke-scripts** unter `scripts/` mit `php scripts/smoke-images.php` und manuelle EPG-runs.
+- **Kein** test-framework eingerichtet - TDD entfällt. Stattdessen: kleine **smoke-scripts** unter `scripts/` mit `php scripts/smoke-images.php` und manuelle EPG-runs.
 - **Commits**: nach jedem task. Single-line `-m '…'` (multi-line bricht im terminal).
-- **Pint**: `cd ../m3u-editor && vendor/bin/pint --dirty ../m3u-editor-epg-enricher/Plugin.php` (plugin hat selbst kein pint — hauptapp-binary nutzen).
+- **Pint**: `cd ../m3u-editor && vendor/bin/pint --dirty ../m3u-editor-epg-enricher/Plugin.php` (plugin hat selbst kein pint - hauptapp-binary nutzen).
 
 ---
 
@@ -35,7 +35,7 @@
 
 **Step 1: Erweitere `extractBaseTitle` um optional year-rückgabe**
 
-Ändere signatur auf `private function extractBaseTitle(string $title): array` mit return `['title' => string, 'year' => ?int]`. Year-regex: `/\b(19\d{2}|20\d{2})\b/` — match das letzte vorkommen.
+Ändere signatur auf `private function extractBaseTitle(string $title): array` mit return `['title' => string, 'year' => ?int]`. Year-regex: `/\b(19\d{2}|20\d{2})\b/` - match das letzte vorkommen.
 
 **Step 2: Update alle 2 callsites in `enrichProgrammeFromTmdb`**
 
@@ -112,7 +112,7 @@ private function getTmdbCredentials(): ?array
 }
 ```
 
-**Step 2: Verifizieren — pint + commit**
+**Step 2: Verifizieren - pint + commit**
 
 ```bash
 git add Plugin.php && git commit -m 'feat: add getTmdbCredentials helper'
@@ -128,7 +128,7 @@ git add Plugin.php && git commit -m 'feat: add getTmdbCredentials helper'
 
 **Step 1: Suche existierende cache-helpers**
 
-`loadTmdbCache` Z.1069, `saveTmdbCache` Z.1103 — kopiere das pattern.
+`loadTmdbCache` Z.1069, `saveTmdbCache` Z.1103 - kopiere das pattern.
 
 **Step 2: Füge zwei neue methoden direkt nach `saveTmdbSeasonCache` (Z.1117) ein**
 
@@ -230,11 +230,11 @@ private function fetchTmdbImages(int $tmdbId, string $mediaType, array &$cache):
 }
 ```
 
-**Step 2: Stelle sicher dass `use Illuminate\Support\Facades\Http;` und `use Illuminate\Support\Facades\Log;` oben drin sind** (sind sie laut grep schon — falls nicht: ergänzen)
+**Step 2: Stelle sicher dass `use Illuminate\Support\Facades\Http;` und `use Illuminate\Support\Facades\Log;` oben drin sind** (sind sie laut grep schon - falls nicht: ergänzen)
 
 **Step 3: Smoke-test (manuell, ohne setup-zwang)**
 
-Skip wenn kein TMDB key verfügbar — Task 5 testet end-to-end.
+Skip wenn kein TMDB key verfügbar - Task 5 testet end-to-end.
 
 **Step 4: commit**
 
@@ -247,9 +247,9 @@ git add Plugin.php && git commit -m 'feat: fetch TMDB images endpoint with multi
 ## Task 5: Image-set selection helper
 
 **Objective:** Aus dem rohen TMDB-images-array die "besten" N varianten pro typ wählen. Regeln:
-- **Posters** (orient=P): top 2 (eine in user-sprache wenn vorhanden, eine sprach-neutral oder en als fallback) — größe `w500` (500x750 typical)
-- **Backdrops** (orient=L): top 2 — sprach-neutral bevorzugt — größe `w1280` (1280x720)
-- **Logos** (orient=L, transparent): top 1 — sprach-präferenz user-lang→en→null — größe `w500`
+- **Posters** (orient=P): top 2 (eine in user-sprache wenn vorhanden, eine sprach-neutral oder en als fallback) - größe `w500` (500x750 typical)
+- **Backdrops** (orient=L): top 2 - sprach-neutral bevorzugt - größe `w1280` (1280x720)
+- **Logos** (orient=L, transparent): top 1 - sprach-präferenz user-lang→en→null - größe `w500`
 
 Sortier-kriterium: `vote_average` desc, dann `vote_count` desc.
 
@@ -459,7 +459,7 @@ if (! $tmdbData) {
 
 **Step 3: Erweitere `healthCheck` (Z.1013) um "top missed titles" section**
 
-Lies das jsonl, count titel-occurrences, gib top 20 zurück. (Aufwand max 30 zeilen — siehe healthCheck struktur, append an `$context->log` oder result-data wie der bestehende code es macht.)
+Lies das jsonl, count titel-occurrences, gib top 20 zurück. (Aufwand max 30 zeilen - siehe healthCheck struktur, append an `$context->log` oder result-data wie der bestehende code es macht.)
 
 **Step 4: commit**
 
@@ -498,11 +498,11 @@ git push -u origin feature/images-pipeline
 
 ## Pitfalls
 
-1. **`$programme['images']` darf nicht überschrieben werden** — der bestehende code (Z.910, 926, 985) appendet schon. Neuer code muss auch appenden + dedupliziert per URL.
-2. **TMDB rate-limit** — `Http::timeout(15)` reicht, aber bei vielen unique tmdb_ids in einem run kann TMDB throttlen (50 req / 1s war historisch). Wenn smoke-test 429 zeigt → in `fetchTmdbImages` ein `usleep(100000)` (100ms) einfügen.
+1. **`$programme['images']` darf nicht überschrieben werden** - der bestehende code (Z.910, 926, 985) appendet schon. Neuer code muss auch appenden + dedupliziert per URL.
+2. **TMDB rate-limit** - `Http::timeout(15)` reicht, aber bei vielen unique tmdb_ids in einem run kann TMDB throttlen (50 req / 1s war historisch). Wenn smoke-test 429 zeigt → in `fetchTmdbImages` ein `usleep(100000)` (100ms) einfügen.
 3. **Kein api_key konfiguriert** → `getTmdbCredentials()` returnt null → Task 4 returnt null → integration in Task 6 skip silently. Kein crash, kein log-spam. Korrekt.
-4. **JSONL append concurrency** — `LOCK_EX` reicht für single-process enricher. Bei parallelen runs theoretisch race aber unkritisch (logfile, kein authoritative state).
-5. **Logos sind transparent PNGs** — clients die `<icon>` ohne `type`-attribut auswerten sehen das logo evtl. als haupt-icon und rendern es schlecht. Bestehender code setzt `$programme['icon']` aus poster (Z.903) — das **darf nicht** auf logo umgestellt werden. Logo nur via `images[]`.
+4. **JSONL append concurrency** - `LOCK_EX` reicht für single-process enricher. Bei parallelen runs theoretisch race aber unkritisch (logfile, kein authoritative state).
+5. **Logos sind transparent PNGs** - clients die `<icon>` ohne `type`-attribut auswerten sehen das logo evtl. als haupt-icon und rendern es schlecht. Bestehender code setzt `$programme['icon']` aus poster (Z.903) - das **darf nicht** auf logo umgestellt werden. Logo nur via `images[]`.
 6. **`aspect_ratio` von TMDB** ist die echte ratio (width/height). Wenn fehlend (alte einträge) → fallback nutzen, sonst division-by-zero.
-7. **`mediaType`** kommt aus `$tmdbData['_media_type']` (gesetzt in `searchTmdbWithValidation` Z.1287/1312) — kann theoretisch fehlen wenn cache aus alter version. Defensiv check.
-8. **Pint im plugin-repo** funktioniert nicht (kein composer setup) — immer hauptapp-pint von `~/Dokumente/private projekte/m3u-editor` aus auf den plugin-pfad anwenden.
+7. **`mediaType`** kommt aus `$tmdbData['_media_type']` (gesetzt in `searchTmdbWithValidation` Z.1287/1312) - kann theoretisch fehlen wenn cache aus alter version. Defensiv check.
+8. **Pint im plugin-repo** funktioniert nicht (kein composer setup) - immer hauptapp-pint von `~/Dokumente/private projekte/m3u-editor` aus auf den plugin-pfad anwenden.

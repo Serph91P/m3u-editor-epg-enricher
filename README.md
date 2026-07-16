@@ -30,6 +30,17 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 | Map genres to Kodi guide color genres | Off | Normalize genres to the detailed Kodi labels from m3u-editor issue 347 (Basketball, Public Affairs, Comedy-Drama, Science Fiction, Cooking, Game Show, etc.). This takes precedence over the Emby compatible mapping when both are enabled. |
 | Auto-run on cache | On | After a related EPG cache is generated, enrich all EPG sources used by each eligible selected playlist |
 
+### Compatibility behavior
+
+| Emby compatible | Kodi detailed | Category output |
+|-----------------|---------------|-----------------|
+| Off | Off | Standard XMLTV. Preserve the first source or TMDB genre without client-specific normalization. |
+| On | Off | Compact Emby compatible categories. |
+| Off | On | Detailed Kodi guide color genres. |
+| On | On | Detailed Kodi guide color genres. Kodi takes precedence. |
+
+Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because no verified plugin output difference requires another setting. Programme identity and artwork ordering remain globally correct XMLTV behavior rather than client profile behavior. Keyword category detection is active when either existing category mapper is enabled.
+
 ## How It Works
 
 1. After the EPG cache is generated (hook: `epg.cache.generated`), or when triggered manually

@@ -125,7 +125,7 @@
           "type": "boolean",
           "label": "Detect categories from title keywords",
           "default": true,
-          "helper_text": "Detect Sports, News, Kids, and Documentary categories from programme titles when TMDB lookup fails. Only active when 'Map genres to EPG categories' is also enabled."
+          "helper_text": "Detect Sports, News, Kids, and Documentary categories directly from programme titles. Active when either the Emby compatible or Kodi guide genre mapper is enabled."
         }
       ]
     },
