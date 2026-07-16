@@ -17,6 +17,40 @@ namespace App\Plugins\Support {
     class PluginExecutionContext {}
 }
 
+namespace App\Services {
+    class TmdbService
+    {
+        public function searchTvSeries(string $title, ?int $year = null): array
+        {
+            return [
+                'tmdb_id' => 42,
+                'name' => $title,
+                'first_air_date' => '2024-01-01',
+            ];
+        }
+
+        public function getTvSeriesDetails(int $tmdbId): array
+        {
+            return [
+                'tmdb_id' => $tmdbId,
+                'name' => 'Profile Matrix Fixture',
+                'genres' => 'Basketball',
+                'overview' => '',
+            ];
+        }
+
+        public function getTvAlternativeTitles(int $tmdbId): array
+        {
+            return [];
+        }
+
+        public function searchMovie(string $title, ?int $year = null, bool $tryFallback = true): ?array
+        {
+            return null;
+        }
+    }
+}
+
 namespace Tests {
     require_once __DIR__.'/../Plugin.php';
 
@@ -70,6 +104,83 @@ namespace Tests {
 
     assertTrueValue(in_array('map_genres_to_epg_categories', $settingIds, true), 'Emby compatible category option should remain available.');
     assertTrueValue(in_array('map_genres_to_kodi_guide_genres', $settingIds, true), 'Kodi guide genre option should be a separate setting.');
+
+    $fieldsById = [];
+    foreach ($manifest['settings'] as $section) {
+        foreach ($section['fields'] ?? [] as $field) {
+            $fieldsById[$field['id']] = $field;
+        }
+    }
+    $keywordHelp = $fieldsById['keyword_category_detection']['helper_text'] ?? '';
+    assertTrueValue(
+        str_contains($keywordHelp, 'Emby') && str_contains($keywordHelp, 'Kodi'),
+        'Keyword detection help should explain that either existing category mapper enables it.'
+    );
+
+    foreach (['jellyfin', 'plex', 'tivimate', 'm3u_tv', 'client_profile'] as $speculativeKey) {
+        foreach ($settingIds as $settingId) {
+            assertTrueValue(
+                ! str_contains($settingId, $speculativeKey),
+                "Standard XMLTV clients should not gain a speculative '{$speculativeKey}' setting."
+            );
+        }
+    }
+
+    $profileMapper = $reflection->getMethod('enrichProgrammeFromTmdb');
+    $profileMapper->setAccessible(true);
+    $profileMatrix = [
+        'standard' => [false, false, 'Basketball'],
+        'emby' => [true, false, 'Sports'],
+        'kodi' => [false, true, 'Basketball'],
+        'emby_and_kodi' => [true, true, 'Basketball'],
+    ];
+    foreach ($profileMatrix as $profile => [$mapEmby, $mapKodi, $expectedCategory]) {
+        $programme = ['title' => 'Profile Matrix Fixture'];
+        $cache = [];
+        $seasonCache = [];
+        $imagesCache = [];
+        $args = [
+            &$programme,
+            new \App\Services\TmdbService(),
+            &$cache,
+            false,
+            true,
+            false,
+            false,
+            false,
+            $mapEmby,
+            $mapKodi,
+            false,
+            false,
+            &$seasonCache,
+            &$imagesCache,
+            [],
+        ];
+        $profileMapper->invokeArgs($plugin, $args);
+        assertSameValue(
+            $expectedCategory,
+            $programme['category'] ?? null,
+            "Compatibility matrix profile '{$profile}' should select the expected category output."
+        );
+    }
+
+    $settingsHasher = $reflection->getMethod('computeSettingsHash');
+    $settingsHasher->setAccessible(true);
+    $profileHashes = [
+        'standard' => $settingsHasher->invoke($plugin, []),
+        'emby' => $settingsHasher->invoke($plugin, ['map_genres_to_epg_categories' => true]),
+        'kodi' => $settingsHasher->invoke($plugin, ['map_genres_to_kodi_guide_genres' => true]),
+        'emby_and_kodi' => $settingsHasher->invoke($plugin, [
+            'map_genres_to_epg_categories' => true,
+            'map_genres_to_kodi_guide_genres' => true,
+        ]),
+    ];
+    assertSameValue(4, count(array_unique($profileHashes)), 'Every compatibility matrix combination should have a distinct settings hash.');
+    assertSameValue(
+        $profileHashes['emby'],
+        $settingsHasher->invoke($plugin, ['map_emby_genres' => true]),
+        'The legacy Emby setting should remain hash-compatible with the current key.'
+    );
 
     echo "Genre mapping tests passed.\n";
 }
