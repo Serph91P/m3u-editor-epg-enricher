@@ -82,6 +82,7 @@ namespace App\Services {
     {
         public int $tvSearches = 0;
         public int $movieSearches = 0;
+        public int $seasonRequests = 0;
 
         public function __construct(private string $scenario) {}
 
@@ -258,6 +259,18 @@ namespace App\Services {
                     'original_title' => $title,
                     'release_date' => '',
                 ],
+                'localized-poster' => [
+                    'tmdb_id' => 208,
+                    'title' => 'Localized Poster',
+                    'original_title' => 'Localized Poster',
+                    'release_date' => '2026-01-01',
+                ],
+                'poster-only' => [
+                    'tmdb_id' => 209,
+                    'title' => 'Poster Only',
+                    'original_title' => 'Poster Only',
+                    'release_date' => '2026-01-01',
+                ],
                 default => null,
             };
         }
@@ -304,6 +317,15 @@ namespace App\Services {
                 'identity-movie-b' => [
                     'backdrop_url' => 'https://fixture.invalid/identity-movie-b.jpg',
                 ],
+                'localized-poster' => [
+                    'overview' => 'A localized poster fixture.',
+                    'poster_url' => 'https://image.tmdb.org/t/p/w500/default-poster.jpg',
+                    'backdrop_url' => 'https://fixture.invalid/localized-backdrop.jpg',
+                ],
+                'poster-only' => [
+                    'overview' => 'A programme without landscape artwork.',
+                    'poster_url' => 'https://fixture.invalid/poster-only.jpg',
+                ],
                 default => null,
             };
         }
@@ -319,6 +341,29 @@ namespace App\Services {
                 'long-walk' => [['title' => 'The Long Walk - Der Todesmarsch', 'iso_3166_1' => 'DE']],
                 'illuminati' => [['title' => 'Illuminati', 'iso_3166_1' => 'DE']],
                 default => [],
+            };
+        }
+
+        public function getSeasonDetails(int $tmdbId, int $season): ?array
+        {
+            $this->seasonRequests++;
+
+            return match ($this->scenario) {
+                'ghosts' => [
+                    'episodes' => [
+                        [
+                            'episode_number' => 6,
+                            'overview' => '',
+                            'still_path' => '/ghosts-s01e06.jpg',
+                        ],
+                        [
+                            'episode_number' => 7,
+                            'overview' => '',
+                            'still_path' => '/ghosts-s01e07.jpg',
+                        ],
+                    ],
+                ],
+                default => null,
             };
         }
     }
@@ -358,10 +403,13 @@ namespace Tests {
         TmdbService $tmdb,
         array &$cache,
         array $lookupContext = [],
+        ?array &$seasonCache = null,
+        ?array &$imagesCache = null,
+        bool $enrichEpisodeDetails = false,
     ): array
     {
-        $seasonCache = [];
-        $imagesCache = [];
+        $seasonCache ??= [];
+        $imagesCache ??= [];
 
         return $method->invokeArgs($plugin, [
             &$programme,
@@ -375,7 +423,7 @@ namespace Tests {
             false,
             false,
             false,
-            false,
+            $enrichEpisodeDetails,
             &$seasonCache,
             &$imagesCache,
             $lookupContext,
@@ -396,6 +444,7 @@ namespace Tests {
         'images' => [
             ['url' => 'https://provider.invalid/unknown.jpg'],
             ['url' => 'https://provider.invalid/unknown.jpg'],
+            ['url' => 'https://fixture.invalid/movie-backdrop.jpg', 'type' => 'backdrop', 'orient' => 'L', 'width' => 4000, 'height' => 2250],
             ['url' => 'https://provider.invalid/logo.png', 'type' => 'logo', 'orient' => 'L', 'width' => 4000, 'height' => 800],
         ],
     ];
@@ -415,12 +464,17 @@ namespace Tests {
         'Landscape, poster, unknown and logo ordering should be stable and duplicate-free.'
     );
     assertSameValue('backdrop', $longWalk['images'][0]['type'], 'Primary image should be a landscape backdrop.');
+    assertSameValue('tmdb', $longWalk['images'][0]['source'] ?? null, 'TMDB provenance should win deduplication over an unprovenanced record with the same URL and role.');
     assertTrueValue(in_array('https://fixture.invalid/movie-poster.jpg', array_column($longWalk['images'], 'url'), true), 'Portrait poster should remain in images.');
     assertTrueValue($longWalkResult['changed'], 'Artwork repair should report a changed programme.');
 
-    $stableLongWalk = $longWalk;
+    $stableLongWalk = json_encode($longWalk, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     enrich($plugin, $method, $longWalk, $longWalkTmdb, $longWalkCache);
-    assertSameValue($stableLongWalk, $longWalk, 'A second enrichment pass should preserve deterministic image order.');
+    assertSameValue(
+        $stableLongWalk,
+        json_encode($longWalk, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        'A second enrichment pass over plugin-created records should be byte-for-byte stable.'
+    );
 
     foreach ([['portrait', 500, 750], ['square', 750, 750]] as [$geometry, $width, $height]) {
         $conflictingArtwork = [
@@ -583,6 +637,97 @@ namespace Tests {
     assertSameValue(2, $ghostsTmdb->tvSearches, 'Ghosts should search the full first episode title and then the base series once.');
     assertSameValue(0, $ghostsTmdb->movieSearches, 'Ghosts episode evidence should keep matching on TV.');
 
+    $episodeStill = [
+        'title' => 'Ghosts - Der Fahrgeist',
+        'desc' => 'Ein Ausflug bringt die Geister durcheinander.',
+        'episode_num' => '0.5',
+        'category' => 'Series',
+        'icon' => 'https://fixture.invalid/ghosts-backdrop.jpg',
+        'images' => [
+            [
+                'url' => 'https://fixture.invalid/ghosts-backdrop.jpg',
+                'type' => 'backdrop',
+                'orient' => 'L',
+                'width' => 1920,
+                'height' => 1080,
+                'scope' => 'series',
+            ],
+            [
+                'url' => 'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
+                'type' => 'screenshot',
+                'orient' => 'L',
+                'width' => 1920,
+                'height' => 1080,
+            ],
+        ],
+    ];
+    $episodeStillCache = [];
+    $episodeSeasonCache = [];
+    $episodeImagesCache = [];
+    $episodeTmdb = new TmdbService('ghosts');
+    enrich(
+        $plugin,
+        $method,
+        $episodeStill,
+        $episodeTmdb,
+        $episodeStillCache,
+        [],
+        $episodeSeasonCache,
+        $episodeImagesCache,
+        true,
+    );
+    assertSameValue(
+        'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
+        $episodeStill['icon'] ?? null,
+        'An exact episode still should be the programme icon even when a series backdrop exists.'
+    );
+    assertSameValue(
+        ['screenshot', 'backdrop', 'poster'],
+        array_column($episodeStill['images'] ?? [], 'type'),
+        'Episode still, series backdrop, and poster roles should remain distinct and ordered.'
+    );
+    assertSameValue('tmdb', $episodeStill['images'][0]['source'] ?? null, 'Validated episode-still provenance should win URL deduplication.');
+
+    $nextEpisodeStill = [
+        'title' => 'Ghosts - Es bleibt in der Familie',
+        'desc' => 'Ein unerwarteter Besuch sorgt für Unruhe.',
+        'episode_num' => '0.6',
+        'category' => 'Series',
+    ];
+    enrich(
+        $plugin,
+        $method,
+        $nextEpisodeStill,
+        $episodeTmdb,
+        $episodeStillCache,
+        [],
+        $episodeSeasonCache,
+        $episodeImagesCache,
+        true,
+    );
+    assertSameValue('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should select its own exact still.');
+    assertSameValue(1, $episodeTmdb->seasonRequests, 'Episodes in one validated series season should safely reuse the season payload.');
+
+    $episodeWithoutStill = [
+        'title' => 'Ghosts - Ohne Szenenbild',
+        'desc' => 'Für diese Folge ist kein Szenenbild verfügbar.',
+        'episode_num' => '0.7',
+        'category' => 'Series',
+    ];
+    enrich(
+        $plugin,
+        $method,
+        $episodeWithoutStill,
+        $episodeTmdb,
+        $episodeStillCache,
+        [],
+        $episodeSeasonCache,
+        $episodeImagesCache,
+        true,
+    );
+    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $episodeWithoutStill['icon'] ?? null, 'An episode without a still should deterministically fall back to the series backdrop.');
+    assertSameValue(1, $episodeTmdb->seasonRequests, 'A missing episode still should reuse the cached season payload.');
+
     $sameNameGhostsCache = [];
     $sameNameGhostsTmdb = new TmdbService('same-name-ghosts');
     foreach ([2019 => 107, 2021 => 108] as $year => $tmdbId) {
@@ -614,9 +759,9 @@ namespace Tests {
     assertSameValue('https://fixture.invalid/landarztpraxis-backdrop.jpg', $germanSeries['icon'] ?? null, 'An exact German series title should use its TV backdrop.');
 
     $provider = [
-        'title' => 'Provider Programme',
-        'desc' => 'Complete provider description.',
-        'category' => 'Series',
+        'title' => 'The Long Walk - Der Todesmarsch',
+        'desc' => 'USA 2025. Bei einem Todesmarsch darf niemand stehen bleiben.',
+        'category' => 'Movie',
         'icon' => 'https://provider.invalid/trusted-landscape.jpg',
         'images' => [
             [
@@ -628,13 +773,34 @@ namespace Tests {
             ],
         ],
     ];
-    $providerBefore = $provider;
     $providerCache = [];
-    $providerTmdb = new TmdbService('none');
+    $providerTmdb = new TmdbService('long-walk');
     $providerResult = enrich($plugin, $method, $provider, $providerTmdb, $providerCache);
-    assertSameValue($providerBefore, $provider, 'Trusted provider landscape artwork should be preserved.');
-    assertSameValue(0, $providerTmdb->tvSearches + $providerTmdb->movieSearches, 'Trusted complete provider metadata should retain the no-op fast path.');
-    assertSameValue(false, $providerResult['changed'], 'Provider no-op should not report a change.');
+    assertSameValue('https://fixture.invalid/movie-backdrop.jpg', $provider['icon'], 'Unscoped landscape branding should be repaired by validated TMDB artwork.');
+    assertTrueValue($providerTmdb->tvSearches + $providerTmdb->movieSearches > 0, 'Unscoped complete metadata should not retain the no-op fast path.');
+    assertSameValue(true, $providerResult['changed'], 'Unscoped artwork repair should report a change.');
+
+    $scopedProvider = [
+        'title' => 'Provider Programme',
+        'desc' => 'Complete provider description.',
+        'category' => 'Series',
+        'icon' => 'https://provider.invalid/programme-landscape.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/programme-landscape.jpg',
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+        ]],
+    ];
+    $scopedProviderBefore = $scopedProvider;
+    $scopedProviderCache = [];
+    $scopedProviderTmdb = new TmdbService('none');
+    $scopedProviderResult = enrich($plugin, $method, $scopedProvider, $scopedProviderTmdb, $scopedProviderCache);
+    assertSameValue($scopedProviderBefore, $scopedProvider, 'Explicitly programme-scoped source artwork should be preserved.');
+    assertSameValue(0, $scopedProviderTmdb->tvSearches + $scopedProviderTmdb->movieSearches, 'Explicit programme provenance should retain the complete-metadata no-op.');
+    assertSameValue(false, $scopedProviderResult['changed'], 'Trusted source artwork should not report a change.');
 
     $ambiguous = [
         'title' => 'Crossroads',
@@ -677,10 +843,85 @@ namespace Tests {
     assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $boston['images'][0]['url'] ?? null, 'Boston landscape artwork should be the first images entry.');
     assertTrueValue(in_array('https://provider.invalid/boston-portrait.jpg', array_column($boston['images'], 'url'), true), 'Boston source portrait artwork should remain available after the backdrop.');
 
+    $posterOnly = [
+        'title' => 'Poster Only',
+        'desc' => 'A 2026 programme without landscape artwork.',
+        'category' => 'Movie',
+        'images' => [[
+            'url' => 'https://provider.invalid/channel-logo.png',
+            'type' => 'logo',
+            'orient' => 'L',
+            'width' => 2000,
+            'height' => 400,
+        ]],
+    ];
+    $posterOnlyCache = [];
+    enrich($plugin, $method, $posterOnly, new TmdbService('poster-only'), $posterOnlyCache);
+    assertSameValue(null, $posterOnly['icon'] ?? null, 'Portrait posters and logos should not be promoted when no landscape programme artwork exists.');
+    assertSameValue(['poster', 'logo'], array_column($posterOnly['images'] ?? [], 'type'), 'Poster and logo roles should remain ordered without a landscape primary.');
+
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
+    $GLOBALS['tmdbTestSettings']->tmdb_language = 'de-DE';
+    Http::$responses[] = new FakeHttpResponse(true, [
+        'posters' => [
+            ['file_path' => '/default-poster.jpg', 'iso_639_1' => 'en', 'vote_average' => 9.0, 'aspect_ratio' => 0.667],
+            ['file_path' => '/german-poster.jpg', 'iso_639_1' => 'de', 'vote_average' => 7.0, 'aspect_ratio' => 0.667],
+        ],
+        'backdrops' => [],
+        'logos' => [],
+    ]);
+    $localizedPoster = [
+        'title' => 'Localized Poster',
+        'desc' => 'A 2026 localized poster fixture.',
+        'category' => 'Movie',
+    ];
+    $localizedPosterCache = [];
+    $localizedSeasonCache = [];
+    $localizedImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $localizedPoster,
+        new TmdbService('localized-poster'),
+        $localizedPosterCache,
+        ['tmdb_language' => 'de-DE'],
+        $localizedSeasonCache,
+        $localizedImagesCache,
+    );
+    $localizedPosters = array_values(array_filter(
+        $localizedPoster['images'] ?? [],
+        fn (array $image): bool => ($image['type'] ?? null) === 'poster'
+    ));
+    assertSameValue('https://image.tmdb.org/t/p/w500/german-poster.jpg', $localizedPosters[0]['url'] ?? null, 'Configured base language should outrank an unverified default poster.');
+    assertSameValue('de', $localizedPosters[0]['language'] ?? null, 'The poster winner should retain its TMDB language metadata.');
+    $defaultPoster = array_values(array_filter(
+        $localizedPosters,
+        fn (array $image): bool => ($image['url'] ?? null) === 'https://image.tmdb.org/t/p/w500/default-poster.jpg'
+    ));
+    assertSameValue('en', $defaultPoster[0]['language'] ?? null, 'A duplicate detail URL should retain the higher-confidence images endpoint metadata.');
+
+    $selectImages = $reflection->getMethod('selectImageSet');
+    $selectImages->setAccessible(true);
+    $languagePriority = $selectImages->invoke($plugin, [
+        'posters' => [
+            ['file_path' => '/english.jpg', 'iso_639_1' => 'en', 'vote_average' => 10.0],
+            ['file_path' => '/neutral.jpg', 'iso_639_1' => null, 'vote_average' => 1.0],
+            ['file_path' => '/german.jpg', 'iso_639_1' => 'de', 'vote_average' => 1.0],
+        ],
+        'backdrops' => [],
+        'logos' => [],
+    ], 'de-DE');
+    assertSameValue(
+        ['https://image.tmdb.org/t/p/w500/german.jpg', 'https://image.tmdb.org/t/p/w500/neutral.jpg'],
+        array_column($languagePriority, 'url'),
+        'Poster selection should prefer configured language, then neutral, before the English fallback.'
+    );
+
     $fetchImages = $reflection->getMethod('fetchTmdbImages');
     $fetchImages->setAccessible(true);
     $imageCache = [];
-    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
+    Http::$calls = [];
+    Http::$responses = [];
     Http::$responses[] = new FakeHttpResponse(false);
     $failedFetch = $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
     assertSameValue(null, $failedFetch, 'Transient image failures should return null.');
@@ -688,14 +929,22 @@ namespace Tests {
 
     Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
     $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
+    $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
+    assertSameValue(2, count(Http::$calls), 'A successful images payload should be reused for the same media identity and language.');
+
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    $fetchImages->invokeArgs($plugin, [99, 'tv', &$imageCache]);
     $GLOBALS['tmdbTestSettings']->tmdb_language = 'en-US';
     Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
     $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    $fetchImages->invokeArgs($plugin, [100, 'movie', &$imageCache]);
     assertSameValue(
-        ['movie:99:de-de', 'movie:99:en-us'],
+        ['movie:99:de-de', 'tv:99:de-de', 'movie:99:en-us', 'movie:100:en-us'],
         array_keys($imageCache),
-        'Image cache identity should include the selected TMDB language.'
+        'Image cache identity should isolate media type, TMDB ID, and selected language.'
     );
+    assertSameValue(5, count(Http::$calls), 'Each distinct image cache identity should fetch exactly once after the transient failure.');
 
     echo "TMDB artwork repair tests passed.\n";
 }
