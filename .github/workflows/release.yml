@@ -81,7 +81,7 @@ jobs:
 
       - name: Skip if no releasable commits
         if: steps.bump.outputs.type == 'none'
-        run: echo "No releasable commits found — skipping release."
+        run: echo "No releasable commits found - skipping release."
 
       - name: Compute new version
         id: version
