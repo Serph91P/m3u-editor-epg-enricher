@@ -138,6 +138,18 @@ namespace App\Services {
                     'original_name' => 'Crossroads',
                     'first_air_date' => '2020-01-01',
                 ],
+                'identity-tv-a' => [
+                    'tmdb_id' => 109,
+                    'name' => $name,
+                    'original_name' => $name,
+                    'first_air_date' => '',
+                ],
+                'identity-tv-b' => [
+                    'tmdb_id' => 110,
+                    'name' => $name,
+                    'original_name' => $name,
+                    'first_air_date' => '',
+                ],
                 default => null,
             };
         }
@@ -182,6 +194,12 @@ namespace App\Services {
                 'ulrich-wetzel' => [
                     'overview' => 'A reality court programme.',
                     'backdrop_url' => 'https://fixture.invalid/court-tv-backdrop.jpg',
+                ],
+                'identity-tv-a' => [
+                    'backdrop_url' => 'https://fixture.invalid/identity-tv-a.jpg',
+                ],
+                'identity-tv-b' => [
+                    'backdrop_url' => 'https://fixture.invalid/identity-tv-b.jpg',
                 ],
                 default => null,
             };
@@ -228,6 +246,18 @@ namespace App\Services {
                     'original_title' => $title,
                     'release_date' => '2022-10-10',
                 ],
+                'identity-movie-a' => [
+                    'tmdb_id' => 206,
+                    'title' => $title,
+                    'original_title' => $title,
+                    'release_date' => '',
+                ],
+                'identity-movie-b' => [
+                    'tmdb_id' => 207,
+                    'title' => $title,
+                    'original_title' => $title,
+                    'release_date' => '',
+                ],
                 default => null,
             };
         }
@@ -267,6 +297,12 @@ namespace App\Services {
                 'ulrich-wetzel' => [
                     'overview' => 'A reality court programme.',
                     'backdrop_url' => 'https://fixture.invalid/court-movie-backdrop.jpg',
+                ],
+                'identity-movie-a' => [
+                    'backdrop_url' => 'https://fixture.invalid/identity-movie-a.jpg',
+                ],
+                'identity-movie-b' => [
+                    'backdrop_url' => 'https://fixture.invalid/identity-movie-b.jpg',
                 ],
                 default => null,
             };
@@ -315,7 +351,14 @@ namespace Tests {
         }
     }
 
-    function enrich(Plugin $plugin, ReflectionMethod $method, array &$programme, TmdbService $tmdb, array &$cache): array
+    function enrich(
+        Plugin $plugin,
+        ReflectionMethod $method,
+        array &$programme,
+        TmdbService $tmdb,
+        array &$cache,
+        array $lookupContext = [],
+    ): array
     {
         $seasonCache = [];
         $imagesCache = [];
@@ -335,6 +378,7 @@ namespace Tests {
             false,
             &$seasonCache,
             &$imagesCache,
+            $lookupContext,
         ]);
     }
 
@@ -430,6 +474,76 @@ namespace Tests {
     enrich($plugin, $method, $weakIlluminati, $illuminatiTmdb, $illuminatiCache);
     assertSameValue($weakBefore, $weakIlluminati, 'Alternative-title matches without description corroboration should fail closed.');
     assertSameValue(2, count($illuminatiCache), 'Lookup cache should separate descriptions that affect identity confidence.');
+
+    $sourceCache = [];
+    $sourceA = ['title' => 'Global Identity'];
+    enrich($plugin, $method, $sourceA, new TmdbService('identity-movie-a'), $sourceCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    $sourceB = ['title' => 'Global Identity'];
+    $sourceBResult = enrich($plugin, $method, $sourceB, new TmdbService('identity-movie-b'), $sourceCache, [
+        'epg_source_id' => 'source-b',
+        'tmdb_language' => 'en-US',
+    ]);
+    assertSameValue('https://fixture.invalid/identity-movie-b.jpg', $sourceB['icon'] ?? null, 'Same-title records without year or description should be isolated by EPG source.');
+    assertSameValue(true, $sourceBResult['lookup'], 'A different EPG source should perform its own TMDB lookup.');
+
+    $languageCache = [];
+    $english = ['title' => 'Language Identity - Episode One', 'episode_num' => '0.0'];
+    enrich($plugin, $method, $english, new TmdbService('identity-tv-a'), $languageCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    $german = ['title' => 'Language Identity - Episode Two', 'episode_num' => '0.1'];
+    $germanResult = enrich($plugin, $method, $german, new TmdbService('identity-tv-b'), $languageCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'de-DE',
+    ]);
+    assertSameValue('https://fixture.invalid/identity-tv-b.jpg', $german['icon'] ?? null, 'Base-series records should be isolated by effective TMDB language.');
+    assertSameValue(true, $germanResult['lookup'], 'A different TMDB language should perform its own lookup.');
+
+    $tmdbIdentityCache = [];
+    $tmdbIdentityA = ['title' => 'Assigned Identity - Episode One', 'episode_num' => '0.0', 'tmdb_id' => 109];
+    enrich($plugin, $method, $tmdbIdentityA, new TmdbService('identity-tv-a'), $tmdbIdentityCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    $tmdbIdentityB = ['title' => 'Assigned Identity - Episode Two', 'episode_num' => '0.1', 'tmdb_id' => 110];
+    $tmdbIdentityBResult = enrich($plugin, $method, $tmdbIdentityB, new TmdbService('identity-tv-b'), $tmdbIdentityCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    assertSameValue('https://fixture.invalid/identity-tv-b.jpg', $tmdbIdentityB['icon'] ?? null, 'Existing TMDB identities should keep base-series cache entries distinct.');
+    assertSameValue(true, $tmdbIdentityBResult['lookup'], 'A different existing TMDB identity should perform its own lookup.');
+
+    $episodeIdentityCache = [];
+    $episodeA = ['title' => 'Episode Identity', 'episode_num' => '0.0'];
+    enrich($plugin, $method, $episodeA, new TmdbService('identity-tv-a'), $episodeIdentityCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    $episodeB = ['title' => 'Episode Identity', 'episode_num' => '1.1'];
+    $episodeBResult = enrich($plugin, $method, $episodeB, new TmdbService('identity-tv-b'), $episodeIdentityCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    assertSameValue('https://fixture.invalid/identity-tv-b.jpg', $episodeB['icon'] ?? null, 'Unrelated season and episode identities should not share a full-title cache entry.');
+    assertSameValue(true, $episodeBResult['lookup'], 'A different season and episode identity should perform its own lookup.');
+
+    $mediaTypeCache = [];
+    $movieIdentity = ['title' => 'Media Identity'];
+    enrich($plugin, $method, $movieIdentity, new TmdbService('identity-movie-a'), $mediaTypeCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    $tvIdentity = ['title' => 'Media Identity', 'episode_num' => '0.0'];
+    $tvIdentityResult = enrich($plugin, $method, $tvIdentity, new TmdbService('identity-tv-b'), $mediaTypeCache, [
+        'epg_source_id' => 'source-a',
+        'tmdb_language' => 'en-US',
+    ]);
+    assertSameValue('https://fixture.invalid/identity-tv-b.jpg', $tvIdentity['icon'] ?? null, 'Movie and TV preferences should not share a cache entry.');
+    assertSameValue(true, $tvIdentityResult['lookup'], 'A different media preference should perform its own lookup.');
 
     $bares = [
         'title' => 'Bares für Rares',
