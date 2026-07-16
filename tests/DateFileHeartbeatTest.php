@@ -102,6 +102,10 @@ namespace Tests {
             false,
             &$seasonCache,
             &$imagesCache,
+            [
+                'epg_source_id' => 'heartbeat-fixture',
+                'tmdb_language' => 'en-US',
+            ],
             $context,
             2,
             4,

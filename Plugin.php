@@ -808,6 +808,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return PluginActionResult::success('TMDB enrichment is disabled - nothing to do.');
         }
 
+        $effectiveTmdbLanguage = $tmdbLanguage !== ''
+            ? $tmdbLanguage
+            : trim((string) (app(GeneralSettings::class)->tmdb_language ?? ''));
+
         // Load TMDB lookup cache from disk
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
@@ -816,7 +820,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // If language changed, the TMDB lookup cache contains results in the old
         // language. Clear it so titles are re-searched with the new language.
         $storedLanguage = $tmdbCache['__language'] ?? null;
-        $currentLanguage = $tmdbLanguage !== '' ? $tmdbLanguage : '__global';
+        $currentLanguage = $effectiveTmdbLanguage !== '' ? $effectiveTmdbLanguage : '__global';
         if ($storedLanguage !== null && $storedLanguage !== $currentLanguage) {
             $context->heartbeat('TMDB language changed - clearing lookup cache for fresh results.');
             $tmdbCache = [];
@@ -960,6 +964,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $enrichEpisodeDetails,
                 $tmdbSeasonCache,
                 $imagesCache,
+                [
+                    'epg_source_id' => (string) $epgId,
+                    'tmdb_language' => $currentLanguage,
+                ],
                 $context,
                 $dayIndex,
                 $totalDays,
@@ -1111,6 +1119,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
         array &$imagesCache,
+        array $lookupContext,
         PluginExecutionContext $context,
         int $dayIndex = 1,
         int $totalDays = 1,
@@ -1185,6 +1194,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $enrichEpisodeDetails,
                     $tmdbSeasonCache,
                     $imagesCache,
+                    $lookupContext,
                 );
 
                 if ($enrichResult['changed']) {
@@ -1261,6 +1271,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         bool $enrichEpisodeDetails,
         array &$tmdbSeasonCache,
         array &$imagesCache,
+        array $lookupContext = [],
     ): array {
         $result = [
             'changed' => false,
@@ -1356,8 +1367,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         $forcedMediaType = $hasStrongSeriesSignals ? 'tv' : null;
         $description = trim((string) ($programme['desc'] ?? ''));
+        $existingTmdbId = $programme['tmdb_id'] ?? null;
+        $existingTmdbId = is_scalar($existingTmdbId) ? trim((string) $existingTmdbId) : null;
+        $cacheScope = [
+            'epg_source_id' => trim((string) ($lookupContext['epg_source_id'] ?? '')),
+            'tmdb_language' => mb_strtolower(trim((string) ($lookupContext['tmdb_language'] ?? ''))),
+            'media_type' => $forcedMediaType,
+            'tmdb_id' => $existingTmdbId !== '' ? $existingTmdbId : null,
+        ];
         $lookupEvidence = [
             'logic' => self::ENRICHMENT_LOGIC_VERSION,
+            'scope' => $cacheScope,
             'title' => $this->normalizeCacheKey($title),
             'base_title' => $this->normalizeCacheKey($baseTitle),
             'year' => $year,
@@ -1374,7 +1394,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $fullCacheKey = $this->normalizeCacheKey($title).'|'.$evidenceHash;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).'|'.$evidenceHash : null;
         $seriesBaseCacheKey = ($baseTitle !== $title && $hasStrongSeriesSignals)
-            ? '__series_base|'.self::ENRICHMENT_LOGIC_VERSION.'|'.$this->normalizeCacheKey($baseTitle).'|year:'.($year ?? 'unknown')
+            ? '__series_base|'.hash('sha256', json_encode([
+                'logic' => self::ENRICHMENT_LOGIC_VERSION,
+                'scope' => $cacheScope,
+                'base_title' => $this->normalizeCacheKey($baseTitle),
+                'year' => $year,
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES))
             : null;
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may
