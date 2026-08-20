@@ -13,7 +13,30 @@ namespace App\Plugins\Contracts {
 namespace App\Plugins\Support {
     class PluginSelectOptionsContext {}
 
-    class PluginActionResult {}
+    class PluginActionResult
+    {
+        public function __construct(
+            public readonly string $status,
+            public readonly bool $success,
+            public readonly string $summary,
+            public readonly array $data = [],
+        ) {}
+
+        public static function success(string $summary, array $data = []): self
+        {
+            return new self('completed', true, $summary, $data);
+        }
+
+        public static function failure(string $summary, array $data = []): self
+        {
+            return new self('failed', false, $summary, $data);
+        }
+
+        public static function cancelled(string $summary, array $data = []): self
+        {
+            return new self('cancelled', false, $summary, $data);
+        }
+    }
 
     class PluginExecutionContext
     {
