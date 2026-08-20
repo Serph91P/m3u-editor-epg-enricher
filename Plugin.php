@@ -635,7 +635,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             if (empty($result->data)) {
-                $notices[] = $result->message;
+                $notices[] = $result->summary;
 
                 continue;
             }

@@ -40,21 +40,26 @@ namespace App\Plugins\Support {
 
     class PluginActionResult
     {
-        public function __construct(public string $status, public array $data = []) {}
+        public function __construct(
+            public readonly string $status,
+            public readonly bool $success,
+            public readonly string $summary,
+            public readonly array $data = [],
+        ) {}
 
-        public static function success(string $message, array $data = []): self
+        public static function success(string $summary, array $data = []): self
         {
-            return new self('success', $data);
+            return new self('completed', true, $summary, $data);
         }
 
-        public static function failure(string $message, array $data = []): self
+        public static function failure(string $summary, array $data = []): self
         {
-            return new self('failure', $data);
+            return new self('failed', false, $summary, $data);
         }
 
-        public static function cancelled(string $message, array $data = []): self
+        public static function cancelled(string $summary, array $data = []): self
         {
-            return new self('cancelled', $data);
+            return new self('cancelled', false, $summary, $data);
         }
     }
 
