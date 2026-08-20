@@ -25,16 +25,26 @@ namespace App\Plugins\Contracts {
 namespace App\Plugins\Support {
     class PluginActionResult
     {
-        public function __construct(public bool $success, public string $message, public array $data = []) {}
+        public function __construct(
+            public readonly string $status,
+            public readonly bool $success,
+            public readonly string $summary,
+            public readonly array $data = [],
+        ) {}
 
-        public static function success(string $message, array $data = []): self
+        public static function success(string $summary, array $data = []): self
         {
-            return new self(true, $message, $data);
+            return new self('completed', true, $summary, $data);
         }
 
-        public static function failure(string $message, array $data = []): self
+        public static function failure(string $summary, array $data = []): self
         {
-            return new self(false, $message, $data);
+            return new self('failed', false, $summary, $data);
+        }
+
+        public static function cancelled(string $summary, array $data = []): self
+        {
+            return new self('cancelled', false, $summary, $data);
         }
     }
 
@@ -454,7 +464,7 @@ namespace Tests {
     $manualContext = new PluginExecutionContext(new User(1));
     $notOwned = $plugin->runAction('enrich_epg', ['playlist_id' => 30], $manualContext);
     assertSameValue(false, $notOwned->success, 'Manual runs must reject playlists owned by another user.');
-    assertTrueValue(str_contains($notOwned->message, 'not owned or is not enrichable'), 'Manual ownership rejection must be clear.');
+    assertTrueValue(str_contains($notOwned->summary, 'not owned or is not enrichable'), 'Manual ownership rejection must be clear.');
     $notEnrichable = $plugin->runAction('enrich_epg', ['playlist_id' => 20], $manualContext);
     assertSameValue(false, $notEnrichable->success, 'Manual runs must reject playlists without eligible channels.');
 
@@ -507,9 +517,10 @@ namespace Tests {
         'playlist_ids' => [10, 10, 11, 12],
     ], $manualContext);
     assertSameValue(true, $playlistScopedResult->success, 'Playlist-scoped auto-run should complete cleanly.');
-    assertTrueValue(
-        str_contains($playlistScopedResult->message, "playlists 'First selected', 'Second selected'"),
-        'Auto-run summaries must name every selected playlist.',
+    assertSameValue(
+        "Enrichment finished for playlists 'First selected', 'Second selected': TMDB enrichment is disabled - nothing to do.",
+        $playlistScopedResult->summary,
+        'Auto-run must aggregate empty-data enrichment summaries for every selected playlist.',
     );
     assertSameValue([1, 2], Epg::$findIds, 'Auto-run must enrich every distinct EPG referenced by selected playlists, but no unselected playlist EPG.');
     assertSameValue(

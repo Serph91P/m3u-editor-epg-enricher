@@ -27,16 +27,26 @@ namespace App\Plugins\Support {
 
     class PluginActionResult
     {
-        public function __construct(public bool $success, public string $message, public array $data = []) {}
+        public function __construct(
+            public readonly string $status,
+            public readonly bool $success,
+            public readonly string $summary,
+            public readonly array $data = [],
+        ) {}
 
-        public static function success(string $message, array $data = []): self
+        public static function success(string $summary, array $data = []): self
         {
-            return new self(true, $message, $data);
+            return new self('completed', true, $summary, $data);
         }
 
-        public static function failure(string $message, array $data = []): self
+        public static function failure(string $summary, array $data = []): self
         {
-            return new self(false, $message, $data);
+            return new self('failed', false, $summary, $data);
+        }
+
+        public static function cancelled(string $summary, array $data = []): self
+        {
+            return new self('cancelled', false, $summary, $data);
         }
     }
 
@@ -279,11 +289,11 @@ namespace Tests {
         'playlist_ids' => [10],
     ], $context);
     assertTrueValue($hookResult->success, 'A competing hook run should skip successfully.');
-    assertTrueValue(str_contains(strtolower($hookResult->message), 'already in progress'), 'The hook busy result should clearly explain the skip.');
+    assertTrueValue(str_contains(strtolower($hookResult->summary), 'already in progress'), 'The hook busy result should clearly explain the skip.');
 
     $manualResult = $plugin->runAction('enrich_epg', ['playlist_id' => 10], $context);
     assertTrueValue($manualResult->success, 'A competing manual run should skip successfully.');
-    assertTrueValue(str_contains(strtolower($manualResult->message), 'already in progress'), 'The manual busy result should clearly explain the skip.');
+    assertTrueValue(str_contains(strtolower($manualResult->summary), 'already in progress'), 'The manual busy result should clearly explain the skip.');
 
     $differentEpgResult = $plugin->runHook('epg.cache.generated', [
         'epg_id' => 2,
