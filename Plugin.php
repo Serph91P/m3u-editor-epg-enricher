@@ -23,7 +23,7 @@ use ReflectionProperty;
 
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, PluginSelectOptionsProviderInterface
 {
-    private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 300;
+    private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 60;
 
     /**
      * Bumped whenever the enrichment output for the SAME inputs changes.
@@ -861,6 +861,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $fileStates = [];
         }
 
+        $checkpointState = $this->loadEnrichmentCheckpoint($stateKey);
+        if (($checkpointState['settings_hash'] ?? null) === $settingsHash
+            && ($checkpointState['channels_hash'] ?? null) === $channelsHash) {
+            $fileStates = array_merge($fileStates, $checkpointState['files'] ?? []);
+        } elseif ($checkpointState !== []) {
+            $this->deleteEnrichmentCheckpoint($stateKey);
+        }
+
         $cacheDir = $this->getActiveCacheDir($epg);
         if ($cacheDir === null) {
             return PluginActionResult::failure('Could not resolve EPG cache directory.');
@@ -898,12 +906,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $this->saveTmdbSeasonCache($tmdbSeasonCache);
                 $this->saveTmdbImagesCache($imagesCache);
                 // Merge new file states with existing ones before saving
-                $enrichmentState[$stateKey] = [
+                $this->saveEpgEnrichmentState($stateKey, [
                     'settings_hash' => $settingsHash,
                     'channels_hash' => $channelsHash,
                     'files' => array_merge($fileStates, $newFileStates),
-                ];
-                $this->saveEnrichmentState($enrichmentState);
+                ]);
+                $this->deleteEnrichmentCheckpoint($stateKey);
 
                 return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
             }
@@ -986,12 +994,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $this->saveTmdbCache($tmdbCache);
                 $this->saveTmdbSeasonCache($tmdbSeasonCache);
                 $this->saveTmdbImagesCache($imagesCache);
-                $enrichmentState[$stateKey] = [
+                $this->saveEpgEnrichmentState($stateKey, [
                     'settings_hash' => $settingsHash,
                     'channels_hash' => $channelsHash,
                     'files' => array_merge($fileStates, $newFileStates),
-                ];
-                $this->saveEnrichmentState($enrichmentState);
+                ]);
+                $this->deleteEnrichmentCheckpoint($stateKey);
 
                 return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
             }
@@ -1016,6 +1024,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'programmes_updated' => $result['updated'],
             ];
 
+            // Persist each completed day so a worker retry can resume instead of
+            // repeating the entire EPG source after a hard queue timeout.
+            $this->saveEnrichmentCheckpoint($stateKey, [
+                'settings_hash' => $settingsHash,
+                'channels_hash' => $channelsHash,
+                'files' => array_merge($fileStates, $newFileStates),
+            ]);
+
             $stats['days_processed']++;
             $currentDate->addDay();
         }
@@ -1026,12 +1042,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $this->saveTmdbImagesCache($imagesCache);
 
         // Persist enrichment state
-        $enrichmentState[$stateKey] = [
+        $this->saveEpgEnrichmentState($stateKey, [
             'settings_hash' => $settingsHash,
             'channels_hash' => $channelsHash,
             'files' => $newFileStates,
-        ];
-        $this->saveEnrichmentState($enrichmentState);
+        ]);
+        $this->deleteEnrichmentCheckpoint($stateKey);
 
         $skippedInfo = $stats['days_skipped'] > 0
             ? " ({$stats['days_skipped']} day(s) skipped - unchanged source data)"
@@ -1156,6 +1172,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     return $result;
                 }
 
+                $now = $clock();
+                if ($now - $lastHeartbeatAt >= self::DATE_FILE_HEARTBEAT_INTERVAL_SECONDS) {
+                    $fileProgress = $fileSize > 0 ? min(1, ftell($handle) / $fileSize) : 1;
+                    $progress = (int) ((($dayIndex - 1 + $fileProgress) / $totalDays) * 100);
+                    $context->heartbeat(
+                        "Processing {$date} ({$dayIndex}/{$totalDays}) - {$result['processed']} programmes processed",
+                        progress: $progress,
+                    );
+                    $lastHeartbeatAt = $now;
+                }
+
                 $line = trim($line);
                 if ($line === '') {
                     continue;
@@ -1214,17 +1241,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     'channel' => $record['channel'],
                     'programme' => $programme,
                 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-
-                $now = $clock();
-                if ($now - $lastHeartbeatAt >= self::DATE_FILE_HEARTBEAT_INTERVAL_SECONDS) {
-                    $fileProgress = $fileSize > 0 ? min(1, ftell($handle) / $fileSize) : 1;
-                    $progress = (int) ((($dayIndex - 1 + $fileProgress) / $totalDays) * 100);
-                    $context->heartbeat(
-                        "Processing {$date} ({$dayIndex}/{$totalDays}) - {$result['processed']} programmes processed",
-                        progress: $progress,
-                    );
-                    $lastHeartbeatAt = $now;
-                }
             }
             fclose($handle);
         }
@@ -3024,10 +3040,107 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     private function saveEnrichmentState(array $state): void
     {
         Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
-        Storage::disk('local')->put(
+        $persisted = Storage::disk('local')->put(
             'plugin-data/epg-enricher/enrichment-state.json',
             json_encode($state, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
         );
+        if (! $persisted) {
+            throw new \RuntimeException('Could not persist enrichment state.');
+        }
+    }
+
+    /**
+     * Merge one EPG source into the canonical state under a global write lock.
+     *
+     * @param  array<string, mixed>  $epgState
+     */
+    private function saveEpgEnrichmentState(string $stateKey, array $epgState): void
+    {
+        $disk = Storage::disk('local');
+        $directory = 'plugin-data/epg-enricher';
+        $disk->makeDirectory($directory);
+        $lock = fopen($disk->path("{$directory}/enrichment-state.lock"), 'c');
+        if ($lock === false) {
+            throw new \RuntimeException('Could not create enrichment state lock.');
+        }
+
+        $locked = false;
+        try {
+            $locked = flock($lock, LOCK_EX);
+            if (! $locked) {
+                throw new \RuntimeException('Could not lock enrichment state.');
+            }
+
+            $state = $this->loadEnrichmentState();
+            $state[$stateKey] = $epgState;
+            $this->saveEnrichmentState($state);
+        } finally {
+            if ($locked) {
+                flock($lock, LOCK_UN);
+            }
+            fclose($lock);
+        }
+    }
+
+    /**
+     * Load the last completed-day checkpoint for one EPG source.
+     *
+     * @return array<string, mixed>
+     */
+    private function loadEnrichmentCheckpoint(string $stateKey): array
+    {
+        $path = $this->enrichmentCheckpointPath($stateKey);
+        if (! Storage::disk('local')->exists($path)) {
+            return [];
+        }
+
+        $data = json_decode(Storage::disk('local')->get($path), true);
+
+        return is_array($data[$stateKey] ?? null) ? $data[$stateKey] : [];
+    }
+
+    /**
+     * Persist one EPG source independently so parallel sources cannot overwrite
+     * each other's in-progress checkpoints.
+     *
+     * @param  array<string, mixed>  $state
+     */
+    private function saveEnrichmentCheckpoint(string $stateKey, array $state): void
+    {
+        Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
+        $persisted = Storage::disk('local')->put(
+            $this->enrichmentCheckpointPath($stateKey),
+            json_encode([$stateKey => $state], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
+        );
+        if (! $persisted) {
+            throw new \RuntimeException('Could not persist enrichment checkpoint.');
+        }
+    }
+
+    private function deleteEnrichmentCheckpoint(string $stateKey): void
+    {
+        $path = Storage::disk('local')->path($this->enrichmentCheckpointPath($stateKey));
+        if (is_file($path)) {
+            @unlink($path);
+        }
+    }
+
+    private function deleteAllEnrichmentCheckpoints(): int
+    {
+        $pattern = Storage::disk('local')->path('plugin-data/epg-enricher/enrichment-checkpoint-epg_*.json');
+        $deleted = 0;
+        foreach (glob($pattern) ?: [] as $path) {
+            if (is_file($path) && @unlink($path)) {
+                $deleted++;
+            }
+        }
+
+        return $deleted;
+    }
+
+    private function enrichmentCheckpointPath(string $stateKey): string
+    {
+        return "plugin-data/epg-enricher/enrichment-checkpoint-{$stateKey}.json";
     }
 
     /**
@@ -3074,8 +3187,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     private function clearEnrichmentState(PluginExecutionContext $context): PluginActionResult
     {
         $path = 'plugin-data/epg-enricher/enrichment-state.json';
+        $checkpointsCleared = $this->deleteAllEnrichmentCheckpoints();
 
         if (! Storage::disk('local')->exists($path)) {
+            if ($checkpointsCleared > 0) {
+                return PluginActionResult::success(
+                    "Enrichment checkpoints cleared. Next run will re-process all files ({$checkpointsCleared} checkpoint(s)).",
+                    ['checkpoints_cleared' => $checkpointsCleared]
+                );
+            }
+
             return PluginActionResult::success('No enrichment state to clear.');
         }
 
@@ -3092,7 +3213,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         return PluginActionResult::success(
             "Enrichment state cleared. Next run will re-process all files ({$epgCount} EPG(s), {$fileCount} tracked file(s)).",
-            ['epgs_cleared' => $epgCount, 'files_cleared' => $fileCount]
+            ['epgs_cleared' => $epgCount, 'files_cleared' => $fileCount, 'checkpoints_cleared' => $checkpointsCleared]
         );
     }
 }
