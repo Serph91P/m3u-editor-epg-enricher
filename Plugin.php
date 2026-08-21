@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.20-v1.13.8';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.21-v1.13.8-icon-order';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -1336,6 +1336,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && ($hasDesc || ! $enrichDescriptions)
             && (! $enrichEpisodeDetails || ! $hasStrongSeriesSignals || $trustedEpisodeStillIcon)
             && ! $needsCategoryFix) {
+            if ($trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwrite)) {
+                $result['changed'] = true;
+            }
+
             return $result;
         }
 
@@ -1682,34 +1686,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $result['changed'] = true;
         }
 
-        // Phase A2/A3: finalize images[] (sort, dedupe, sync primary <icon>).
-        if (! empty($programme['images']) && is_array($programme['images'])) {
-            $imagesBeforeFinalization = $programme['images'];
-            $iconBeforeFinalization = $programme['icon'] ?? null;
-            $programme['images'] = $this->prioritizeImages($programme['images']);
-            $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
-            if ($trustedLandscapeIcon && ! $overwrite) {
-                $trustedUrl = (string) ($programme['icon'] ?? '');
-                foreach ($programme['images'] as $index => $image) {
-                    if (($image['url'] ?? null) !== $trustedUrl) {
-                        continue;
-                    }
-                    if ($index > 0) {
-                        array_unshift($programme['images'], array_splice($programme['images'], $index, 1)[0]);
-                    }
-                    break;
-                }
-            } else {
-                foreach ($programme['images'] as $image) {
-                    if ($this->isTrustedLandscapeImage($image)) {
-                        $programme['icon'] = $image['url'];
-                        break;
-                    }
-                }
-            }
-            if ($programme['images'] !== $imagesBeforeFinalization || ($programme['icon'] ?? null) !== $iconBeforeFinalization) {
-                $result['changed'] = true;
-            }
+        if ($this->finalizeImageSerialization($programme, $trustedLandscapeIcon, $overwrite)) {
+            $result['changed'] = true;
         }
 
         return $result;
@@ -2250,6 +2228,54 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $out[] = $img;
         }
         return array_values($out);
+    }
+
+    /**
+     * Keep a selected trusted landscape primary at both XMLTV image boundaries.
+     */
+    private function finalizeImageSerialization(array &$programme, bool $trustedLandscapeIcon, bool $overwrite): bool
+    {
+        if (empty($programme['images']) || ! is_array($programme['images'])) {
+            return false;
+        }
+
+        $imagesBeforeFinalization = $programme['images'];
+        $iconBeforeFinalization = $programme['icon'] ?? null;
+        $programme['images'] = $this->prioritizeImages($programme['images']);
+        $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
+
+        if ($trustedLandscapeIcon && ! $overwrite) {
+            $trustedUrl = (string) ($programme['icon'] ?? '');
+            foreach ($programme['images'] as $index => $image) {
+                if (($image['url'] ?? null) !== $trustedUrl) {
+                    continue;
+                }
+                if ($index > 0) {
+                    array_unshift($programme['images'], array_splice($programme['images'], $index, 1)[0]);
+                }
+                break;
+            }
+        } else {
+            foreach ($programme['images'] as $image) {
+                if ($this->isTrustedLandscapeImage($image)) {
+                    $programme['icon'] = $image['url'];
+                    break;
+                }
+            }
+        }
+
+        $primaryUrl = trim((string) ($programme['icon'] ?? ''));
+        if ($primaryUrl !== '') {
+            foreach ($programme['images'] as $image) {
+                if (($image['url'] ?? null) === $primaryUrl && $this->isTrustedLandscapeImage($image)) {
+                    $programme['images'][] = $image;
+                    break;
+                }
+            }
+        }
+
+        return $programme['images'] !== $imagesBeforeFinalization
+            || ($programme['icon'] ?? null) !== $iconBeforeFinalization;
     }
 
     /**

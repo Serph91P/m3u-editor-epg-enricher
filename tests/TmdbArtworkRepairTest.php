@@ -482,12 +482,15 @@ namespace Tests {
             'https://fixture.invalid/movie-poster.jpg',
             'https://provider.invalid/unknown.jpg',
             'https://provider.invalid/logo.png',
+            'https://fixture.invalid/movie-backdrop.jpg',
         ],
         array_column($longWalk['images'], 'url'),
-        'Landscape, poster, unknown and logo ordering should be stable and duplicate-free.'
+        'A movie primary should bracket secondary artwork for first- and last-icon consumers.'
     );
     assertSameValue('backdrop', $longWalk['images'][0]['type'], 'Primary image should be a landscape backdrop.');
     assertSameValue('tmdb', $longWalk['images'][0]['source'] ?? null, 'TMDB provenance should win deduplication over an unprovenanced record with the same URL and role.');
+    assertSameValue($longWalk['icon'], $longWalk['images'][array_key_last($longWalk['images'])]['url'], 'The terminal movie image should duplicate the selected primary URL.');
+    assertSameValue('backdrop', $longWalk['images'][array_key_last($longWalk['images'])]['type'], 'The terminal movie primary duplicate should retain its image type.');
     assertTrueValue(in_array('https://fixture.invalid/movie-poster.jpg', array_column($longWalk['images'], 'url'), true), 'Portrait poster should remain in images.');
     assertTrueValue($longWalkResult['changed'], 'Artwork repair should report a changed programme.');
 
@@ -635,6 +638,9 @@ namespace Tests {
     enrich($plugin, $method, $bares, $baresTmdb, $baresCache);
     assertSameValue('https://fixture.invalid/bares-backdrop.jpg', $bares['icon'], 'Episodic signals should force the TV landscape backdrop.');
     assertTrueValue(in_array('https://fixture.invalid/bares-poster.jpg', array_column($bares['images'], 'url'), true), 'TV portrait poster should remain in images.');
+    assertSameValue($bares['icon'], $bares['images'][0]['url'], 'The selected series landscape should remain the first image.');
+    assertSameValue($bares['icon'], $bares['images'][array_key_last($bares['images'])]['url'], 'The selected series landscape should also be the final image.');
+    assertSameValue('backdrop', $bares['images'][array_key_last($bares['images'])]['type'], 'The terminal series primary duplicate should retain its image type.');
     assertSameValue(1, $baresTmdb->tvSearches, 'The exact Unicode title should resolve through the TV artwork path.');
     assertSameValue(0, $baresTmdb->movieSearches, 'Strong episodic evidence should not search movies.');
 
@@ -705,11 +711,13 @@ namespace Tests {
         'An exact episode still should be the programme icon even when a series backdrop exists.'
     );
     assertSameValue(
-        ['screenshot', 'backdrop', 'poster'],
+        ['screenshot', 'backdrop', 'poster', 'screenshot'],
         array_column($episodeStill['images'] ?? [], 'type'),
-        'Episode still, series backdrop, and poster roles should remain distinct and ordered.'
+        'The exact episode still should bracket series backdrop and poster alternatives.'
     );
     assertSameValue('tmdb', $episodeStill['images'][0]['source'] ?? null, 'Validated episode-still provenance should win URL deduplication.');
+    assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal episode image should duplicate the exact still primary.');
+    assertSameValue('screenshot', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal episode primary duplicate should retain its screenshot type.');
 
     $nextEpisodeStill = [
         'title' => 'Ghosts - Es bleibt in der Familie',
@@ -821,9 +829,12 @@ namespace Tests {
     $scopedProviderCache = [];
     $scopedProviderTmdb = new TmdbService('none');
     $scopedProviderResult = enrich($plugin, $method, $scopedProvider, $scopedProviderTmdb, $scopedProviderCache);
-    assertSameValue($scopedProviderBefore, $scopedProvider, 'Explicitly programme-scoped source artwork should be preserved.');
+    assertSameValue($scopedProviderBefore['icon'], $scopedProvider['icon'], 'Explicitly programme-scoped source artwork should remain the primary icon.');
+    assertSameValue($scopedProvider['icon'], $scopedProvider['images'][0]['url'], 'Explicitly programme-scoped artwork should remain the first image.');
+    assertSameValue($scopedProvider['icon'], $scopedProvider['images'][array_key_last($scopedProvider['images'])]['url'], 'Explicitly programme-scoped artwork should also be the final image.');
+    assertSameValue('fanart', $scopedProvider['images'][array_key_last($scopedProvider['images'])]['type'], 'The source primary duplicate should retain its image type.');
     assertSameValue(0, $scopedProviderTmdb->tvSearches + $scopedProviderTmdb->movieSearches, 'Explicit programme provenance should retain the complete-metadata no-op.');
-    assertSameValue(false, $scopedProviderResult['changed'], 'Trusted source artwork should not report a change.');
+    assertSameValue(true, $scopedProviderResult['changed'], 'Trusted source artwork should report its serialization repair.');
 
     $ambiguous = [
         'title' => 'Crossroads',
@@ -969,5 +980,46 @@ namespace Tests {
     );
     assertSameValue(5, count(Http::$calls), 'Each distinct image cache identity should fetch exactly once after the transient failure.');
 
+    $finalizeImageSerialization = $reflection->getMethod('finalizeImageSerialization');
+    $finalizeImageSerialization->setAccessible(true);
+    $benchmarkParity = ['denominator' => 0, 'numerator' => 0];
+    foreach (range(1, 101) as $index) {
+        $primaryType = ['backdrop', 'fanart', 'screenshot'][($index - 1) % 3];
+        $primaryUrl = "https://fixture.invalid/issue47-primary-{$index}.jpg";
+        $primary = [
+            'url' => $primaryUrl,
+            'type' => $primaryType,
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'source' => 'tmdb',
+            'scope' => $primaryType === 'screenshot' ? 'episode' : 'programme',
+        ];
+        $benchmarkProgramme = [
+            'icon' => $primaryUrl,
+            'images' => [
+                $primary,
+                ['url' => "https://fixture.invalid/issue47-poster-{$index}.jpg", 'type' => 'poster', 'orient' => 'P', 'width' => 500, 'height' => 750],
+                ['url' => "https://fixture.invalid/issue47-logo-{$index}.png", 'type' => 'logo', 'orient' => 'L', 'width' => 500, 'height' => 200],
+            ],
+        ];
+        $finalizeImageSerialization->invokeArgs($plugin, [&$benchmarkProgramme, true, false]);
+        assertSameValue($primaryUrl, $benchmarkProgramme['images'][0]['url'], 'Every Issue 47 synthetic primary should remain first.');
+        assertSameValue($primaryUrl, $benchmarkProgramme['images'][array_key_last($benchmarkProgramme['images'])]['url'], 'Every Issue 47 synthetic primary should be duplicated last.');
+        assertSameValue($primaryType, $benchmarkProgramme['images'][array_key_last($benchmarkProgramme['images'])]['type'], 'Every terminal Issue 47 primary duplicate should retain its type.');
+        $benchmarkParity['denominator']++;
+        if ($benchmarkProgramme['images'][0]['url'] === $benchmarkProgramme['images'][array_key_last($benchmarkProgramme['images'])]['url']) {
+            $benchmarkParity['numerator']++;
+        }
+
+        $serializedBenchmarkProgramme = json_encode($benchmarkProgramme, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $finalizeImageSerialization->invokeArgs($plugin, [&$benchmarkProgramme, true, false]);
+        assertSameValue($serializedBenchmarkProgramme, json_encode($benchmarkProgramme, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Issue 47 serialization should be deterministic on repeat runs.');
+    }
+
     echo "TMDB artwork repair tests passed.\n";
+    echo json_encode([
+        'first_last_boundary_parity' => $benchmarkParity,
+        'fixture_egress' => count(Http::$calls),
+    ], JSON_THROW_ON_ERROR)."\n";
 }
