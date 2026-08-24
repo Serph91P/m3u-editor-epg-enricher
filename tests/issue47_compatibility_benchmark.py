@@ -43,6 +43,7 @@ def main() -> None:
     try:
         fixture_measurement = json.loads(runs[0].splitlines()[-1])
         current_parity = fixture_measurement["first_last_boundary_parity"]
+        quality_evidence = fixture_measurement["artwork_quality_evidence"]
         fixture_egress = fixture_measurement["fixture_egress"]
     except (IndexError, json.JSONDecodeError, KeyError, TypeError) as error:
         raise SystemExit("Issue 47 synthetic benchmark did not emit fixture measurements.") from error
@@ -53,13 +54,22 @@ def main() -> None:
         raise SystemExit("Issue 47 synthetic benchmark emitted an invalid parity measurement.")
     if not isinstance(fixture_egress, int):
         raise SystemExit("Issue 47 synthetic benchmark emitted an invalid fixture egress measurement.")
+    if quality_evidence != {
+        "rejected_zero_vote_title_cards": 1,
+        "selected_scene_controls": 1,
+    }:
+        raise SystemExit("Issue 47 artwork-quality evidence changed unexpectedly.")
 
     print(json.dumps({
         "baseline_first_last_boundary_parity": baseline_parity,
         "current_first_last_boundary_parity": current_parity,
         "deterministic_repeat_output": True,
         "wrong_identity_regressions": {"status": "unobservable"},
-        "unsafe_primary_regressions": {"status": "unobservable"},
+        "unsafe_primary_regressions": {
+            "status": "no_unsuitable_primary_promoted",
+            "rejected_zero_vote_title_cards": quality_evidence["rejected_zero_vote_title_cards"],
+            "selected_scene_controls": quality_evidence["selected_scene_controls"],
+        },
         "fixture_egress": fixture_egress,
     }, sort_keys=True))
 

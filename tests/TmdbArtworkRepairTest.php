@@ -294,6 +294,12 @@ namespace App\Services {
                     'original_title' => 'Poster Only',
                     'release_date' => '2026-01-01',
                 ],
+                'backdrop-quality' => [
+                    'tmdb_id' => 210,
+                    'title' => 'Backdrop Quality',
+                    'original_title' => 'Backdrop Quality',
+                    'release_date' => '2026-01-01',
+                ],
                 default => null,
             };
         }
@@ -348,6 +354,10 @@ namespace App\Services {
                 'poster-only' => [
                     'overview' => 'A programme without landscape artwork.',
                     'poster_url' => 'https://fixture.invalid/poster-only.jpg',
+                ],
+                'backdrop-quality' => [
+                    'overview' => 'A programme used to verify backdrop quality selection.',
+                    'backdrop_url' => 'https://fixture.invalid/details-backdrop.jpg',
                 ],
                 default => null,
             };
@@ -896,6 +906,90 @@ namespace Tests {
 
     $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
     $GLOBALS['tmdbTestSettings']->tmdb_language = 'de-DE';
+    $titleCard = [
+        'title' => 'Backdrop Quality',
+        'desc' => 'A 2026 programme used to verify backdrop quality selection.',
+        'category' => 'Movie',
+    ];
+    $titleCardCache = [];
+    $titleCardImagesCache = [];
+    Http::$responses[] = new FakeHttpResponse(true, [
+        'posters' => [],
+        'backdrops' => [[
+            'file_path' => '/german-16x9-zero-vote-title-card.jpg',
+            'iso_639_1' => 'de',
+            'vote_count' => 0,
+            'vote_average' => 0.0,
+            'aspect_ratio' => 1.778,
+        ]],
+        'logos' => [],
+    ]);
+    enrich(
+        $plugin,
+        $method,
+        $titleCard,
+        new TmdbService('backdrop-quality'),
+        $titleCardCache,
+        [],
+        $titleCardSeasonCache,
+        $titleCardImagesCache,
+    );
+    assertSameValue(null, $titleCard['icon'] ?? null, 'A zero-vote German 16:9 title card must not become primary artwork.');
+    assertSameValue([
+        'source' => 'tmdb',
+        'asset_type' => 'backdrop',
+        'reason' => 'no_backdrop_with_vote_evidence',
+    ], $titleCard['artwork_rejection'] ?? null, 'A rejected primary must retain safe TMDB provenance and reason metadata.');
+    assertSameValue([], array_values(array_filter(
+        $titleCard['images'] ?? [],
+        fn (array $image): bool => ($image['type'] ?? null) === 'backdrop'
+    )), 'Rejected title-card metadata must not be serialized as a programme backdrop.');
+
+    $sceneControl = [
+        'title' => 'Backdrop Quality',
+        'desc' => 'A 2026 programme used to verify backdrop quality selection.',
+        'category' => 'Movie',
+    ];
+    $sceneControlCache = [];
+    $sceneControlImagesCache = [];
+    Http::$responses[] = new FakeHttpResponse(true, [
+        'posters' => [],
+        'backdrops' => [
+            [
+                'file_path' => '/german-16x9-zero-vote-title-card.jpg',
+                'iso_639_1' => 'de',
+                'vote_count' => 0,
+                'vote_average' => 0.0,
+                'aspect_ratio' => 1.778,
+            ],
+            [
+                'file_path' => '/scene-key-art-control.jpg',
+                'iso_639_1' => null,
+                'vote_count' => 4,
+                'vote_average' => 7.0,
+                'aspect_ratio' => 1.778,
+            ],
+        ],
+        'logos' => [],
+    ]);
+    enrich(
+        $plugin,
+        $method,
+        $sceneControl,
+        new TmdbService('backdrop-quality'),
+        $sceneControlCache,
+        [],
+        $sceneControlSeasonCache,
+        $sceneControlImagesCache,
+    );
+    assertSameValue('https://image.tmdb.org/t/p/w1280/scene-key-art-control.jpg', $sceneControl['icon'] ?? null, 'Suitable scene metadata must beat the zero-vote title-card backdrop.');
+    assertSameValue('tmdb_vote_evidence', $sceneControl['images'][0]['artwork_quality'] ?? null, 'Selected scene artwork must retain its TMDB metadata provenance.');
+    assertSameValue(false, isset($sceneControl['artwork_rejection']), 'A suitable scene candidate must clear the rejection state.');
+    $artworkQualityEvidence = [
+        'rejected_zero_vote_title_cards' => 1,
+        'selected_scene_controls' => 1,
+    ];
+
     Http::$responses[] = new FakeHttpResponse(true, [
         'posters' => [
             ['file_path' => '/default-poster.jpg', 'iso_639_1' => 'en', 'vote_average' => 9.0, 'aspect_ratio' => 0.667],
@@ -995,6 +1089,9 @@ namespace Tests {
             'source' => 'tmdb',
             'scope' => $primaryType === 'screenshot' ? 'episode' : 'programme',
         ];
+        if ($primaryType === 'backdrop') {
+            $primary['artwork_quality'] = 'tmdb_vote_evidence';
+        }
         $benchmarkProgramme = [
             'icon' => $primaryUrl,
             'images' => [
@@ -1020,6 +1117,7 @@ namespace Tests {
     echo "TMDB artwork repair tests passed.\n";
     echo json_encode([
         'first_last_boundary_parity' => $benchmarkParity,
+        'artwork_quality_evidence' => $artworkQualityEvidence,
         'fixture_egress' => count(Http::$calls),
     ], JSON_THROW_ON_ERROR)."\n";
 }

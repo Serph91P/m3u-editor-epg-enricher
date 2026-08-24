@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.21-v1.13.8-icon-order';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.24-v1.13.8-backdrop-quality';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -1485,52 +1485,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Enrich poster/icon
         $posterUrl = $tmdbData['poster_url'] ?? null;
-        $backdropUrl = $tmdbData['backdrop_url'] ?? null;
+        $backdropUrl = null;
         $mediaType = $tmdbData['_media_type'] ?? null;
-
-        // Primary <icon> in XMLTV: prefer landscape (backdrop) over portrait (poster).
-        // Reason: emby/jellyfin/plex/tvheadend xmltv importers read only the FIRST <icon>
-        // and ignore non-standard type/orient/size attributes. Their EPG grid cells are
-        // landscape, so a portrait poster as primary icon gets cropped/stretched.
-        // For tv episodes we'll override with the episode still further below if available.
-        $primaryIconUrl = null;
-        if ($enrichBackdrops && $backdropUrl) {
-            $primaryIconUrl = $backdropUrl;
-        }
-
-        if ($primaryIconUrl !== null
-            && ($overwrite || ! $trustedLandscapeIcon)
-            && ($programme['icon'] ?? null) !== $primaryIconUrl) {
-            $programme['icon'] = $primaryIconUrl;
-            $result['poster'] = true;
-            $result['changed'] = true;
-        }
-
-        // Add backdrop to images array (size=1: primary landscape for EPG grid)
-        if ($enrichBackdrops && $backdropUrl) {
-            $hasTmdbBackdrop = false;
-            foreach (($programme['images'] ?? []) as $image) {
-                if (($image['url'] ?? null) === $backdropUrl
-                    && ($image['type'] ?? null) === 'backdrop'
-                    && ($image['source'] ?? null) === 'tmdb') {
-                    $hasTmdbBackdrop = true;
-                    break;
-                }
-            }
-            if (! $hasTmdbBackdrop) {
-                $programme['images'][] = [
-                    'url' => $backdropUrl,
-                    'type' => 'backdrop',
-                    'width' => 1920,
-                    'height' => 1080,
-                    'orient' => 'L',
-                    'size' => 1,
-                    'source' => 'tmdb',
-                    'scope' => 'programme',
-                ];
-                $result['changed'] = true;
-            }
-        }
 
         // Add poster to images array (size=2: portrait for info/details views)
         if ($enrichPosters && $posterUrl) {
@@ -1558,13 +1514,76 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
+        $hasBackdropMetadata = false;
+        $backdropRejected = false;
+
         // Erweiterte images-pipeline: hole zusätzliche varianten + logo
         if (($enrichPosters || $enrichBackdrops) && ! empty($tmdbData['tmdb_id']) && ! empty($mediaType)) {
             $creds = $this->getTmdbCredentials();
             if ($creds !== null) {
                 $imageSet = $this->fetchTmdbImages((int) $tmdbData['tmdb_id'], $mediaType, $imagesCache);
                 if ($imageSet !== null) {
+                    $hasBackdropMetadata = ! empty(array_filter(
+                        $imageSet['backdrops'] ?? [],
+                        fn (array $image): bool => ! empty($image['file_path'])
+                    ));
                     $candidates = $this->selectImageSet($imageSet, $creds['language']);
+                    $selectedBackdrop = null;
+                    foreach ($candidates as $candidate) {
+                        if (($candidate['type'] ?? null) === 'backdrop') {
+                            $selectedBackdrop = $candidate;
+                            break;
+                        }
+                    }
+
+                    if ($enrichBackdrops && $hasBackdropMetadata) {
+                        // The images response is the only bounded quality evidence. Do not
+                        // promote a details backdrop when every returned candidate is weak.
+                        $selectedBackdropUrls = array_column(array_filter(
+                            $candidates,
+                            fn (array $candidate): bool => ($candidate['type'] ?? null) === 'backdrop'
+                        ), 'url');
+                        $staleBackdropUrls = [];
+                        $programme['images'] = array_values(array_filter(
+                            $programme['images'] ?? [],
+                            function (array $image) use ($selectedBackdropUrls, &$staleBackdropUrls): bool {
+                                $isStaleTmdbBackdrop = ($image['type'] ?? null) === 'backdrop'
+                                    && ($image['source'] ?? null) === 'tmdb'
+                                    && ! in_array($image['url'] ?? null, $selectedBackdropUrls, true);
+                                if ($isStaleTmdbBackdrop && isset($image['url'])) {
+                                    $staleBackdropUrls[] = $image['url'];
+                                }
+
+                                return ! $isStaleTmdbBackdrop;
+                            }
+                        ));
+                        if ($staleBackdropUrls !== []) {
+                            $result['changed'] = true;
+                        }
+
+                        if ($selectedBackdrop === null) {
+                            $backdropRejected = true;
+                            if (in_array($programme['icon'] ?? null, $staleBackdropUrls, true)) {
+                                unset($programme['icon']);
+                                $result['changed'] = true;
+                            }
+                            $rejection = [
+                                'source' => 'tmdb',
+                                'asset_type' => 'backdrop',
+                                'reason' => 'no_backdrop_with_vote_evidence',
+                            ];
+                            if (($programme['artwork_rejection'] ?? null) !== $rejection) {
+                                $programme['artwork_rejection'] = $rejection;
+                                $result['changed'] = true;
+                            }
+                        } else {
+                            $backdropUrl = $selectedBackdrop['url'];
+                            if (isset($programme['artwork_rejection'])) {
+                                unset($programme['artwork_rejection']);
+                                $result['changed'] = true;
+                            }
+                        }
+                    }
                     foreach ($candidates as $img) {
                         if ($img['type'] === 'poster' && ! $enrichPosters) {
                             continue;
@@ -1581,6 +1600,49 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         $result['changed'] = true;
                     }
                 }
+            }
+        }
+
+        // Preserve the established details fallback only when the images response has no
+        // backdrop candidates. A nonempty response without vote evidence is an abstention.
+        if ($enrichBackdrops && ! $hasBackdropMetadata && ! $backdropRejected) {
+            $backdropUrl = $tmdbData['backdrop_url'] ?? null;
+        }
+
+        // Primary <icon> in XMLTV: prefer a quality-qualified landscape backdrop over a
+        // portrait poster. Exact episode stills below retain their higher priority.
+        if ($enrichBackdrops && $backdropUrl
+            && ($overwrite || ! $trustedLandscapeIcon)
+            && ($programme['icon'] ?? null) !== $backdropUrl) {
+            $programme['icon'] = $backdropUrl;
+            $result['poster'] = true;
+            $result['changed'] = true;
+        }
+
+        // Add a details fallback backdrop only when no images metadata was available.
+        if ($enrichBackdrops && $backdropUrl) {
+            $hasTmdbBackdrop = false;
+            foreach (($programme['images'] ?? []) as $image) {
+                if (($image['url'] ?? null) === $backdropUrl
+                    && ($image['type'] ?? null) === 'backdrop'
+                    && ($image['source'] ?? null) === 'tmdb') {
+                    $hasTmdbBackdrop = true;
+                    break;
+                }
+            }
+            if (! $hasTmdbBackdrop) {
+                $programme['images'][] = [
+                    'url' => $backdropUrl,
+                    'type' => 'backdrop',
+                    'width' => 1920,
+                    'height' => 1080,
+                    'orient' => 'L',
+                    'size' => 1,
+                    'source' => 'tmdb',
+                    'scope' => 'programme',
+                    'artwork_quality' => 'details_fallback',
+                ];
+                $result['changed'] = true;
             }
         }
 
@@ -2017,7 +2079,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         };
 
         // Backdrops zuerst (landscape primary, size=1), sprach-neutral bevorzugt
-        $backdrops = $images['backdrops'] ?? [];
+        $backdrops = array_values(array_filter(
+            $images['backdrops'] ?? [],
+            fn (array $backdrop): bool => $this->hasBackdropVoteEvidence($backdrop)
+        ));
         $langPrioBack = [null, $shortLang, 'en'];
         usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
         foreach (array_slice($backdrops, 0, 2) as $b) {
@@ -2035,6 +2100,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'scope' => 'programme',
                 'language' => $b['iso_639_1'] ?? null,
                 'language_rank' => $rank($b, $langPrioBack),
+                'artwork_quality' => 'tmdb_vote_evidence',
             ];
         }
 
@@ -2085,6 +2151,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $out;
     }
 
+    /**
+     * TMDB does not expose image-content semantics. Positive public vote metadata is the
+     * minimum bounded evidence required before a backdrop can become programme primary.
+     */
+    private function hasBackdropVoteEvidence(array $backdrop): bool
+    {
+        return is_numeric($backdrop['vote_count'] ?? null)
+            && (int) $backdrop['vote_count'] > 0
+            && is_numeric($backdrop['vote_average'] ?? null)
+            && (float) $backdrop['vote_average'] > 0;
+    }
+
     private function hasTrustedLandscapeIcon(array $programme): bool
     {
         $icon = trim((string) ($programme['icon'] ?? ''));
@@ -2131,6 +2209,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || $orient !== 'L'
             || ! in_array($type, ['backdrop', 'fanart', 'screenshot'], true)
             || ($source !== 'tmdb' && ! in_array($scope, ['programme', 'movie', 'series', 'episode'], true))) {
+            return false;
+        }
+
+        // Legacy TMDB backdrops predate the bounded quality decision and must be
+        // re-evaluated instead of preventing the new logic from running.
+        if ($source === 'tmdb' && $type === 'backdrop'
+            && ! in_array($image['artwork_quality'] ?? null, ['tmdb_vote_evidence', 'details_fallback'], true)) {
             return false;
         }
 
