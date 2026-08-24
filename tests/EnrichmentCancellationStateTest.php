@@ -331,6 +331,21 @@ namespace Tests {
     $dateFile = $cacheDir.'/programmes-2026-07-11.jsonl';
     file_put_contents($dateFile, $source);
 
+    $legacySettingsHash = md5(json_encode([
+        'logic_version' => '2026.08.20-v1.13.8',
+        'enrich_from_tmdb' => true,
+        'overwrite_existing' => false,
+        'enrich_categories' => true,
+        'enrich_descriptions' => false,
+        'enrich_posters' => false,
+        'enrich_backdrops' => false,
+        'map_genres_to_epg_categories' => true,
+        'map_genres_to_kodi_guide_genres' => false,
+        'keyword_category_detection' => true,
+        'enrich_episode_details' => false,
+        'tmdb_language' => '',
+    ]));
+
     $priorState = [
         'source_hash' => 'prior-source',
         'enriched_hash' => 'prior-enriched',
@@ -339,13 +354,31 @@ namespace Tests {
     ];
     file_put_contents($stateDir.'/enrichment-state.json', json_encode([
         'epg_1' => [
-            'files' => ['programmes-2026-07-10.jsonl' => $priorState],
+            'settings_hash' => $legacySettingsHash,
+            'channels_hash' => md5(json_encode(['target'])),
+            'files' => [
+                'programmes-2026-07-10.jsonl' => $priorState,
+                'programmes-2026-07-11.jsonl' => [
+                    'source_hash' => md5_file($dateFile),
+                    'enriched_hash' => md5_file($dateFile),
+                    'enriched_at' => '2026-07-10T12:00:00+00:00',
+                    'programmes_updated' => 0,
+                ],
+            ],
         ],
     ]));
 
     $plugin = new Plugin();
     $method = new ReflectionMethod($plugin, 'doEnrich');
     $method->setAccessible(true);
+
+    $settingsHashMethod = new ReflectionMethod($plugin, 'computeSettingsHash');
+    $settingsHashMethod->setAccessible(true);
+    assertSameValue(
+        true,
+        $legacySettingsHash !== $settingsHashMethod->invoke($plugin, (new PluginExecutionContext())->settings),
+        'A changed enrichment logic version must invalidate a previously processed state hash.'
+    );
 
     $cancelContext = new PluginExecutionContext();
     $cancelContext->cancelAfterChecks = 3;
@@ -359,9 +392,9 @@ namespace Tests {
         'A cancelled date file must not be recorded as complete.'
     );
     assertSameValue(
-        $priorState,
-        $stateAfterCancellation['epg_1']['files']['programmes-2026-07-10.jsonl'] ?? null,
-        'Cancellation should preserve prior successfully completed file states.'
+        false,
+        isset($stateAfterCancellation['epg_1']['files']['programmes-2026-07-10.jsonl']),
+        'A changed logic version should invalidate all previously completed file states.'
     );
     assertSameValue('cancelled', $cancelResult->status, 'Cancellation inside a date file should propagate to doEnrich.');
     assertSameValue(1, $cancelResult->data['programmes_updated'] ?? null, 'The fixture should modify a programme in memory before cancellation.');
