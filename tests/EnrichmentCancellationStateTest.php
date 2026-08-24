@@ -332,7 +332,7 @@ namespace Tests {
     file_put_contents($dateFile, $source);
 
     $legacySettingsHash = md5(json_encode([
-        'logic_version' => '2026.08.20-v1.13.8',
+        'logic_version' => '2026.08.21-v1.13.8-icon-order',
         'enrich_from_tmdb' => true,
         'overwrite_existing' => false,
         'enrich_categories' => true,
@@ -377,7 +377,7 @@ namespace Tests {
     assertSameValue(
         true,
         $legacySettingsHash !== $settingsHashMethod->invoke($plugin, (new PluginExecutionContext())->settings),
-        'A changed enrichment logic version must invalidate a previously processed state hash.'
+        'The title-card quality logic version must invalidate a previously processed state hash.'
     );
 
     $cancelContext = new PluginExecutionContext();
