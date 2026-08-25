@@ -23,7 +23,7 @@ use ReflectionProperty;
 
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, PluginSelectOptionsProviderInterface
 {
-    private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 300;
+    private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 60;
 
     /**
      * Bumped whenever the enrichment output for the SAME inputs changes.
@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.20-v1.13.8';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.24-v1.13.8-backdrop-quality';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -861,6 +861,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $fileStates = [];
         }
 
+        $checkpointState = $this->loadEnrichmentCheckpoint($stateKey);
+        if (($checkpointState['settings_hash'] ?? null) === $settingsHash
+            && ($checkpointState['channels_hash'] ?? null) === $channelsHash) {
+            $fileStates = array_merge($fileStates, $checkpointState['files'] ?? []);
+        } elseif ($checkpointState !== []) {
+            $this->deleteEnrichmentCheckpoint($stateKey);
+        }
+
         $cacheDir = $this->getActiveCacheDir($epg);
         if ($cacheDir === null) {
             return PluginActionResult::failure('Could not resolve EPG cache directory.');
@@ -898,12 +906,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $this->saveTmdbSeasonCache($tmdbSeasonCache);
                 $this->saveTmdbImagesCache($imagesCache);
                 // Merge new file states with existing ones before saving
-                $enrichmentState[$stateKey] = [
+                $this->saveEpgEnrichmentState($stateKey, [
                     'settings_hash' => $settingsHash,
                     'channels_hash' => $channelsHash,
                     'files' => array_merge($fileStates, $newFileStates),
-                ];
-                $this->saveEnrichmentState($enrichmentState);
+                ]);
+                $this->deleteEnrichmentCheckpoint($stateKey);
 
                 return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
             }
@@ -986,12 +994,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $this->saveTmdbCache($tmdbCache);
                 $this->saveTmdbSeasonCache($tmdbSeasonCache);
                 $this->saveTmdbImagesCache($imagesCache);
-                $enrichmentState[$stateKey] = [
+                $this->saveEpgEnrichmentState($stateKey, [
                     'settings_hash' => $settingsHash,
                     'channels_hash' => $channelsHash,
                     'files' => array_merge($fileStates, $newFileStates),
-                ];
-                $this->saveEnrichmentState($enrichmentState);
+                ]);
+                $this->deleteEnrichmentCheckpoint($stateKey);
 
                 return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
             }
@@ -1016,6 +1024,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'programmes_updated' => $result['updated'],
             ];
 
+            // Persist each completed day so a worker retry can resume instead of
+            // repeating the entire EPG source after a hard queue timeout.
+            $this->saveEnrichmentCheckpoint($stateKey, [
+                'settings_hash' => $settingsHash,
+                'channels_hash' => $channelsHash,
+                'files' => array_merge($fileStates, $newFileStates),
+            ]);
+
             $stats['days_processed']++;
             $currentDate->addDay();
         }
@@ -1026,12 +1042,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $this->saveTmdbImagesCache($imagesCache);
 
         // Persist enrichment state
-        $enrichmentState[$stateKey] = [
+        $this->saveEpgEnrichmentState($stateKey, [
             'settings_hash' => $settingsHash,
             'channels_hash' => $channelsHash,
             'files' => $newFileStates,
-        ];
-        $this->saveEnrichmentState($enrichmentState);
+        ]);
+        $this->deleteEnrichmentCheckpoint($stateKey);
 
         $skippedInfo = $stats['days_skipped'] > 0
             ? " ({$stats['days_skipped']} day(s) skipped - unchanged source data)"
@@ -1156,6 +1172,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     return $result;
                 }
 
+                $now = $clock();
+                if ($now - $lastHeartbeatAt >= self::DATE_FILE_HEARTBEAT_INTERVAL_SECONDS) {
+                    $fileProgress = $fileSize > 0 ? min(1, ftell($handle) / $fileSize) : 1;
+                    $progress = (int) ((($dayIndex - 1 + $fileProgress) / $totalDays) * 100);
+                    $context->heartbeat(
+                        "Processing {$date} ({$dayIndex}/{$totalDays}) - {$result['processed']} programmes processed",
+                        progress: $progress,
+                    );
+                    $lastHeartbeatAt = $now;
+                }
+
                 $line = trim($line);
                 if ($line === '') {
                     continue;
@@ -1214,17 +1241,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     'channel' => $record['channel'],
                     'programme' => $programme,
                 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-
-                $now = $clock();
-                if ($now - $lastHeartbeatAt >= self::DATE_FILE_HEARTBEAT_INTERVAL_SECONDS) {
-                    $fileProgress = $fileSize > 0 ? min(1, ftell($handle) / $fileSize) : 1;
-                    $progress = (int) ((($dayIndex - 1 + $fileProgress) / $totalDays) * 100);
-                    $context->heartbeat(
-                        "Processing {$date} ({$dayIndex}/{$totalDays}) - {$result['processed']} programmes processed",
-                        progress: $progress,
-                    );
-                    $lastHeartbeatAt = $now;
-                }
             }
             fclose($handle);
         }
@@ -1320,6 +1336,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && ($hasDesc || ! $enrichDescriptions)
             && (! $enrichEpisodeDetails || ! $hasStrongSeriesSignals || $trustedEpisodeStillIcon)
             && ! $needsCategoryFix) {
+            if ($trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwrite)) {
+                $result['changed'] = true;
+            }
+
             return $result;
         }
 
@@ -1465,52 +1485,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Enrich poster/icon
         $posterUrl = $tmdbData['poster_url'] ?? null;
-        $backdropUrl = $tmdbData['backdrop_url'] ?? null;
+        $backdropUrl = null;
         $mediaType = $tmdbData['_media_type'] ?? null;
-
-        // Primary <icon> in XMLTV: prefer landscape (backdrop) over portrait (poster).
-        // Reason: emby/jellyfin/plex/tvheadend xmltv importers read only the FIRST <icon>
-        // and ignore non-standard type/orient/size attributes. Their EPG grid cells are
-        // landscape, so a portrait poster as primary icon gets cropped/stretched.
-        // For tv episodes we'll override with the episode still further below if available.
-        $primaryIconUrl = null;
-        if ($enrichBackdrops && $backdropUrl) {
-            $primaryIconUrl = $backdropUrl;
-        }
-
-        if ($primaryIconUrl !== null
-            && ($overwrite || ! $trustedLandscapeIcon)
-            && ($programme['icon'] ?? null) !== $primaryIconUrl) {
-            $programme['icon'] = $primaryIconUrl;
-            $result['poster'] = true;
-            $result['changed'] = true;
-        }
-
-        // Add backdrop to images array (size=1: primary landscape for EPG grid)
-        if ($enrichBackdrops && $backdropUrl) {
-            $hasTmdbBackdrop = false;
-            foreach (($programme['images'] ?? []) as $image) {
-                if (($image['url'] ?? null) === $backdropUrl
-                    && ($image['type'] ?? null) === 'backdrop'
-                    && ($image['source'] ?? null) === 'tmdb') {
-                    $hasTmdbBackdrop = true;
-                    break;
-                }
-            }
-            if (! $hasTmdbBackdrop) {
-                $programme['images'][] = [
-                    'url' => $backdropUrl,
-                    'type' => 'backdrop',
-                    'width' => 1920,
-                    'height' => 1080,
-                    'orient' => 'L',
-                    'size' => 1,
-                    'source' => 'tmdb',
-                    'scope' => 'programme',
-                ];
-                $result['changed'] = true;
-            }
-        }
 
         // Add poster to images array (size=2: portrait for info/details views)
         if ($enrichPosters && $posterUrl) {
@@ -1538,13 +1514,76 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
+        $hasBackdropMetadata = false;
+        $backdropRejected = false;
+
         // Erweiterte images-pipeline: hole zusätzliche varianten + logo
         if (($enrichPosters || $enrichBackdrops) && ! empty($tmdbData['tmdb_id']) && ! empty($mediaType)) {
             $creds = $this->getTmdbCredentials();
             if ($creds !== null) {
                 $imageSet = $this->fetchTmdbImages((int) $tmdbData['tmdb_id'], $mediaType, $imagesCache);
                 if ($imageSet !== null) {
+                    $hasBackdropMetadata = ! empty(array_filter(
+                        $imageSet['backdrops'] ?? [],
+                        fn (array $image): bool => ! empty($image['file_path'])
+                    ));
                     $candidates = $this->selectImageSet($imageSet, $creds['language']);
+                    $selectedBackdrop = null;
+                    foreach ($candidates as $candidate) {
+                        if (($candidate['type'] ?? null) === 'backdrop') {
+                            $selectedBackdrop = $candidate;
+                            break;
+                        }
+                    }
+
+                    if ($enrichBackdrops && $hasBackdropMetadata) {
+                        // The images response is the only bounded quality evidence. Do not
+                        // promote a details backdrop when every returned candidate is weak.
+                        $selectedBackdropUrls = array_column(array_filter(
+                            $candidates,
+                            fn (array $candidate): bool => ($candidate['type'] ?? null) === 'backdrop'
+                        ), 'url');
+                        $staleBackdropUrls = [];
+                        $programme['images'] = array_values(array_filter(
+                            $programme['images'] ?? [],
+                            function (array $image) use ($selectedBackdropUrls, &$staleBackdropUrls): bool {
+                                $isStaleTmdbBackdrop = ($image['type'] ?? null) === 'backdrop'
+                                    && ($image['source'] ?? null) === 'tmdb'
+                                    && ! in_array($image['url'] ?? null, $selectedBackdropUrls, true);
+                                if ($isStaleTmdbBackdrop && isset($image['url'])) {
+                                    $staleBackdropUrls[] = $image['url'];
+                                }
+
+                                return ! $isStaleTmdbBackdrop;
+                            }
+                        ));
+                        if ($staleBackdropUrls !== []) {
+                            $result['changed'] = true;
+                        }
+
+                        if ($selectedBackdrop === null) {
+                            $backdropRejected = true;
+                            if (in_array($programme['icon'] ?? null, $staleBackdropUrls, true)) {
+                                unset($programme['icon']);
+                                $result['changed'] = true;
+                            }
+                            $rejection = [
+                                'source' => 'tmdb',
+                                'asset_type' => 'backdrop',
+                                'reason' => 'no_backdrop_with_vote_evidence',
+                            ];
+                            if (($programme['artwork_rejection'] ?? null) !== $rejection) {
+                                $programme['artwork_rejection'] = $rejection;
+                                $result['changed'] = true;
+                            }
+                        } else {
+                            $backdropUrl = $selectedBackdrop['url'];
+                            if (isset($programme['artwork_rejection'])) {
+                                unset($programme['artwork_rejection']);
+                                $result['changed'] = true;
+                            }
+                        }
+                    }
                     foreach ($candidates as $img) {
                         if ($img['type'] === 'poster' && ! $enrichPosters) {
                             continue;
@@ -1561,6 +1600,49 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         $result['changed'] = true;
                     }
                 }
+            }
+        }
+
+        // Preserve the established details fallback only when the images response has no
+        // backdrop candidates. A nonempty response without vote evidence is an abstention.
+        if ($enrichBackdrops && ! $hasBackdropMetadata && ! $backdropRejected) {
+            $backdropUrl = $tmdbData['backdrop_url'] ?? null;
+        }
+
+        // Primary <icon> in XMLTV: prefer a quality-qualified landscape backdrop over a
+        // portrait poster. Exact episode stills below retain their higher priority.
+        if ($enrichBackdrops && $backdropUrl
+            && ($overwrite || ! $trustedLandscapeIcon)
+            && ($programme['icon'] ?? null) !== $backdropUrl) {
+            $programme['icon'] = $backdropUrl;
+            $result['poster'] = true;
+            $result['changed'] = true;
+        }
+
+        // Add a details fallback backdrop only when no images metadata was available.
+        if ($enrichBackdrops && $backdropUrl) {
+            $hasTmdbBackdrop = false;
+            foreach (($programme['images'] ?? []) as $image) {
+                if (($image['url'] ?? null) === $backdropUrl
+                    && ($image['type'] ?? null) === 'backdrop'
+                    && ($image['source'] ?? null) === 'tmdb') {
+                    $hasTmdbBackdrop = true;
+                    break;
+                }
+            }
+            if (! $hasTmdbBackdrop) {
+                $programme['images'][] = [
+                    'url' => $backdropUrl,
+                    'type' => 'backdrop',
+                    'width' => 1920,
+                    'height' => 1080,
+                    'orient' => 'L',
+                    'size' => 1,
+                    'source' => 'tmdb',
+                    'scope' => 'programme',
+                    'artwork_quality' => 'details_fallback',
+                ];
+                $result['changed'] = true;
             }
         }
 
@@ -1666,34 +1748,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $result['changed'] = true;
         }
 
-        // Phase A2/A3: finalize images[] (sort, dedupe, sync primary <icon>).
-        if (! empty($programme['images']) && is_array($programme['images'])) {
-            $imagesBeforeFinalization = $programme['images'];
-            $iconBeforeFinalization = $programme['icon'] ?? null;
-            $programme['images'] = $this->prioritizeImages($programme['images']);
-            $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
-            if ($trustedLandscapeIcon && ! $overwrite) {
-                $trustedUrl = (string) ($programme['icon'] ?? '');
-                foreach ($programme['images'] as $index => $image) {
-                    if (($image['url'] ?? null) !== $trustedUrl) {
-                        continue;
-                    }
-                    if ($index > 0) {
-                        array_unshift($programme['images'], array_splice($programme['images'], $index, 1)[0]);
-                    }
-                    break;
-                }
-            } else {
-                foreach ($programme['images'] as $image) {
-                    if ($this->isTrustedLandscapeImage($image)) {
-                        $programme['icon'] = $image['url'];
-                        break;
-                    }
-                }
-            }
-            if ($programme['images'] !== $imagesBeforeFinalization || ($programme['icon'] ?? null) !== $iconBeforeFinalization) {
-                $result['changed'] = true;
-            }
+        if ($this->finalizeImageSerialization($programme, $trustedLandscapeIcon, $overwrite)) {
+            $result['changed'] = true;
         }
 
         return $result;
@@ -2023,7 +2079,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         };
 
         // Backdrops zuerst (landscape primary, size=1), sprach-neutral bevorzugt
-        $backdrops = $images['backdrops'] ?? [];
+        $backdrops = array_values(array_filter(
+            $images['backdrops'] ?? [],
+            fn (array $backdrop): bool => $this->hasBackdropVoteEvidence($backdrop)
+        ));
         $langPrioBack = [null, $shortLang, 'en'];
         usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
         foreach (array_slice($backdrops, 0, 2) as $b) {
@@ -2041,6 +2100,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'scope' => 'programme',
                 'language' => $b['iso_639_1'] ?? null,
                 'language_rank' => $rank($b, $langPrioBack),
+                'artwork_quality' => 'tmdb_vote_evidence',
             ];
         }
 
@@ -2091,6 +2151,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $out;
     }
 
+    /**
+     * TMDB does not expose image-content semantics. Positive public vote metadata is the
+     * minimum bounded evidence required before a backdrop can become programme primary.
+     */
+    private function hasBackdropVoteEvidence(array $backdrop): bool
+    {
+        return is_numeric($backdrop['vote_count'] ?? null)
+            && (int) $backdrop['vote_count'] > 0
+            && is_numeric($backdrop['vote_average'] ?? null)
+            && (float) $backdrop['vote_average'] > 0;
+    }
+
     private function hasTrustedLandscapeIcon(array $programme): bool
     {
         $icon = trim((string) ($programme['icon'] ?? ''));
@@ -2137,6 +2209,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || $orient !== 'L'
             || ! in_array($type, ['backdrop', 'fanart', 'screenshot'], true)
             || ($source !== 'tmdb' && ! in_array($scope, ['programme', 'movie', 'series', 'episode'], true))) {
+            return false;
+        }
+
+        // Legacy TMDB backdrops predate the bounded quality decision and must be
+        // re-evaluated instead of preventing the new logic from running.
+        if ($source === 'tmdb' && $type === 'backdrop'
+            && ! in_array($image['artwork_quality'] ?? null, ['tmdb_vote_evidence', 'details_fallback'], true)) {
             return false;
         }
 
@@ -2234,6 +2313,54 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $out[] = $img;
         }
         return array_values($out);
+    }
+
+    /**
+     * Keep a selected trusted landscape primary at both XMLTV image boundaries.
+     */
+    private function finalizeImageSerialization(array &$programme, bool $trustedLandscapeIcon, bool $overwrite): bool
+    {
+        if (empty($programme['images']) || ! is_array($programme['images'])) {
+            return false;
+        }
+
+        $imagesBeforeFinalization = $programme['images'];
+        $iconBeforeFinalization = $programme['icon'] ?? null;
+        $programme['images'] = $this->prioritizeImages($programme['images']);
+        $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
+
+        if ($trustedLandscapeIcon && ! $overwrite) {
+            $trustedUrl = (string) ($programme['icon'] ?? '');
+            foreach ($programme['images'] as $index => $image) {
+                if (($image['url'] ?? null) !== $trustedUrl) {
+                    continue;
+                }
+                if ($index > 0) {
+                    array_unshift($programme['images'], array_splice($programme['images'], $index, 1)[0]);
+                }
+                break;
+            }
+        } else {
+            foreach ($programme['images'] as $image) {
+                if ($this->isTrustedLandscapeImage($image)) {
+                    $programme['icon'] = $image['url'];
+                    break;
+                }
+            }
+        }
+
+        $primaryUrl = trim((string) ($programme['icon'] ?? ''));
+        if ($primaryUrl !== '') {
+            foreach ($programme['images'] as $image) {
+                if (($image['url'] ?? null) === $primaryUrl && $this->isTrustedLandscapeImage($image)) {
+                    $programme['images'][] = $image;
+                    break;
+                }
+            }
+        }
+
+        return $programme['images'] !== $imagesBeforeFinalization
+            || ($programme['icon'] ?? null) !== $iconBeforeFinalization;
     }
 
     /**
@@ -3024,10 +3151,107 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     private function saveEnrichmentState(array $state): void
     {
         Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
-        Storage::disk('local')->put(
+        $persisted = Storage::disk('local')->put(
             'plugin-data/epg-enricher/enrichment-state.json',
             json_encode($state, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
         );
+        if (! $persisted) {
+            throw new \RuntimeException('Could not persist enrichment state.');
+        }
+    }
+
+    /**
+     * Merge one EPG source into the canonical state under a global write lock.
+     *
+     * @param  array<string, mixed>  $epgState
+     */
+    private function saveEpgEnrichmentState(string $stateKey, array $epgState): void
+    {
+        $disk = Storage::disk('local');
+        $directory = 'plugin-data/epg-enricher';
+        $disk->makeDirectory($directory);
+        $lock = fopen($disk->path("{$directory}/enrichment-state.lock"), 'c');
+        if ($lock === false) {
+            throw new \RuntimeException('Could not create enrichment state lock.');
+        }
+
+        $locked = false;
+        try {
+            $locked = flock($lock, LOCK_EX);
+            if (! $locked) {
+                throw new \RuntimeException('Could not lock enrichment state.');
+            }
+
+            $state = $this->loadEnrichmentState();
+            $state[$stateKey] = $epgState;
+            $this->saveEnrichmentState($state);
+        } finally {
+            if ($locked) {
+                flock($lock, LOCK_UN);
+            }
+            fclose($lock);
+        }
+    }
+
+    /**
+     * Load the last completed-day checkpoint for one EPG source.
+     *
+     * @return array<string, mixed>
+     */
+    private function loadEnrichmentCheckpoint(string $stateKey): array
+    {
+        $path = $this->enrichmentCheckpointPath($stateKey);
+        if (! Storage::disk('local')->exists($path)) {
+            return [];
+        }
+
+        $data = json_decode(Storage::disk('local')->get($path), true);
+
+        return is_array($data[$stateKey] ?? null) ? $data[$stateKey] : [];
+    }
+
+    /**
+     * Persist one EPG source independently so parallel sources cannot overwrite
+     * each other's in-progress checkpoints.
+     *
+     * @param  array<string, mixed>  $state
+     */
+    private function saveEnrichmentCheckpoint(string $stateKey, array $state): void
+    {
+        Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
+        $persisted = Storage::disk('local')->put(
+            $this->enrichmentCheckpointPath($stateKey),
+            json_encode([$stateKey => $state], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
+        );
+        if (! $persisted) {
+            throw new \RuntimeException('Could not persist enrichment checkpoint.');
+        }
+    }
+
+    private function deleteEnrichmentCheckpoint(string $stateKey): void
+    {
+        $path = Storage::disk('local')->path($this->enrichmentCheckpointPath($stateKey));
+        if (is_file($path)) {
+            @unlink($path);
+        }
+    }
+
+    private function deleteAllEnrichmentCheckpoints(): int
+    {
+        $pattern = Storage::disk('local')->path('plugin-data/epg-enricher/enrichment-checkpoint-epg_*.json');
+        $deleted = 0;
+        foreach (glob($pattern) ?: [] as $path) {
+            if (is_file($path) && @unlink($path)) {
+                $deleted++;
+            }
+        }
+
+        return $deleted;
+    }
+
+    private function enrichmentCheckpointPath(string $stateKey): string
+    {
+        return "plugin-data/epg-enricher/enrichment-checkpoint-{$stateKey}.json";
     }
 
     /**
@@ -3074,8 +3298,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     private function clearEnrichmentState(PluginExecutionContext $context): PluginActionResult
     {
         $path = 'plugin-data/epg-enricher/enrichment-state.json';
+        $checkpointsCleared = $this->deleteAllEnrichmentCheckpoints();
 
         if (! Storage::disk('local')->exists($path)) {
+            if ($checkpointsCleared > 0) {
+                return PluginActionResult::success(
+                    "Enrichment checkpoints cleared. Next run will re-process all files ({$checkpointsCleared} checkpoint(s)).",
+                    ['checkpoints_cleared' => $checkpointsCleared]
+                );
+            }
+
             return PluginActionResult::success('No enrichment state to clear.');
         }
 
@@ -3092,7 +3324,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         return PluginActionResult::success(
             "Enrichment state cleared. Next run will re-process all files ({$epgCount} EPG(s), {$fileCount} tracked file(s)).",
-            ['epgs_cleared' => $epgCount, 'files_cleared' => $fileCount]
+            ['epgs_cleared' => $epgCount, 'files_cleared' => $fileCount, 'checkpoints_cleared' => $checkpointsCleared]
         );
     }
 }

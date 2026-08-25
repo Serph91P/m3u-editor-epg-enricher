@@ -154,7 +154,7 @@ namespace Tests {
     }
     file_put_contents($tempDir.'/long.jsonl', $targetRecords);
 
-    $times = [0.0, 299.0, 300.0, 301.0, 599.0, 600.0];
+    $times = [0.0, 59.0, 60.0, 119.0, 120.0, 121.0];
     $context = new PluginExecutionContext();
     runDateFile($plugin, $method, 'long.jsonl', ['target'], $context, function () use (&$times): float {
         return array_shift($times);
@@ -163,13 +163,70 @@ namespace Tests {
     assertSameValue(2, count($context->heartbeats), 'Long date files should refresh the heartbeat at a throttled interval.');
     assertSameValue(
         [
-            'Processing 2026-07-11 (2/4) - 2 programmes processed',
-            'Processing 2026-07-11 (2/4) - 5 programmes processed',
+            'Processing 2026-07-11 (2/4) - 1 programmes processed',
+            'Processing 2026-07-11 (2/4) - 3 programmes processed',
         ],
         array_column($context->heartbeats, 'message'),
         'Intra-day heartbeat messages should report monotonic processed counts.'
     );
-    assertSameValue([35, 50], array_column($context->heartbeats, 'progress'), 'Intra-day progress should advance within the current day.');
+    assertSameValue([35, 45], array_column($context->heartbeats, 'progress'), 'Intra-day progress should advance within the current day.');
+
+    $untargetedRecords = '';
+    foreach (range(1, 3) as $index) {
+        $untargetedRecords .= json_encode([
+            'channel' => 'other',
+            'programme' => ['title' => 'Untargeted'],
+        ], JSON_UNESCAPED_SLASHES)."\n";
+    }
+    file_put_contents($tempDir.'/untargeted.jsonl', $untargetedRecords);
+
+    $untargetedTimes = [0.0, 59.0, 60.0, 61.0];
+    $untargetedContext = new PluginExecutionContext();
+    runDateFile($plugin, $method, 'untargeted.jsonl', ['target'], $untargetedContext, function () use (&$untargetedTimes): float {
+        return array_shift($untargetedTimes);
+    });
+    assertSameValue(
+        1,
+        count($untargetedContext->heartbeats),
+        'Long scans should refresh the heartbeat even when the current records are not targeted.'
+    );
+    assertSameValue(
+        'Processing 2026-07-11 (2/4) - 0 programmes processed',
+        $untargetedContext->heartbeats[0]['message'] ?? null,
+        'Untargeted scan heartbeats should keep the processed programme count truthful.'
+    );
+
+    $largeChannelIds = [];
+    $largeRecords = '';
+    foreach (range(1, 700) as $index) {
+        $channelId = "target-{$index}";
+        $largeChannelIds[] = $channelId;
+        $largeRecords .= json_encode([
+            'channel' => $channelId,
+            'programme' => ['title' => ''],
+        ], JSON_UNESCAPED_SLASHES)."\n";
+    }
+    file_put_contents($tempDir.'/large-channel-set.jsonl', $largeRecords);
+
+    $largeTime = -1.0;
+    $largeContext = new PluginExecutionContext();
+    $largeResult = runDateFile(
+        $plugin,
+        $method,
+        'large-channel-set.jsonl',
+        $largeChannelIds,
+        $largeContext,
+        function () use (&$largeTime): float {
+            return ++$largeTime;
+        },
+    );
+    assertSameValue(700, $largeResult['processed'], 'A large run should process all 700 targeted channels.');
+    assertSameValue(11, count($largeContext->heartbeats), 'A 700-second run should refresh its heartbeat every 60 seconds.');
+    assertSameValue(
+        'Processing 2026-07-11 (2/4) - 659 programmes processed',
+        $largeContext->heartbeats[10]['message'] ?? null,
+        'Heartbeat progress should remain monotonic through a 700-channel run.'
+    );
 
     $cancelFile = json_encode([
         'channel' => 'target',
@@ -181,7 +238,7 @@ namespace Tests {
     file_put_contents($tempDir.'/cancel.jsonl', $cancelFile);
     $cancelContext = new PluginExecutionContext();
     $cancelContext->cancelAfterChecks = 3;
-    $cancelTimes = [0.0, 1.0];
+    $cancelTimes = [0.0, 1.0, 2.0];
     $cancelResult = runDateFile($plugin, $method, 'cancel.jsonl', ['target'], $cancelContext, function () use (&$cancelTimes): float {
         return array_shift($cancelTimes);
     }, true);
@@ -204,6 +261,8 @@ namespace Tests {
     assertSameValue(1, $smallResult['processed'], 'Small-file processing counts should remain unchanged.');
 
     unlink($tempDir.'/long.jsonl');
+    unlink($tempDir.'/untargeted.jsonl');
+    unlink($tempDir.'/large-channel-set.jsonl');
     unlink($tempDir.'/cancel.jsonl');
     unlink($tempDir.'/small.jsonl');
     rmdir($tempDir);

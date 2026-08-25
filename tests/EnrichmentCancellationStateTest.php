@@ -233,9 +233,13 @@ namespace Carbon {
 }
 
 namespace Illuminate\Support\Facades {
+    use RuntimeException;
+
     class Storage
     {
         public static string $root;
+        public static ?string $throwOnExistsPath = null;
+        public static ?string $failPutPath = null;
 
         public static function disk(string $name): self
         {
@@ -249,6 +253,10 @@ namespace Illuminate\Support\Facades {
 
         public function exists(string $path): bool
         {
+            if ($path === self::$throwOnExistsPath) {
+                throw new RuntimeException('Simulated worker termination before the next date file.');
+            }
+
             return file_exists($this->path($path));
         }
 
@@ -257,9 +265,18 @@ namespace Illuminate\Support\Facades {
             return (string) file_get_contents($this->path($path));
         }
 
-        public function put(string $path, string $contents): void
+        public function put(string $path, string $contents): bool
         {
-            file_put_contents($this->path($path), $contents);
+            if ($path === self::$failPutPath) {
+                return false;
+            }
+
+            return file_put_contents($this->path($path), $contents) !== false;
+        }
+
+        public function delete(string $path): void
+        {
+            @unlink($this->path($path));
         }
 
         public function makeDirectory(string $path): void
@@ -281,6 +298,7 @@ namespace Tests {
     use AppLocalPlugins\EpgEnricher\Plugin;
     use Illuminate\Support\Facades\Storage;
     use ReflectionMethod;
+    use RuntimeException;
 
     function assertSameValue(mixed $expected, mixed $actual, string $message): void
     {
@@ -313,6 +331,21 @@ namespace Tests {
     $dateFile = $cacheDir.'/programmes-2026-07-11.jsonl';
     file_put_contents($dateFile, $source);
 
+    $legacySettingsHash = md5(json_encode([
+        'logic_version' => '2026.08.21-v1.13.8-icon-order',
+        'enrich_from_tmdb' => true,
+        'overwrite_existing' => false,
+        'enrich_categories' => true,
+        'enrich_descriptions' => false,
+        'enrich_posters' => false,
+        'enrich_backdrops' => false,
+        'map_genres_to_epg_categories' => true,
+        'map_genres_to_kodi_guide_genres' => false,
+        'keyword_category_detection' => true,
+        'enrich_episode_details' => false,
+        'tmdb_language' => '',
+    ]));
+
     $priorState = [
         'source_hash' => 'prior-source',
         'enriched_hash' => 'prior-enriched',
@@ -321,13 +354,31 @@ namespace Tests {
     ];
     file_put_contents($stateDir.'/enrichment-state.json', json_encode([
         'epg_1' => [
-            'files' => ['programmes-2026-07-10.jsonl' => $priorState],
+            'settings_hash' => $legacySettingsHash,
+            'channels_hash' => md5(json_encode(['target'])),
+            'files' => [
+                'programmes-2026-07-10.jsonl' => $priorState,
+                'programmes-2026-07-11.jsonl' => [
+                    'source_hash' => md5_file($dateFile),
+                    'enriched_hash' => md5_file($dateFile),
+                    'enriched_at' => '2026-07-10T12:00:00+00:00',
+                    'programmes_updated' => 0,
+                ],
+            ],
         ],
     ]));
 
     $plugin = new Plugin();
     $method = new ReflectionMethod($plugin, 'doEnrich');
     $method->setAccessible(true);
+
+    $settingsHashMethod = new ReflectionMethod($plugin, 'computeSettingsHash');
+    $settingsHashMethod->setAccessible(true);
+    assertSameValue(
+        true,
+        $legacySettingsHash !== $settingsHashMethod->invoke($plugin, (new PluginExecutionContext())->settings),
+        'The title-card quality logic version must invalidate a previously processed state hash.'
+    );
 
     $cancelContext = new PluginExecutionContext();
     $cancelContext->cancelAfterChecks = 3;
@@ -341,9 +392,9 @@ namespace Tests {
         'A cancelled date file must not be recorded as complete.'
     );
     assertSameValue(
-        $priorState,
-        $stateAfterCancellation['epg_1']['files']['programmes-2026-07-10.jsonl'] ?? null,
-        'Cancellation should preserve prior successfully completed file states.'
+        false,
+        isset($stateAfterCancellation['epg_1']['files']['programmes-2026-07-10.jsonl']),
+        'A changed logic version should invalidate all previously completed file states.'
     );
     assertSameValue('cancelled', $cancelResult->status, 'Cancellation inside a date file should propagate to doEnrich.');
     assertSameValue(1, $cancelResult->data['programmes_updated'] ?? null, 'The fixture should modify a programme in memory before cancellation.');
@@ -353,14 +404,138 @@ namespace Tests {
     assertSameValue(1, $retryResult->data['programmes_updated'] ?? null, 'A subsequent run should process the cancelled date file.');
     assertSameValue(false, $source === file_get_contents($dateFile), 'The subsequent run should write the enrichment.');
 
-    $files = new \RecursiveIteratorIterator(
-        new \RecursiveDirectoryIterator($tempDir, \FilesystemIterator::SKIP_DOTS),
-        \RecursiveIteratorIterator::CHILD_FIRST,
-    );
-    foreach ($files as $file) {
-        $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+    $checkpointTempDir = sys_get_temp_dir().'/epg-enricher-day-checkpoint-'.bin2hex(random_bytes(6));
+    $checkpointCacheDir = $checkpointTempDir.'/epg-cache/cancel-fixture/v2';
+    $checkpointStateDir = $checkpointTempDir.'/plugin-data/epg-enricher';
+    mkdir($checkpointCacheDir, 0777, true);
+    mkdir($checkpointStateDir, 0777, true);
+    Storage::$root = $checkpointTempDir;
+
+    file_put_contents($checkpointCacheDir.'/metadata.json', json_encode([
+        'programme_date_range' => [
+            'min_date' => '2026-07-11',
+            'max_date' => '2026-07-12',
+        ],
+    ]));
+    file_put_contents($checkpointCacheDir.'/programmes-2026-07-11.jsonl', json_encode([
+        'channel' => 'target',
+        'programme' => ['title' => 'Wimbledon'],
+    ], JSON_UNESCAPED_SLASHES)."\n");
+    file_put_contents($checkpointCacheDir.'/programmes-2026-07-12.jsonl', json_encode([
+        'channel' => 'target',
+        'programme' => ['title' => 'Wimbledon'],
+    ], JSON_UNESCAPED_SLASHES)."\n");
+
+    Storage::$throwOnExistsPath = 'epg-cache/cancel-fixture/v2/programmes-2026-07-12.jsonl';
+
+    try {
+        $method->invoke($plugin, 1, [1], new PluginExecutionContext());
+        fwrite(STDERR, "Expected simulated worker termination.\n");
+        exit(1);
+    } catch (RuntimeException $exception) {
+        assertSameValue(
+            'Simulated worker termination before the next date file.',
+            $exception->getMessage(),
+            'The fixture should stop immediately before the second date file.'
+        );
     }
-    rmdir($tempDir);
+
+    $checkpointPath = $checkpointStateDir.'/enrichment-checkpoint-epg_1.json';
+    $checkpoint = json_decode((string) file_get_contents($checkpointPath), true);
+    assertSameValue(
+        true,
+        isset($checkpoint['epg_1']['files']['programmes-2026-07-11.jsonl']),
+        'A completed date file should be checkpointed before the next date starts.'
+    );
+    assertSameValue(
+        false,
+        isset($checkpoint['epg_1']['files']['programmes-2026-07-12.jsonl']),
+        'An unstarted date file must not be checkpointed.'
+    );
+    assertSameValue(
+        false,
+        file_exists($checkpointStateDir.'/enrichment-state.json'),
+        'A hard-stop checkpoint must not replace the canonical cross-EPG state file.'
+    );
+
+    Storage::$throwOnExistsPath = null;
+    $checkpointRetry = $method->invoke($plugin, 1, [1], new PluginExecutionContext());
+    assertSameValue(1, $checkpointRetry->data['days_skipped'] ?? null, 'A retry should skip the checkpointed first date file.');
+    assertSameValue(1, $checkpointRetry->data['programmes_processed'] ?? null, 'A retry should process only the remaining date file.');
+    assertSameValue(false, file_exists($checkpointPath), 'A successful retry should remove its per-EPG checkpoint.');
+
+    file_put_contents($checkpointPath, '{}');
+    $clearMethod = new ReflectionMethod($plugin, 'clearEnrichmentState');
+    $clearMethod->setAccessible(true);
+    $clearMethod->invoke($plugin, new PluginExecutionContext());
+    assertSameValue(false, file_exists($checkpointPath), 'Clearing enrichment state should remove stale per-EPG checkpoints.');
+
+    $saveEpgStateMethod = new ReflectionMethod($plugin, 'saveEpgEnrichmentState');
+    $saveEpgStateMethod->setAccessible(true);
+    $saveEpgStateMethod->invoke($plugin, 'epg_1', ['files' => ['first.jsonl' => ['source_hash' => 'first']]]);
+    $saveEpgStateMethod->invoke($plugin, 'epg_2', ['files' => ['second.jsonl' => ['source_hash' => 'second']]]);
+    $mergedState = json_decode((string) file_get_contents($checkpointStateDir.'/enrichment-state.json'), true);
+    assertSameValue(
+        ['epg_1', 'epg_2'],
+        array_keys($mergedState),
+        'Canonical state writes should merge independently completed EPG sources.'
+    );
+
+    @unlink($checkpointStateDir.'/enrichment-state.json');
+    file_put_contents($checkpointCacheDir.'/metadata.json', json_encode([
+        'programme_date_range' => [
+            'min_date' => '2026-07-11',
+            'max_date' => '2026-07-11',
+        ],
+    ]));
+    file_put_contents($checkpointCacheDir.'/programmes-2026-07-11.jsonl', json_encode([
+        'channel' => 'target',
+        'programme' => ['title' => 'Wimbledon'],
+    ], JSON_UNESCAPED_SLASHES)."\n");
+    Storage::$failPutPath = 'plugin-data/epg-enricher/enrichment-state.json';
+    try {
+        $method->invoke($plugin, 1, [1], new PluginExecutionContext());
+        fwrite(STDERR, "Expected canonical state write failure.\n");
+        exit(1);
+    } catch (RuntimeException $exception) {
+        assertSameValue(
+            'Could not persist enrichment state.',
+            $exception->getMessage(),
+            'A failed canonical state write should abort completion.'
+        );
+    }
+    assertSameValue(true, file_exists($checkpointPath), 'A failed canonical state write must preserve the per-EPG checkpoint.');
+    Storage::$failPutPath = null;
+
+    $priorCheckpoint = '{"prior":true}';
+    file_put_contents($checkpointPath, $priorCheckpoint);
+    Storage::$failPutPath = 'plugin-data/epg-enricher/enrichment-checkpoint-epg_1.json';
+    $saveCheckpointMethod = new ReflectionMethod($plugin, 'saveEnrichmentCheckpoint');
+    $saveCheckpointMethod->setAccessible(true);
+    try {
+        $saveCheckpointMethod->invoke($plugin, 'epg_1', ['files' => []]);
+        fwrite(STDERR, "Expected checkpoint write failure.\n");
+        exit(1);
+    } catch (RuntimeException $exception) {
+        assertSameValue(
+            'Could not persist enrichment checkpoint.',
+            $exception->getMessage(),
+            'A failed checkpoint write should abort progress.'
+        );
+    }
+    assertSameValue($priorCheckpoint, file_get_contents($checkpointPath), 'A failed checkpoint write must preserve the prior checkpoint bytes.');
+    Storage::$failPutPath = null;
+
+    foreach ([$tempDir, $checkpointTempDir] as $directory) {
+        $files = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        );
+        foreach ($files as $file) {
+            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+        }
+        rmdir($directory);
+    }
 
     echo "Enrichment cancellation state tests passed.\n";
 }
