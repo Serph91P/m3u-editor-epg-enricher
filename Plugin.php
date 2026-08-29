@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.25-v1.13.9-emby-output';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.29-v1.14.0-deterministic-artwork';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -1371,6 +1371,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $hasCategory = $existingCategory !== '';
         $hasDesc = ! empty($programme['desc']);
         $trustedLandscapeIcon = $this->hasTrustedLandscapeIcon($programme);
+        $trustedNonTmdbLandscapeIcon = $this->hasTrustedNonTmdbLandscapeIcon($programme);
 
         $wantsArtwork = $enrichPosters || $enrichBackdrops;
 
@@ -1394,6 +1395,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         if (! $overwrite
             && (! $wantsArtwork || $trustedLandscapeIcon)
+            && ! $trustedNonTmdbLandscapeIcon
             && ($hasCategory || ! $enrichCategories)
             && ($hasDesc || ! $enrichDescriptions)
             && (! $enrichEpisodeDetails || ! $hasStrongSeriesSignals || $trustedEpisodeStillIcon)
@@ -1542,6 +1544,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $result['changed'] = true;
             }
 
+            if ($trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwrite)) {
+                $result['changed'] = true;
+            }
+
             return $result;
         }
 
@@ -1592,7 +1598,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $candidates = $this->selectImageSet(
                         $imageSet,
                         $creds['language'],
-                        $overwrite ? ($tmdbData['backdrop_url'] ?? null) : null,
+                        $tmdbData['backdrop_url'] ?? null,
+                        $overwrite,
                     );
                     $selectedBackdrop = null;
                     foreach ($candidates as $candidate) {
@@ -1648,6 +1655,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                                 unset($programme['artwork_rejection']);
                                 $result['changed'] = true;
                             }
+                        }
+                        if ($this->recordArtworkDecision(
+                            $programme,
+                            $imageSet,
+                            $selectedBackdrop,
+                            $tmdbData,
+                            $result['cache_hit'],
+                            $creds['language'],
+                            $backdropRejected,
+                        )) {
+                            $result['changed'] = true;
                         }
                     }
                     foreach ($candidates as $img) {
@@ -2112,7 +2130,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      * @param  array{posters: array, backdrops: array, logos: array}  $images
      * @return array<int, array{url: string, type: string, width: int, height: int, orient: string, size: int}>
      */
-    private function selectImageSet(array $images, string $userLang, ?string $detailsBackdropUrl = null): array
+    private function selectImageSet(
+        array $images,
+        string $userLang,
+        ?string $detailsBackdropUrl = null,
+        bool $allowUnratedDetailsFallback = false,
+    ): array
     {
         $shortLang = strtolower(explode('-', $userLang)[0] ?? 'en');
         $out = [];
@@ -2145,14 +2168,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         };
 
         // Backdrops zuerst (landscape primary, size=1), sprach-neutral bevorzugt
-        $backdrops = array_values(array_filter(
-            $images['backdrops'] ?? [],
-            fn (array $backdrop): bool => $this->hasBackdropVoteEvidence($backdrop)
-        ));
         $detailsBackdropPath = $detailsBackdropUrl !== null
             ? $this->tmdbImageFilePath($detailsBackdropUrl)
             : null;
-        if ($backdrops === [] && $detailsBackdropPath !== null) {
+        $backdrops = array_values(array_filter(
+            $images['backdrops'] ?? [],
+            fn (array $backdrop): bool => $this->hasBackdropVoteEvidence($backdrop)
+                && $this->isGenuineLandscapeBackdrop($backdrop)
+        ));
+        if ($backdrops === [] && $allowUnratedDetailsFallback && $detailsBackdropPath !== null) {
             foreach ($images['backdrops'] ?? [] as $backdrop) {
                 if (($backdrop['file_path'] ?? null) === $detailsBackdropPath
                     && $this->isGenuineLandscapeBackdrop($backdrop)) {
@@ -2163,7 +2187,51 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
         $langPrioBack = [null, $shortLang, 'en'];
-        usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
+        usort($backdrops, function (array $a, array $b) use ($detailsBackdropPath, $rank, $langPrioBack): int {
+            // The details response establishes the canonical artwork identity. Alternative
+            // ranking only applies after a genuine canonical backdrop has been considered.
+            $detailsOrder = (($b['file_path'] ?? null) === $detailsBackdropPath)
+                <=> (($a['file_path'] ?? null) === $detailsBackdropPath);
+            if ($detailsOrder !== 0) {
+                return $detailsOrder;
+            }
+
+            $geometry = function (array $image): float {
+                $width = is_numeric($image['width'] ?? null) ? (float) $image['width'] : 0.0;
+                $height = is_numeric($image['height'] ?? null) ? (float) $image['height'] : 0.0;
+                $aspect = $width > 0 && $height > 0
+                    ? $width / $height
+                    : (float) ($image['aspect_ratio'] ?? 0.0);
+
+                return $aspect > 1.0 ? -abs($aspect - (16 / 9)) : -INF;
+            };
+            $geometryOrder = $geometry($b) <=> $geometry($a);
+            if ($geometryOrder !== 0) {
+                return $geometryOrder;
+            }
+
+            $languageOrder = $rank($a, $langPrioBack) <=> $rank($b, $langPrioBack);
+            if ($languageOrder !== 0) {
+                return $languageOrder;
+            }
+
+            $voteOrder = ($b['vote_average'] ?? 0) <=> ($a['vote_average'] ?? 0);
+            if ($voteOrder !== 0) {
+                return $voteOrder;
+            }
+            $voteCountOrder = ($b['vote_count'] ?? 0) <=> ($a['vote_count'] ?? 0);
+            if ($voteCountOrder !== 0) {
+                return $voteCountOrder;
+            }
+
+            $sceneQualityOrder = ((int) ($b['width'] ?? 0) * (int) ($b['height'] ?? 0))
+                <=> ((int) ($a['width'] ?? 0) * (int) ($a['height'] ?? 0));
+            if ($sceneQualityOrder !== 0) {
+                return $sceneQualityOrder;
+            }
+
+            return strcmp((string) ($a['file_path'] ?? ''), (string) ($b['file_path'] ?? ''));
+        });
         foreach (array_slice($backdrops, 0, 2) as $b) {
             if (empty($b['file_path'])) {
                 continue;
@@ -2259,11 +2327,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
     private function isGenuineLandscapeBackdrop(array $backdrop): bool
     {
-        return is_numeric($backdrop['width'] ?? null)
+        if (is_numeric($backdrop['width'] ?? null)
             && is_numeric($backdrop['height'] ?? null)
             && (float) $backdrop['width'] > 0
-            && (float) $backdrop['height'] > 0
-            && (float) $backdrop['width'] > (float) $backdrop['height'];
+            && (float) $backdrop['height'] > 0) {
+            return (float) $backdrop['width'] > (float) $backdrop['height'];
+        }
+
+        return is_numeric($backdrop['aspect_ratio'] ?? null)
+            && (float) $backdrop['aspect_ratio'] > 1.0;
     }
 
     private function hasTrustedLandscapeIcon(array $programme): bool
@@ -2280,6 +2352,100 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return false;
+    }
+
+    private function hasTrustedNonTmdbLandscapeIcon(array $programme): bool
+    {
+        $icon = trim((string) ($programme['icon'] ?? ''));
+        if ($icon === '' || ! is_array($programme['images'] ?? null)) {
+            return false;
+        }
+
+        foreach ($programme['images'] as $image) {
+            if (($image['url'] ?? null) === $icon
+                && strtolower(trim((string) ($image['source'] ?? ''))) !== 'tmdb'
+                && $this->isTrustedLandscapeImage($image)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function recordArtworkDecision(
+        array &$programme,
+        array $imageSet,
+        ?array $selectedBackdrop,
+        array $tmdbData,
+        bool $cacheHit,
+        string $userLang,
+        bool $backdropRejected,
+    ): bool {
+        $detailsPath = $this->tmdbImageFilePath((string) ($tmdbData['backdrop_url'] ?? ''));
+        $shortLang = strtolower(explode('-', $userLang)[0] ?? 'en');
+        $langPriority = [null, $shortLang, 'en'];
+        $backdrops = array_values(array_filter(
+            $imageSet['backdrops'] ?? [],
+            fn (array $backdrop): bool => ! empty($backdrop['file_path'])
+        ));
+        usort($backdrops, fn (array $a, array $b): int => strcmp(
+            (string) ($a['file_path'] ?? ''),
+            (string) ($b['file_path'] ?? '')
+        ));
+        $candidateMetadata = [];
+        foreach (array_slice($backdrops, 0, 4) as $backdrop) {
+            $iso = isset($backdrop['iso_639_1']) ? strtolower((string) $backdrop['iso_639_1']) : null;
+            $languageRank = count($langPriority);
+            foreach ($langPriority as $index => $language) {
+                if ($iso === $language || ($iso === null && $language === null)) {
+                    $languageRank = $index;
+                    break;
+                }
+            }
+            $candidateMetadata[] = [
+                'path_hash' => hash('sha256', (string) $backdrop['file_path']),
+                'role' => 'backdrop',
+                'landscape' => $this->isGenuineLandscapeBackdrop($backdrop),
+                'language_rank' => $languageRank,
+                'vote_evidence' => $this->hasBackdropVoteEvidence($backdrop),
+                'scene_quality_evidence' => $this->hasBackdropVoteEvidence($backdrop)
+                    && $this->isGenuineLandscapeBackdrop($backdrop),
+                'details_path_equality' => ($backdrop['file_path'] ?? null) === $detailsPath,
+            ];
+        }
+
+        $winnerPath = $selectedBackdrop !== null
+            ? $this->tmdbImageFilePath((string) ($selectedBackdrop['url'] ?? ''))
+            : null;
+        $detailsPathEquality = $winnerPath !== null && $winnerPath === $detailsPath;
+        $inputFingerprint = hash('sha256', json_encode([
+            'title' => $this->normalizeCacheKey((string) ($programme['title'] ?? '')),
+            'description' => $this->normalizeIdentityText((string) ($programme['desc'] ?? '')),
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        $decision = [
+            'input_fingerprint' => $inputFingerprint,
+            'tmdb_id' => (int) ($tmdbData['tmdb_id'] ?? 0),
+            'media_type' => (string) ($tmdbData['_media_type'] ?? ''),
+            'cache_hit' => $cacheHit,
+            'candidates' => $candidateMetadata,
+            'details_path_equality' => $detailsPathEquality,
+            'reason' => $selectedBackdrop === null
+                ? ($backdropRejected ? 'no_qualified_backdrop' : 'no_backdrop_candidate')
+                : ($detailsPathEquality ? 'tmdb_details_backdrop_preferred' : 'tmdb_ranked_backdrop_selected'),
+        ];
+        if ($winnerPath !== null) {
+            $decision['winner_path_hash'] = hash('sha256', $winnerPath);
+        } elseif ($candidateMetadata !== []) {
+            $decision['rejection_path_hash'] = $candidateMetadata[0]['path_hash'];
+        }
+
+        if (($programme['artwork_decision'] ?? null) === $decision) {
+            return false;
+        }
+
+        $programme['artwork_decision'] = $decision;
+
+        return true;
     }
 
     private function hasTrustedEpisodeStillIcon(array $programme): bool

@@ -369,7 +369,7 @@ namespace App\Services {
                 ],
                 'backdrop-quality' => [
                     'overview' => 'A programme used to verify backdrop quality selection.',
-                    'backdrop_url' => 'https://fixture.invalid/details-backdrop.jpg',
+                    'backdrop_url' => 'https://image.tmdb.org/t/p/original/details-backdrop.jpg',
                 ],
                 default => null,
             };
@@ -858,7 +858,7 @@ namespace Tests {
     assertSameValue($scopedProvider['icon'], $scopedProvider['images'][0]['url'], 'Explicitly programme-scoped artwork should remain the first image.');
     assertSameValue($scopedProvider['icon'], $scopedProvider['images'][array_key_last($scopedProvider['images'])]['url'], 'Explicitly programme-scoped artwork should also be the final image.');
     assertSameValue('fanart', $scopedProvider['images'][array_key_last($scopedProvider['images'])]['type'], 'The source primary duplicate should retain its image type.');
-    assertSameValue(0, $scopedProviderTmdb->tvSearches + $scopedProviderTmdb->movieSearches, 'Explicit programme provenance should retain the complete-metadata no-op.');
+    assertTrueValue($scopedProviderTmdb->tvSearches + $scopedProviderTmdb->movieSearches > 0, 'Explicit programme provenance should still evaluate TMDB identity.');
     assertSameValue(true, $scopedProviderResult['changed'], 'Trusted source artwork should report its serialization repair.');
 
     $ambiguous = [
@@ -1155,6 +1155,115 @@ namespace Tests {
 
     $selectImages = $reflection->getMethod('selectImageSet');
     $selectImages->setAccessible(true);
+    $canonicalBackdrop = 'https://image.tmdb.org/t/p/original/canonical-details-backdrop.jpg';
+    $canonicalCompetition = $selectImages->invoke($plugin, [
+        'posters' => [],
+        'backdrops' => [
+            [
+                'file_path' => '/canonical-details-backdrop.jpg',
+                'iso_639_1' => 'en',
+                'vote_count' => 1,
+                'vote_average' => 2.0,
+                'width' => 1920,
+                'height' => 1080,
+            ],
+            [
+                'file_path' => '/german-higher-vote-backdrop.jpg',
+                'iso_639_1' => 'de',
+                'vote_count' => 50,
+                'vote_average' => 9.0,
+                'width' => 1920,
+                'height' => 1080,
+            ],
+        ],
+        'logos' => [],
+    ], 'de-DE', $canonicalBackdrop);
+    assertSameValue(
+        'https://image.tmdb.org/t/p/w1280/canonical-details-backdrop.jpg',
+        $canonicalCompetition[0]['url'] ?? null,
+        'A genuine canonical details backdrop must outrank a language- or vote-ranked alternative.'
+    );
+
+    $sourcePrimary = 'https://provider.invalid/programme-primary.jpg';
+    $sourceLandscape = [
+        'title' => 'Backdrop Quality',
+        'desc' => 'A 2026 programme used to verify backdrop quality selection.',
+        'category' => 'Movie',
+        'icon' => $sourcePrimary,
+        'images' => [[
+            'url' => $sourcePrimary,
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+        ]],
+    ];
+    $sourceLandscapeCache = [];
+    $sourceLandscapeImagesCache = [];
+    Http::$responses[] = new FakeHttpResponse(true, [
+        'posters' => [],
+        'backdrops' => [
+            [
+                'file_path' => '/details-backdrop.jpg',
+                'iso_639_1' => 'en',
+                'vote_count' => 1,
+                'vote_average' => 2.0,
+                'width' => 1920,
+                'height' => 1080,
+            ],
+            [
+                'file_path' => '/german-higher-vote-backdrop.jpg',
+                'iso_639_1' => 'de',
+                'vote_count' => 50,
+                'vote_average' => 9.0,
+                'width' => 1920,
+                'height' => 1080,
+            ],
+        ],
+        'logos' => [],
+    ]);
+    $sourceLandscapeResult = enrich(
+        $plugin,
+        $method,
+        $sourceLandscape,
+        new TmdbService('backdrop-quality'),
+        $sourceLandscapeCache,
+        [],
+        $sourceLandscapeSeasonCache,
+        $sourceLandscapeImagesCache,
+    );
+    assertSameValue($sourcePrimary, $sourceLandscape['icon'], 'A trusted non-TMDB source landscape must remain primary without overwrite.');
+    assertSameValue(true, $sourceLandscapeResult['lookup'], 'A trusted non-TMDB source landscape must not bypass TMDB identity evaluation.');
+    assertSameValue('tmdb_details_backdrop_preferred', $sourceLandscape['artwork_decision']['reason'] ?? null, 'Artwork provenance must record the canonical-details decision.');
+    assertSameValue(210, $sourceLandscape['artwork_decision']['tmdb_id'] ?? null, 'Artwork provenance must record the selected TMDB identity.');
+    assertSameValue('movie', $sourceLandscape['artwork_decision']['media_type'] ?? null, 'Artwork provenance must record the selected media type.');
+    assertSameValue(true, $sourceLandscape['artwork_decision']['details_path_equality'] ?? null, 'Artwork provenance must record details-path equality.');
+    assertTrueValue(isset($sourceLandscape['artwork_decision']['winner_path_hash']), 'Artwork provenance must fingerprint the winner without persisting its path.');
+    assertTrueValue(
+        preg_match('/^[a-f0-9]{64}$/', $sourceLandscape['artwork_decision']['input_fingerprint'] ?? '') === 1,
+        'Artwork provenance must contain a non-empty SHA-256 fingerprint of normalized input.'
+    );
+    assertSameValue(
+        hash('sha256', json_encode([
+            'title' => 'backdrop quality',
+            'description' => 'a 2026 programme used to verify backdrop quality selection',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)),
+        $sourceLandscape['artwork_decision']['input_fingerprint'],
+        'Artwork provenance input fingerprint must be stable for normalized title and description.'
+    );
+    $serializedSourceDecision = json_encode($sourceLandscape['artwork_decision'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    assertTrueValue(
+        ! str_contains($serializedSourceDecision, 'provider.invalid')
+            && ! str_contains($serializedSourceDecision, $sourceLandscape['desc']),
+        'Artwork provenance must not serialize the provider host or raw programme description.'
+    );
+    $branchBEvidence = [
+        'canonical_details_preferred' => 1,
+        'source_primary_lookup_evaluated' => 1,
+        'reason_codes' => ['tmdb_details_backdrop_preferred'],
+    ];
+
     $languagePriority = $selectImages->invoke($plugin, [
         'posters' => [
             ['file_path' => '/english.jpg', 'iso_639_1' => 'en', 'vote_average' => 10.0],
@@ -1243,6 +1352,7 @@ namespace Tests {
     echo json_encode([
         'first_last_boundary_parity' => $benchmarkParity,
         'artwork_quality_evidence' => $artworkQualityEvidence,
+        'branch_b_artwork_evidence' => $branchBEvidence,
         'fixture_egress' => count(Http::$calls),
     ], JSON_THROW_ON_ERROR)."\n";
 }
