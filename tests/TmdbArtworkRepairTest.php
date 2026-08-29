@@ -174,6 +174,12 @@ namespace App\Services {
                     'original_name' => $name,
                     'first_air_date' => '',
                 ],
+                'rote-rosen' => [
+                    'tmdb_id' => 27181,
+                    'name' => 'Rote Rosen',
+                    'original_name' => 'Rote Rosen',
+                    'first_air_date' => '2006-11-06',
+                ],
                 default => null,
             };
         }
@@ -224,6 +230,12 @@ namespace App\Services {
                 ],
                 'identity-tv-b' => [
                     'backdrop_url' => 'https://fixture.invalid/identity-tv-b.jpg',
+                ],
+                'rote-rosen' => [
+                    'overview' => 'Eine Telenovela aus Lueneburg.',
+                    'poster_url' => 'https://image.tmdb.org/t/p/w500/rote-rosen-poster.jpg',
+                    'backdrop_url' => 'https://image.tmdb.org/t/p/original/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg',
+                    'genres' => 'Soap, Drama',
                 ],
                 default => null,
             };
@@ -439,6 +451,9 @@ namespace Tests {
         ?array &$seasonCache = null,
         ?array &$imagesCache = null,
         bool $enrichEpisodeDetails = false,
+        bool $overwrite = false,
+        bool $mapGenresToEpgCategories = false,
+        bool $mapGenresToKodiGuideGenres = false,
     ): array
     {
         $seasonCache ??= [];
@@ -448,13 +463,13 @@ namespace Tests {
             &$programme,
             $tmdb,
             &$cache,
-            false,
+            $overwrite,
             true,
             true,
             true,
             true,
-            false,
-            false,
+            $mapGenresToEpgCategories,
+            $mapGenresToKodiGuideGenres,
             false,
             $enrichEpisodeDetails,
             &$seasonCache,
@@ -944,6 +959,116 @@ namespace Tests {
         $titleCard['images'] ?? [],
         fn (array $image): bool => ($image['type'] ?? null) === 'backdrop'
     )), 'Rejected title-card metadata must not be serialized as a programme backdrop.');
+
+    $roteRosenImages = [
+        'posters' => [[
+            'file_path' => '/rote-rosen-poster.jpg',
+            'iso_639_1' => 'de',
+            'vote_count' => 1,
+            'vote_average' => 5.0,
+            'aspect_ratio' => 0.667,
+            'width' => 1000,
+            'height' => 1500,
+        ]],
+        'backdrops' => [[
+            'file_path' => '/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg',
+            'iso_639_1' => null,
+            'vote_count' => 0,
+            'vote_average' => 0.0,
+            'aspect_ratio' => 1.778,
+            'width' => 1920,
+            'height' => 1080,
+        ]],
+        'logos' => [],
+    ];
+    $roteRosenNoOverwrite = [
+        'title' => 'Rote Rosen',
+        'desc' => 'Eine Telenovela aus Lueneburg.',
+        'category' => 'Series',
+    ];
+    $roteRosenNoOverwriteCache = [];
+    $roteRosenNoOverwriteImagesCache = [];
+    Http::$responses[] = new FakeHttpResponse(true, $roteRosenImages);
+    enrich(
+        $plugin,
+        $method,
+        $roteRosenNoOverwrite,
+        new TmdbService('rote-rosen'),
+        $roteRosenNoOverwriteCache,
+        [],
+        $roteRosenNoOverwriteSeasonCache,
+        $roteRosenNoOverwriteImagesCache,
+        false,
+        false,
+    );
+    assertSameValue(null, $roteRosenNoOverwrite['icon'] ?? null, 'Rote Rosen must retain zero-vote abstention when overwrite is disabled.');
+
+    $roteRosenOverwrite = [
+        'title' => 'Rote Rosen',
+        'desc' => 'Eine Telenovela aus Lueneburg.',
+        'category' => 'Series',
+    ];
+    $roteRosenOverwriteCache = [];
+    $roteRosenOverwriteImagesCache = [];
+    Http::$responses[] = new FakeHttpResponse(true, $roteRosenImages);
+    enrich(
+        $plugin,
+        $method,
+        $roteRosenOverwrite,
+        new TmdbService('rote-rosen'),
+        $roteRosenOverwriteCache,
+        [],
+        $roteRosenOverwriteSeasonCache,
+        $roteRosenOverwriteImagesCache,
+        false,
+        true,
+    );
+    $roteRosenBackdrop = 'https://image.tmdb.org/t/p/original/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg';
+    assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['icon'] ?? null, 'Overwrite mode should select the exact validated Rote Rosen details backdrop.');
+    assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['images'][0]['url'] ?? null, 'The unrated Rote Rosen primary must be the first image.');
+    assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['images'][array_key_last($roteRosenOverwrite['images'])]['url'] ?? null, 'The unrated Rote Rosen primary must also be the last image.');
+    assertSameValue('tmdb', $roteRosenOverwrite['images'][0]['source'] ?? null, 'The unrated fallback must retain TMDB provenance.');
+    assertSameValue('programme', $roteRosenOverwrite['images'][0]['scope'] ?? null, 'The unrated fallback must retain programme scope.');
+    assertSameValue('tmdb_details_unrated_fallback', $roteRosenOverwrite['images'][0]['artwork_quality'] ?? null, 'The unrated fallback must have distinct quality provenance.');
+    assertTrueValue(in_array('poster', array_column($roteRosenOverwrite['images'], 'type'), true), 'The Rote Rosen poster must remain secondary artwork.');
+
+    $roteRosenCategory = [
+        'title' => 'Rote Rosen',
+        'desc' => 'Eine Telenovela aus Lueneburg.',
+        'category' => ['Soap', 'Drama'],
+    ];
+    $roteRosenCategoryCache = [];
+    $roteRosenCategoryImagesCache = [];
+    $categoryWarnings = [];
+    Http::$responses[] = new FakeHttpResponse(true, $roteRosenImages);
+    set_error_handler(function (int $severity, string $message) use (&$categoryWarnings): bool {
+        if (str_contains($message, 'Array to string conversion')) {
+            $categoryWarnings[] = $message;
+
+            return true;
+        }
+
+        return false;
+    });
+    try {
+        enrich(
+            $plugin,
+            $method,
+            $roteRosenCategory,
+            new TmdbService('rote-rosen'),
+            $roteRosenCategoryCache,
+            [],
+            $roteRosenCategorySeasonCache,
+            $roteRosenCategoryImagesCache,
+            false,
+            true,
+            true,
+        );
+    } finally {
+        restore_error_handler();
+    }
+    assertSameValue([], $categoryWarnings, 'Provider category arrays must not trigger array-to-string warnings.');
+    assertSameValue('Series', $roteRosenCategory['category'] ?? null, 'Validated TV data with Emby mapping must compact provider category arrays to Series.');
 
     $sceneControl = [
         'title' => 'Backdrop Quality',

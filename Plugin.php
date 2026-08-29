@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.25-v1.13.9';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.25-v1.13.9-emby-output';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -626,6 +626,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $combinedStats = [];
         $notices = [];
+        $modifiedEpgIds = [];
 
         foreach ($epgIds as $epgId) {
             $result = $this->doEnrich($epgId, $playlistIds, $context);
@@ -640,6 +641,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 continue;
             }
 
+            if (($result->data['programmes_updated'] ?? 0) > 0) {
+                $modifiedEpgIds[] = (int) $epgId;
+            }
+
             foreach ($result->data as $key => $value) {
                 if (is_int($value)) {
                     $combinedStats[$key] = ($combinedStats[$key] ?? 0) + $value;
@@ -648,6 +653,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
             }
         }
+
+        $this->invalidatePlaylistEpgCaches($playlistIds, array_values(array_unique($modifiedEpgIds)), $context);
 
         $notice = implode(' ', array_unique($notices));
         if (empty($combinedStats)) {
@@ -715,6 +722,39 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'intval',
             array_filter($playlistIds, fn ($id): bool => is_numeric($id) && (int) $id > 0),
         )));
+    }
+
+    /**
+     * Invalidate generated XMLTV output only for selected playlists that use a modified EPG.
+     *
+     * @param  array<int>  $playlistIds
+     * @param  array<int>  $modifiedEpgIds
+     */
+    private function invalidatePlaylistEpgCaches(
+        array $playlistIds,
+        array $modifiedEpgIds,
+        PluginExecutionContext $context,
+    ): void {
+        if ($modifiedEpgIds === [] || ($context->dryRun ?? false)) {
+            return;
+        }
+
+        $affectedPlaylistIds = Channel::query()
+            ->whereIn('playlist_id', $playlistIds)
+            ->where('enabled', true)
+            ->whereNotNull('epg_channel_id')
+            ->whereHas('epgChannel', fn ($query) => $query->whereIn('epg_id', $modifiedEpgIds))
+            ->distinct()
+            ->pluck('playlist_id')
+            ->all();
+
+        if ($affectedPlaylistIds === []) {
+            return;
+        }
+
+        foreach (Playlist::query()->whereKey($affectedPlaylistIds)->get() as $playlist) {
+            EpgCacheService::clearPlaylistEpgCacheFile($playlist);
+        }
     }
 
     /**
@@ -1248,18 +1288,32 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Only write the file back if at least one programme was enriched
         if ($result['modified']) {
             $tempPath = $fullPath.'.enriching';
+            $persisted = false;
             if (($handle = fopen($tempPath, 'w')) !== false) {
+                $writeSucceeded = true;
                 foreach ($enrichedLines as $line) {
-                    fwrite($handle, $line."\n");
+                    $contents = $line."\n";
+                    if (fwrite($handle, $contents) !== strlen($contents)) {
+                        $writeSucceeded = false;
+                        break;
+                    }
                 }
-                fclose($handle);
+                $writeSucceeded = fclose($handle) && $writeSucceeded;
 
                 // The original file or directory may have been removed by a cache refresh
-                if (is_dir(dirname($fullPath))) {
-                    rename($tempPath, $fullPath);
-                } else {
+                if ($writeSucceeded && is_dir(dirname($fullPath))) {
+                    $persisted = rename($tempPath, $fullPath);
+                }
+                if (! $persisted) {
                     @unlink($tempPath);
                 }
+            }
+            if (! $persisted) {
+                $result['updated'] = 0;
+                $result['posters'] = 0;
+                $result['categories'] = 0;
+                $result['descriptions'] = 0;
+                $result['modified'] = false;
             }
         }
 
@@ -1305,9 +1359,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Check if programme already has all data we'd enrich
         // (e.g. from Schedules Direct / Gracenote during EPG cache generation)
-        $hasCategory = ! empty($programme['category']);
+        $categoryValue = $programme['category'] ?? '';
+        if (is_array($categoryValue)) {
+            $existingCategory = implode(', ', array_values(array_filter(array_map(
+                fn ($category): string => is_scalar($category) ? trim((string) $category) : '',
+                $categoryValue,
+            ), fn (string $category): bool => $category !== '')));
+        } else {
+            $existingCategory = is_scalar($categoryValue) ? trim((string) $categoryValue) : '';
+        }
+        $hasCategory = $existingCategory !== '';
         $hasDesc = ! empty($programme['desc']);
-        $existingCategory = trim((string) ($programme['category'] ?? ''));
         $trustedLandscapeIcon = $this->hasTrustedLandscapeIcon($programme);
 
         $wantsArtwork = $enrichPosters || $enrichBackdrops;
@@ -1527,7 +1589,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         $imageSet['backdrops'] ?? [],
                         fn (array $image): bool => ! empty($image['file_path'])
                     ));
-                    $candidates = $this->selectImageSet($imageSet, $creds['language']);
+                    $candidates = $this->selectImageSet(
+                        $imageSet,
+                        $creds['language'],
+                        $overwrite ? ($tmdbData['backdrop_url'] ?? null) : null,
+                    );
                     $selectedBackdrop = null;
                     foreach ($candidates as $candidate) {
                         if (($candidate['type'] ?? null) === 'backdrop') {
@@ -1665,9 +1731,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         } elseif (($mapGenresToKodiGuideGenres || $mapGenresToEpgCategories) && $hasCategory) {
             // Map existing category even if not enriching from TMDB.
             $mapped = $mapGenresToKodiGuideGenres
-                ? $this->mapToKodiGuideGenre($programme['category'], $mediaType)
-                : $this->mapToEpgCategory($programme['category'], $mediaType);
-            if ($mapped !== $programme['category']) {
+                ? $this->mapToKodiGuideGenre($existingCategory, $mediaType)
+                : $this->mapToEpgCategory($existingCategory, $mediaType);
+            if ($mapped !== $existingCategory || ! is_string($categoryValue)) {
                 $programme['category'] = $mapped;
                 $result['category'] = true;
                 $result['changed'] = true;
@@ -2046,7 +2112,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      * @param  array{posters: array, backdrops: array, logos: array}  $images
      * @return array<int, array{url: string, type: string, width: int, height: int, orient: string, size: int}>
      */
-    private function selectImageSet(array $images, string $userLang): array
+    private function selectImageSet(array $images, string $userLang, ?string $detailsBackdropUrl = null): array
     {
         $shortLang = strtolower(explode('-', $userLang)[0] ?? 'en');
         $out = [];
@@ -2083,24 +2149,40 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $images['backdrops'] ?? [],
             fn (array $backdrop): bool => $this->hasBackdropVoteEvidence($backdrop)
         ));
+        $detailsBackdropPath = $detailsBackdropUrl !== null
+            ? $this->tmdbImageFilePath($detailsBackdropUrl)
+            : null;
+        if ($backdrops === [] && $detailsBackdropPath !== null) {
+            foreach ($images['backdrops'] ?? [] as $backdrop) {
+                if (($backdrop['file_path'] ?? null) === $detailsBackdropPath
+                    && $this->isGenuineLandscapeBackdrop($backdrop)) {
+                    $backdrop['_details_fallback'] = true;
+                    $backdrops[] = $backdrop;
+                    break;
+                }
+            }
+        }
         $langPrioBack = [null, $shortLang, 'en'];
         usort($backdrops, fn ($a, $b) => $sortBy($a, $b, $langPrioBack));
         foreach (array_slice($backdrops, 0, 2) as $b) {
             if (empty($b['file_path'])) {
                 continue;
             }
+            $isDetailsFallback = ($b['_details_fallback'] ?? false) === true;
             $out[] = [
-                'url' => 'https://image.tmdb.org/t/p/w1280'.$b['file_path'],
+                'url' => $isDetailsFallback ? $detailsBackdropUrl : 'https://image.tmdb.org/t/p/w1280'.$b['file_path'],
                 'type' => 'backdrop',
-                'width' => 1280,
-                'height' => (int) round(1280 / max($b['aspect_ratio'] ?? 1.778, 0.1)),
+                'width' => $isDetailsFallback ? (int) $b['width'] : 1280,
+                'height' => $isDetailsFallback
+                    ? (int) $b['height']
+                    : (int) round(1280 / max($b['aspect_ratio'] ?? 1.778, 0.1)),
                 'orient' => 'L',
                 'size' => 1,
                 'source' => 'tmdb',
                 'scope' => 'programme',
                 'language' => $b['iso_639_1'] ?? null,
                 'language_rank' => $rank($b, $langPrioBack),
-                'artwork_quality' => 'tmdb_vote_evidence',
+                'artwork_quality' => $isDetailsFallback ? 'tmdb_details_unrated_fallback' : 'tmdb_vote_evidence',
             ];
         }
 
@@ -2163,6 +2245,27 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && (float) $backdrop['vote_average'] > 0;
     }
 
+    private function tmdbImageFilePath(string $url): ?string
+    {
+        $parts = parse_url($url);
+        if (! is_array($parts)
+            || strtolower((string) ($parts['host'] ?? '')) !== 'image.tmdb.org'
+            || ! preg_match('#^/t/p/[^/]+(/.+)$#', (string) ($parts['path'] ?? ''), $matches)) {
+            return null;
+        }
+
+        return $matches[1];
+    }
+
+    private function isGenuineLandscapeBackdrop(array $backdrop): bool
+    {
+        return is_numeric($backdrop['width'] ?? null)
+            && is_numeric($backdrop['height'] ?? null)
+            && (float) $backdrop['width'] > 0
+            && (float) $backdrop['height'] > 0
+            && (float) $backdrop['width'] > (float) $backdrop['height'];
+    }
+
     private function hasTrustedLandscapeIcon(array $programme): bool
     {
         $icon = trim((string) ($programme['icon'] ?? ''));
@@ -2215,7 +2318,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Legacy TMDB backdrops predate the bounded quality decision and must be
         // re-evaluated instead of preventing the new logic from running.
         if ($source === 'tmdb' && $type === 'backdrop'
-            && ! in_array($image['artwork_quality'] ?? null, ['tmdb_vote_evidence', 'details_fallback'], true)) {
+            && ! in_array($image['artwork_quality'] ?? null, ['tmdb_vote_evidence', 'tmdb_details_unrated_fallback', 'details_fallback'], true)) {
             return false;
         }
 

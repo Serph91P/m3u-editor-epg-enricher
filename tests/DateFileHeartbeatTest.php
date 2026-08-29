@@ -260,11 +260,41 @@ namespace Tests {
     assertSameValue($smallFile, file_get_contents($tempDir.'/small.jsonl'), 'Small-file output should remain unchanged.');
     assertSameValue(1, $smallResult['processed'], 'Small-file processing counts should remain unchanged.');
 
+    $persistenceFailureFile = json_encode([
+        'channel' => 'target',
+        'programme' => ['title' => 'Wimbledon'],
+    ], JSON_UNESCAPED_SLASHES)."\n";
+    file_put_contents($tempDir.'/persistence-failure.jsonl', $persistenceFailureFile);
+    mkdir($tempDir.'/persistence-failure.jsonl.enriching');
+    $persistenceFailureContext = new PluginExecutionContext();
+    $persistenceFailureTimes = [0.0, 1.0];
+    set_error_handler(static fn (): bool => true);
+    try {
+        $persistenceFailureResult = runDateFile(
+            $plugin,
+            $method,
+            'persistence-failure.jsonl',
+            ['target'],
+            $persistenceFailureContext,
+            function () use (&$persistenceFailureTimes): float {
+                return array_shift($persistenceFailureTimes);
+            },
+            true,
+        );
+    } finally {
+        restore_error_handler();
+    }
+    assertSameValue(false, $persistenceFailureResult['modified'], 'A failed temporary write must not report a modified date file.');
+    assertSameValue(0, $persistenceFailureResult['updated'], 'A failed temporary write must not count an unpersisted programme update.');
+    assertSameValue($persistenceFailureFile, file_get_contents($tempDir.'/persistence-failure.jsonl'), 'A failed temporary write must preserve the original date file.');
+
     unlink($tempDir.'/long.jsonl');
     unlink($tempDir.'/untargeted.jsonl');
     unlink($tempDir.'/large-channel-set.jsonl');
     unlink($tempDir.'/cancel.jsonl');
     unlink($tempDir.'/small.jsonl');
+    unlink($tempDir.'/persistence-failure.jsonl');
+    rmdir($tempDir.'/persistence-failure.jsonl.enriching');
     rmdir($tempDir);
 
     echo "Date-file heartbeat tests passed.\n";
