@@ -105,9 +105,13 @@ namespace App\Services {
     {
         public int $tvSearches = 0;
         public int $movieSearches = 0;
+        public int $tvDetailsRequests = 0;
+        public int $movieDetailsRequests = 0;
+        public int $tvAlternativeRequests = 0;
+        public int $movieAlternativeRequests = 0;
         public int $seasonRequests = 0;
 
-        public function __construct(private string $scenario) {}
+        public function __construct(protected string $scenario) {}
 
         public function searchTvSeries(string $name, ?int $year = null): ?array
         {
@@ -186,6 +190,8 @@ namespace App\Services {
 
         public function getTvSeriesDetails(int $tmdbId): ?array
         {
+            $this->tvDetailsRequests++;
+
             return match ($this->scenario) {
                 'long-walk' => [
                     'overview' => 'An unrelated reality competition.',
@@ -318,6 +324,8 @@ namespace App\Services {
 
         public function getMovieDetails(int $tmdbId): ?array
         {
+            $this->movieDetailsRequests++;
+
             return match ($this->scenario) {
                 'long-walk' => [
                     'overview' => 'In a deadly annual contest, young men must keep walking.',
@@ -377,11 +385,15 @@ namespace App\Services {
 
         public function getTvAlternativeTitles(int $tmdbId): array
         {
+            $this->tvAlternativeRequests++;
+
             return [];
         }
 
         public function getMovieAlternativeTitles(int $tmdbId): array
         {
+            $this->movieAlternativeRequests++;
+
             return match ($this->scenario) {
                 'long-walk' => [['title' => 'The Long Walk - Der Todesmarsch', 'iso_3166_1' => 'DE']],
                 'illuminati' => [['title' => 'Illuminati', 'iso_3166_1' => 'DE']],
@@ -412,12 +424,82 @@ namespace App\Services {
             };
         }
     }
+
+    class CandidateTmdbService extends TmdbService
+    {
+        public int $tvCandidateSearches = 0;
+        public int $movieCandidateSearches = 0;
+        public array $tvLimits = [];
+        public array $movieLimits = [];
+
+        public function __construct(
+            private array $tvCandidates = [],
+            private array $movieCandidates = [],
+            private array $tvDetails = [],
+            private array $movieDetails = [],
+            private bool $throwOnTvCandidates = false,
+            private bool $throwOnMovieCandidates = false,
+        ) {
+            parent::__construct('candidate-api');
+        }
+
+        public function searchTvSeriesCandidates(string $name, ?int $year = null, int $limit = 5): array
+        {
+            $this->tvCandidateSearches++;
+            $this->tvLimits[] = $limit;
+            if ($this->throwOnTvCandidates) {
+                throw new \RuntimeException('synthetic TV candidate failure');
+            }
+
+            return $this->tvCandidates;
+        }
+
+        public function searchMovieCandidates(string $title, ?int $year = null, int $limit = 5): array
+        {
+            $this->movieCandidateSearches++;
+            $this->movieLimits[] = $limit;
+            if ($this->throwOnMovieCandidates) {
+                throw new \RuntimeException('synthetic movie candidate failure');
+            }
+
+            return $this->movieCandidates;
+        }
+
+        public function getTvSeriesDetails(int $tmdbId): ?array
+        {
+            $this->tvDetailsRequests++;
+
+            return $this->tvDetails[$tmdbId] ?? null;
+        }
+
+        public function getMovieDetails(int $tmdbId): ?array
+        {
+            $this->movieDetailsRequests++;
+
+            return $this->movieDetails[$tmdbId] ?? null;
+        }
+
+        public function getTvAlternativeTitles(int $tmdbId): array
+        {
+            $this->tvAlternativeRequests++;
+
+            return [];
+        }
+
+        public function getMovieAlternativeTitles(int $tmdbId): array
+        {
+            $this->movieAlternativeRequests++;
+
+            return [];
+        }
+    }
 }
 
 namespace Tests {
     require_once __DIR__.'/../Plugin.php';
 
     use App\Services\TmdbService;
+    use App\Services\CandidateTmdbService;
     use App\Settings\GeneralSettings;
     use AppLocalPlugins\EpgEnricher\Plugin;
     use Illuminate\Support\Facades\FakeHttpResponse;
@@ -478,11 +560,172 @@ namespace Tests {
         ]);
     }
 
+    function validatedSearch(
+        Plugin $plugin,
+        ReflectionMethod $method,
+        TmdbService $tmdb,
+        string $title,
+        ?string $mediaType = null,
+        ?int $year = null,
+        string $description = '',
+    ): ?array {
+        return $method->invoke($plugin, $tmdb, $title, $mediaType, $year, $description);
+    }
+
     $GLOBALS['tmdbTestSettings'] = new GeneralSettings();
     $plugin = new Plugin();
     $reflection = new ReflectionClass($plugin);
     $method = $reflection->getMethod('enrichProgrammeFromTmdb');
     $method->setAccessible(true);
+    $searchMethod = $reflection->getMethod('searchTmdbWithValidation');
+    $searchMethod->setAccessible(true);
+
+    $rankedTmdb = new CandidateTmdbService(
+        tvCandidates: [
+            ['tmdb_id' => 601, 'name' => 'Unrelated Result', 'original_name' => 'Unrelated Result', 'first_air_date' => '2018-01-01', 'overview' => 'No shared evidence.'],
+            ['tmdb_id' => 602, 'name' => 'Ranked Target', 'original_name' => 'Ranked Target', 'first_air_date' => '2024-01-01', 'overview' => 'The correct synthetic result.'],
+        ],
+        movieCandidates: [
+            ['tmdb_id' => 603, 'title' => 'Different Film', 'original_title' => 'Different Film', 'release_date' => '2024-01-01', 'overview' => 'No shared evidence.'],
+        ],
+        tvDetails: [602 => ['backdrop_url' => 'https://fixture.invalid/ranked-target.jpg']],
+    );
+    $rankedWinner = validatedSearch($plugin, $searchMethod, $rankedTmdb, 'Ranked Target', null, 2024);
+    assertSameValue(602, $rankedWinner['tmdb_id'] ?? null, 'A correct candidate behind rank one should win global identity validation.');
+    assertSameValue([5], $rankedTmdb->tvLimits, 'TV candidate lookup should request at most five results.');
+    assertSameValue([5], $rankedTmdb->movieLimits, 'Movie candidate lookup should request at most five results.');
+    assertSameValue(1, $rankedTmdb->tvDetailsRequests, 'Only the validated TV winner should load details.');
+    assertSameValue(0, $rankedTmdb->movieDetailsRequests, 'Losing movie candidates must not load details.');
+    assertSameValue(0, $rankedTmdb->tvAlternativeRequests + $rankedTmdb->movieAlternativeRequests, 'Candidate validation must not load alternative titles.');
+
+    $globalTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 611,
+            'name' => 'Global Choice',
+            'original_name' => 'Global Choice',
+            'first_air_date' => '2010-01-01',
+            'overview' => 'An older synthetic series.',
+        ]],
+        movieCandidates: [[
+            'tmdb_id' => 612,
+            'title' => 'Global Choice',
+            'original_title' => 'Global Choice',
+            'release_date' => '2024-01-01',
+            'overview' => 'The matching synthetic movie.',
+        ]],
+        movieDetails: [612 => ['backdrop_url' => 'https://fixture.invalid/global-movie.jpg']],
+    );
+    $globalWinner = validatedSearch($plugin, $searchMethod, $globalTmdb, 'Global Choice', null, 2024);
+    assertSameValue([612, 'movie'], [$globalWinner['tmdb_id'] ?? null, $globalWinner['_media_type'] ?? null], 'TV and movie candidates should compete in one global ranking.');
+    assertSameValue([0, 1], [$globalTmdb->tvDetailsRequests, $globalTmdb->movieDetailsRequests], 'Only the global movie winner should load details.');
+
+    $forcedTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 621,
+            'name' => 'Forced Series',
+            'original_name' => 'Forced Series',
+            'first_air_date' => '2022-01-01',
+            'overview' => 'A synthetic episodic series.',
+        ]],
+        movieCandidates: [[
+            'tmdb_id' => 622,
+            'title' => 'Forced Series',
+            'original_title' => 'Forced Series',
+            'release_date' => '2022-01-01',
+            'overview' => 'A synthetic movie.',
+        ]],
+        tvDetails: [621 => []],
+    );
+    $forcedWinner = validatedSearch($plugin, $searchMethod, $forcedTmdb, 'Forced Series', 'tv', 2022);
+    assertSameValue(621, $forcedWinner['tmdb_id'] ?? null, 'Forced TV validation should select from TV candidates.');
+    assertSameValue([1, 0], [$forcedTmdb->tvCandidateSearches, $forcedTmdb->movieCandidateSearches], 'Forced TV validation must not request movie candidates.');
+
+    $thresholdTmdb = new CandidateTmdbService(tvCandidates: [[
+        'tmdb_id' => 631,
+        'name' => 'Unrelated Name',
+        'original_name' => 'Unrelated Name',
+        'first_air_date' => '2024-01-01',
+        'overview' => 'No useful evidence.',
+    ]]);
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $thresholdTmdb, 'Threshold Target', 'tv', 2024), 'A candidate below identity threshold should abstain.');
+    assertSameValue(0, $thresholdTmdb->tvDetailsRequests, 'Threshold misses must not load details.');
+
+    $marginTmdb = new CandidateTmdbService(tvCandidates: [
+        ['tmdb_id' => 641, 'name' => 'Margin Target', 'original_name' => 'Margin Target', 'first_air_date' => '2024-01-01', 'overview' => 'No overlap.'],
+        ['tmdb_id' => 642, 'name' => 'Margin Target', 'original_name' => 'Margin Target', 'first_air_date' => '2023-01-01', 'overview' => 'Shared alpha evidence.'],
+    ]);
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $marginTmdb, 'Margin Target', 'tv', 2024, 'Shared alpha description.'), 'An insufficient winner margin should abstain.');
+    assertSameValue(0, $marginTmdb->tvDetailsRequests, 'Margin abstention must not load candidate details.');
+
+    $malformedTmdb = new CandidateTmdbService(tvCandidates: [
+        ['tmdb_id' => 651, 'name' => 'Malformed Target', 'original_name' => 'Malformed Target', 'first_air_date' => '2024-01-01', 'overview' => 'Valid candidate.'],
+        ['name' => 'Missing Identity'],
+    ]);
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $malformedTmdb, 'Malformed Target', 'tv', 2024), 'A malformed raw candidate should make validation abstain safely.');
+    assertSameValue(0, $malformedTmdb->tvDetailsRequests, 'Malformed candidate abstention must not load details.');
+
+    $errorTmdb = new CandidateTmdbService(throwOnTvCandidates: true);
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $errorTmdb, 'Error Target', 'tv', 2024), 'A candidate-method error should abstain without escaping.');
+
+    $missingDetailsCandidates = [[
+        'tmdb_id' => 671,
+        'name' => 'Missing Details Identity',
+        'original_name' => 'Missing Details Identity',
+        'first_air_date' => '2024-01-01',
+        'overview' => 'A synthetic identity whose details are unavailable.',
+    ]];
+    $missingDetailsTmdb = new CandidateTmdbService(tvCandidates: $missingDetailsCandidates);
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $missingDetailsTmdb, 'Missing Details Identity', 'tv', 2024),
+        'A validated bounded-candidate winner with missing details should fail closed.'
+    );
+    assertSameValue(1, $missingDetailsTmdb->tvDetailsRequests, 'The validated winner should make exactly one details request.');
+
+    $missingDetailsEnrichmentTmdb = new CandidateTmdbService(tvCandidates: $missingDetailsCandidates);
+    $missingDetailsProgramme = ['title' => 'Missing Details Identity'];
+    $missingDetailsBefore = $missingDetailsProgramme;
+    $missingDetailsCache = [];
+    enrich($plugin, $method, $missingDetailsProgramme, $missingDetailsEnrichmentTmdb, $missingDetailsCache);
+    assertSameValue($missingDetailsBefore, $missingDetailsProgramme, 'Missing winner details should not modify programme data.');
+    assertSameValue([], $missingDetailsCache, 'Missing winner details should not write a TMDB cache entry.');
+    assertSameValue(1, $missingDetailsEnrichmentTmdb->tvDetailsRequests, 'Normal enrichment should request only the validated winner details.');
+
+    $legacyTmdb = new TmdbService('long-walk');
+    $legacyWinner = validatedSearch(
+        $plugin,
+        $searchMethod,
+        $legacyTmdb,
+        'The Long Walk',
+        null,
+        2025,
+        'Bei einem Todesmarsch muss eine Gruppe junger Männer immer weitergehen.',
+    );
+    assertSameValue([200, 'movie'], [$legacyWinner['tmdb_id'] ?? null, $legacyWinner['_media_type'] ?? null], 'An older host without candidate methods should retain one-result fallback selection.');
+
+    $abstentionTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 661,
+            'name' => 'Balanced Identity',
+            'original_name' => 'Balanced Identity',
+            'first_air_date' => '',
+            'overview' => 'A synthetic TV identity.',
+        ]],
+        movieCandidates: [[
+            'tmdb_id' => 662,
+            'title' => 'Balanced Identity',
+            'original_title' => 'Balanced Identity',
+            'release_date' => '',
+            'overview' => 'A synthetic movie identity.',
+        ]],
+    );
+    $abstentionProgramme = ['title' => 'Balanced Identity'];
+    $abstentionBefore = $abstentionProgramme;
+    $abstentionCache = [];
+    enrich($plugin, $method, $abstentionProgramme, $abstentionTmdb, $abstentionCache);
+    assertSameValue($abstentionBefore, $abstentionProgramme, 'Identity abstention should not modify programme data.');
+    assertSameValue([], $abstentionCache, 'Identity abstention should not write a TMDB cache entry.');
+    assertSameValue(0, $abstentionTmdb->tvDetailsRequests + $abstentionTmdb->movieDetailsRequests, 'A global tie must not load any details.');
 
     $longWalk = [
         'title' => 'The Long Walk - Der Todesmarsch',
@@ -578,7 +821,7 @@ namespace Tests {
     $weakBefore = $weakIlluminati;
     enrich($plugin, $method, $weakIlluminati, $illuminatiTmdb, $illuminatiCache);
     assertSameValue($weakBefore, $weakIlluminati, 'Alternative-title matches without description corroboration should fail closed.');
-    assertSameValue(2, count($illuminatiCache), 'Lookup cache should separate descriptions that affect identity confidence.');
+    assertSameValue(1, count($illuminatiCache), 'Identity abstention should not persist a cache entry.');
 
     $sourceCache = [];
     $sourceA = ['title' => 'Global Identity'];

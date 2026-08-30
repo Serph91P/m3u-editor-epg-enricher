@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.29-v1.14.0-deterministic-artwork';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.30-v1.14.0-top-n-identity';
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -1516,18 +1516,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $matchedViaBase = $tmdbData !== null;
             }
 
-            // Cache under full title key
-            $cache[$fullCacheKey] = $tmdbData;
-
-            // Preserve the evidence-specific base entry and separately record exact primary
-            // TV-series identities that are safe to reuse across strongly episodic titles.
-            if ($matchedViaBase && $baseCacheKey !== null) {
-                $cache[$baseCacheKey] = $tmdbData;
-            }
-            if ($matchedViaBase
-                && $seriesBaseCacheKey !== null
-                && $this->isReusableBaseSeriesMatch($tmdbData, $baseTitle)) {
-                $cache[$seriesBaseCacheKey] = $tmdbData;
+            if ($tmdbData !== null) {
+                // Preserve successful evidence-specific identities. Abstentions are retried
+                // because a transient candidate error must not become a durable cache miss.
+                $cache[$fullCacheKey] = $tmdbData;
+                if ($matchedViaBase && $baseCacheKey !== null) {
+                    $cache[$baseCacheKey] = $tmdbData;
+                }
+                if ($matchedViaBase
+                    && $seriesBaseCacheKey !== null
+                    && $this->isReusableBaseSeriesMatch($tmdbData, $baseTitle)) {
+                    $cache[$seriesBaseCacheKey] = $tmdbData;
+                }
             }
         }
 
@@ -2831,6 +2831,54 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $searchNorm = mb_strtolower(trim($searchTitle));
         $candidates = [];
 
+        if (method_exists($tmdb, 'searchTvSeriesCandidates')
+            && method_exists($tmdb, 'searchMovieCandidates')) {
+            try {
+                if ($forceMediaType !== 'movie') {
+                    $tvCandidates = array_slice($tmdb->searchTvSeriesCandidates($searchTitle, $year, 5), 0, 5);
+                    foreach ($tvCandidates as $candidate) {
+                        if (! $this->isValidRawTmdbCandidate($candidate, 'tv')) {
+                            return null;
+                        }
+                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'tv', $searchNorm, $year, $description, []);
+                    }
+                }
+
+                if ($forceMediaType !== 'tv') {
+                    $movieCandidates = array_slice($tmdb->searchMovieCandidates($searchTitle, $year, 5), 0, 5);
+                    foreach ($movieCandidates as $candidate) {
+                        if (! $this->isValidRawTmdbCandidate($candidate, 'movie')) {
+                            return null;
+                        }
+                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'movie', $searchNorm, $year, $description, []);
+                    }
+                }
+            } catch (\Throwable) {
+                return null;
+            }
+
+            $best = $this->selectTmdbIdentityWinner($candidates);
+            if ($best === null) {
+                return null;
+            }
+
+            try {
+                $details = $best['_media_type'] === 'tv'
+                    ? $tmdb->getTvSeriesDetails((int) $best['tmdb_id'])
+                    : $tmdb->getMovieDetails((int) $best['tmdb_id']);
+            } catch (\Throwable) {
+                return null;
+            }
+            if (! is_array($details)) {
+                return null;
+            }
+            $best = array_merge($best, $details);
+
+            unset($best['_identity_valid']);
+
+            return $best;
+        }
+
         if ($forceMediaType !== 'movie') {
             $tvResult = $tmdb->searchTvSeries($searchTitle, $year);
             if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
@@ -2855,6 +2903,42 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
+        $best = $this->selectTmdbIdentityWinner($candidates);
+        if ($best === null) {
+            return null;
+        }
+
+        unset($best['_identity_valid']);
+
+        return $best;
+    }
+
+    private function isValidRawTmdbCandidate(mixed $candidate, string $mediaType): bool
+    {
+        if (! is_array($candidate)
+            || ! is_numeric($candidate['tmdb_id'] ?? null)
+            || (int) $candidate['tmdb_id'] < 1) {
+            return false;
+        }
+
+        $requiredFields = $mediaType === 'tv'
+            ? ['name', 'original_name', 'first_air_date', 'overview']
+            : ['title', 'original_title', 'release_date', 'overview'];
+        foreach ($requiredFields as $field) {
+            if (! array_key_exists($field, $candidate)
+                || ($candidate[$field] !== null && ! is_scalar($candidate[$field]))) {
+                return false;
+            }
+        }
+
+        $titleFields = $mediaType === 'tv' ? ['name', 'original_name'] : ['title', 'original_title'];
+
+        return trim((string) $candidate[$titleFields[0]]) !== ''
+            || trim((string) $candidate[$titleFields[1]]) !== '';
+    }
+
+    private function selectTmdbIdentityWinner(array $candidates): ?array
+    {
         usort($candidates, fn (array $a, array $b): int => $b['_identity_score'] <=> $a['_identity_score']);
         $best = $candidates[0] ?? null;
         if ($best === null || $best['_identity_score'] < 76.0 || ! $best['_identity_valid']) {
@@ -2863,8 +2947,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (isset($candidates[1]) && ($best['_identity_score'] - $candidates[1]['_identity_score']) < 8.0) {
             return null;
         }
-
-        unset($best['_identity_valid']);
 
         return $best;
     }
