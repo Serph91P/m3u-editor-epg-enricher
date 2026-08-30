@@ -664,6 +664,46 @@ namespace Tests {
     assertSameValue(null, validatedSearch($plugin, $searchMethod, $malformedTmdb, 'Malformed Target', 'tv', 2024), 'A malformed raw candidate should make validation abstain safely.');
     assertSameValue(0, $malformedTmdb->tvDetailsRequests, 'Malformed candidate abstention must not load details.');
 
+    $invalidRawCandidateIds = [
+        'positive integral float' => 123.0,
+        'fractional float' => 1.5,
+        'fractional numeric string' => '1.5',
+        'exponent numeric string' => '1e3',
+        'integer numeric string' => '123',
+        'null' => null,
+        'true' => true,
+        'false' => false,
+        'array' => [],
+        'object' => (object) ['id' => 123],
+        'zero' => 0,
+        'negative integer' => -123,
+    ];
+    foreach ($invalidRawCandidateIds as $label => $invalidId) {
+        $invalidIdTmdb = new CandidateTmdbService(
+            tvCandidates: [[
+                'tmdb_id' => $invalidId,
+                'name' => 'Invalid Identity',
+                'original_name' => 'Invalid Identity',
+                'first_air_date' => '2024-01-01',
+                'overview' => 'A candidate with an invalid raw identity.',
+            ]],
+            tvDetails: [
+                1 => ['backdrop_url' => 'https://fixture.invalid/invalid-1.jpg'],
+                123 => ['backdrop_url' => 'https://fixture.invalid/invalid-123.jpg'],
+                1000 => ['backdrop_url' => 'https://fixture.invalid/invalid-1000.jpg'],
+            ],
+        );
+        $invalidIdProgramme = ['title' => 'Invalid Identity', 'episode_num' => '0.0'];
+        $invalidIdBefore = $invalidIdProgramme;
+        $invalidIdCache = [];
+
+        enrich($plugin, $method, $invalidIdProgramme, $invalidIdTmdb, $invalidIdCache);
+
+        assertSameValue(0, $invalidIdTmdb->tvDetailsRequests, ucfirst($label).' raw candidate ID must not trigger a details request.');
+        assertSameValue($invalidIdBefore, $invalidIdProgramme, ucfirst($label).' raw candidate ID must not modify programme data.');
+        assertSameValue([], $invalidIdCache, ucfirst($label).' raw candidate ID must not write a TMDB cache entry.');
+    }
+
     $errorTmdb = new CandidateTmdbService(throwOnTvCandidates: true);
     assertSameValue(null, validatedSearch($plugin, $searchMethod, $errorTmdb, 'Error Target', 'tv', 2024), 'A candidate-method error should abstain without escaping.');
 

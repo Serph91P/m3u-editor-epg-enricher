@@ -2916,8 +2916,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     private function isValidRawTmdbCandidate(mixed $candidate, string $mediaType): bool
     {
         if (! is_array($candidate)
-            || ! is_numeric($candidate['tmdb_id'] ?? null)
-            || (int) $candidate['tmdb_id'] < 1) {
+            || ! is_int($candidate['tmdb_id'] ?? null)
+            || $candidate['tmdb_id'] <= 0) {
             return false;
         }
 
