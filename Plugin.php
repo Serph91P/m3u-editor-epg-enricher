@@ -43,13 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.18.0-persisted-cache-guard';
-
-    /** @var array<string, array{media_type: 'tv'|'movie', tmdb_id: int}> */
-    private const array REVIEWED_TMDB_IDENTITIES = [
-        'unter uns classics' => ['media_type' => 'tv', 'tmdb_id' => 17892],
-        'cerro kishtwar eine eiskalte geschichte' => ['media_type' => 'movie', 'tmdb_id' => 717948],
-    ];
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.19.0-global-identity-matching';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1497,29 +1491,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may
         // reuse a separately validated, exact primary TV-series match across episode titles.
-        $reviewedIdentity = $this->reviewedTmdbIdentityForTitle($title)
-            ?? $this->reviewedTmdbIdentityForEpisodeTitle($title, $baseTitle);
         $this->removeInvalidTmdbCacheEntries($cache, [
             $fullCacheKey,
             $baseCacheKey,
             $seriesBaseCacheKey,
         ]);
-        if ($reviewedIdentity !== null) {
-            $matchedViaBase = false;
-            if (array_key_exists($fullCacheKey, $cache)
-                && $this->matchesReviewedTmdbIdentity($cache[$fullCacheKey], $reviewedIdentity)) {
-                $result['cache_hit'] = true;
-                $tmdbData = $cache[$fullCacheKey];
-            } else {
-                $result['lookup'] = true;
-                $tmdbData = $this->loadReviewedTmdbIdentity($tmdb, $reviewedIdentity);
-                if ($tmdbData === null) {
-                    return $result;
-                }
-
-                $cache[$fullCacheKey] = $tmdbData;
-            }
-        } elseif (isset($cache[$fullCacheKey])) {
+        if (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
         } elseif ($baseCacheKey !== null && isset($cache[$baseCacheKey])) {
@@ -2822,8 +2799,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $year = (int) end($yearMatches[1]);
         }
 
-        // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
+        // Strip trailing episode markers and generic rerun-edition labels before the
+        // base-title fallback. The full title is still searched first, so a real TMDB
+        // title ending in "Classics" keeps precedence over the fallback variant.
         $cleaned = $this->stripRecognizedEpisodeTitleSuffix($title);
+        $cleaned = preg_replace('/\s+Classics?\s*$/iu', '', $cleaned);
 
         // Strip trailing year markers like "(2010)" or " - 2009"
         $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
@@ -3116,67 +3096,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
 
         return trim(preg_replace('/\s+/', ' ', $normalized));
-    }
-
-    private function reviewedTmdbIdentityForTitle(string $title): ?array
-    {
-        $identity = self::REVIEWED_TMDB_IDENTITIES[$this->normalizeIdentityText($title)] ?? null;
-        if (! is_array($identity)
-            || ! in_array($identity['media_type'] ?? null, ['tv', 'movie'], true)
-            || ! is_int($identity['tmdb_id'] ?? null)
-            || $identity['tmdb_id'] <= 0) {
-            return null;
-        }
-
-        return $identity;
-    }
-
-    private function reviewedTmdbIdentityForEpisodeTitle(string $title, string $baseTitle): ?array
-    {
-        if ($this->stripRecognizedEpisodeTitleSuffix($title) === trim($title)) {
-            return null;
-        }
-
-        $identity = $this->reviewedTmdbIdentityForTitle($baseTitle);
-
-        return ($identity['media_type'] ?? null) === 'tv' ? $identity : null;
-    }
-
-    private function loadReviewedTmdbIdentity(TmdbService $tmdb, array $identity): ?array
-    {
-        $mediaType = $identity['media_type'];
-        $tmdbId = $identity['tmdb_id'];
-
-        try {
-            $details = $mediaType === 'tv'
-                ? $tmdb->getTvSeriesDetails($tmdbId)
-                : $tmdb->getMovieDetails($tmdbId);
-        } catch (\Throwable) {
-            return null;
-        }
-
-        if (! is_array($details)
-            || ! is_int($details['tmdb_id'] ?? null)
-            || $details['tmdb_id'] <= 0
-            || $details['tmdb_id'] !== $tmdbId) {
-            return null;
-        }
-
-        $tmdbData = array_merge($details, ['_media_type' => $mediaType]);
-
-        return $this->hasValidTmdbDetailsShape($tmdbData, $mediaType)
-            ? $tmdbData
-            : null;
-    }
-
-    private function matchesReviewedTmdbIdentity(mixed $tmdbData, array $identity): bool
-    {
-        return is_array($tmdbData)
-            && ($tmdbData['_media_type'] ?? null) === $identity['media_type']
-            && is_int($tmdbData['tmdb_id'] ?? null)
-            && $tmdbData['tmdb_id'] > 0
-            && $tmdbData['tmdb_id'] === $identity['tmdb_id']
-            && $this->hasValidTmdbDetailsShape($tmdbData, $identity['media_type']);
     }
 
     private function hasValidTmdbDetailsShape(array $tmdbData, string $mediaType): bool
