@@ -2799,11 +2799,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $year = (int) end($yearMatches[1]);
         }
 
-        // Strip trailing episode markers and generic rerun-edition labels before the
-        // base-title fallback. The full title is still searched first, so a real TMDB
-        // title ending in "Classics" keeps precedence over the fallback variant.
-        $cleaned = $this->stripRecognizedEpisodeTitleSuffix($title);
-        $cleaned = preg_replace('/\s+Classics?\s*$/iu', '', $cleaned);
+        // Strip a generic rerun-edition label only when the title also has a
+        // recognized episode suffix. This keeps the fallback global for episodic
+        // guide rows without shortening unrelated plain titles ending in Classics.
+        $trimmedTitle = trim($title);
+        $cleaned = $this->stripRecognizedEpisodeTitleSuffix($trimmedTitle);
+        $hasEpisodeSuffix = $cleaned !== $trimmedTitle
+            && ! preg_match('/\((?:19|20)\d{2}\)\s*$/', $trimmedTitle);
+        if ($hasEpisodeSuffix) {
+            $cleaned = preg_replace('/\s+Classics?\s*$/iu', '', $cleaned);
+        }
 
         // Strip trailing year markers like "(2010)" or " - 2009"
         $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
