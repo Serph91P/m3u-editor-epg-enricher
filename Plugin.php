@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.20.0-global-compound-identity';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.13.11';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
