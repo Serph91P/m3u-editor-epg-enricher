@@ -43,13 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.18.0-persisted-cache-guard';
-
-    /** @var array<string, array{media_type: 'tv'|'movie', tmdb_id: int}> */
-    private const array REVIEWED_TMDB_IDENTITIES = [
-        'unter uns classics' => ['media_type' => 'tv', 'tmdb_id' => 17892],
-        'cerro kishtwar eine eiskalte geschichte' => ['media_type' => 'movie', 'tmdb_id' => 717948],
-    ];
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.20.0-global-compound-identity';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1497,29 +1491,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may
         // reuse a separately validated, exact primary TV-series match across episode titles.
-        $reviewedIdentity = $this->reviewedTmdbIdentityForTitle($title)
-            ?? $this->reviewedTmdbIdentityForEpisodeTitle($title, $baseTitle);
         $this->removeInvalidTmdbCacheEntries($cache, [
             $fullCacheKey,
             $baseCacheKey,
             $seriesBaseCacheKey,
         ]);
-        if ($reviewedIdentity !== null) {
-            $matchedViaBase = false;
-            if (array_key_exists($fullCacheKey, $cache)
-                && $this->matchesReviewedTmdbIdentity($cache[$fullCacheKey], $reviewedIdentity)) {
-                $result['cache_hit'] = true;
-                $tmdbData = $cache[$fullCacheKey];
-            } else {
-                $result['lookup'] = true;
-                $tmdbData = $this->loadReviewedTmdbIdentity($tmdb, $reviewedIdentity);
-                if ($tmdbData === null) {
-                    return $result;
-                }
-
-                $cache[$fullCacheKey] = $tmdbData;
-            }
-        } elseif (isset($cache[$fullCacheKey])) {
+        if (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
         } elseif ($baseCacheKey !== null && isset($cache[$baseCacheKey])) {
@@ -1537,11 +1514,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
-            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType, $year, $description);
+            $compoundIdentity = null;
+            $tmdbData = $this->searchTmdbWithValidation(
+                $tmdb,
+                $title,
+                $forcedMediaType,
+                $year,
+                $description,
+                $compoundIdentity,
+            );
             $matchedViaBase = false;
 
             if (! $tmdbData && $baseTitle !== $title) {
-                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType, $year, $description);
+                $unusedCompoundIdentity = null;
+                $tmdbData = $this->searchTmdbWithValidation(
+                    $tmdb,
+                    $baseTitle,
+                    $forcedMediaType,
+                    $year,
+                    $description,
+                    $unusedCompoundIdentity,
+                    $compoundIdentity,
+                );
                 $matchedViaBase = $tmdbData !== null;
             }
 
@@ -2822,8 +2816,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $year = (int) end($yearMatches[1]);
         }
 
-        // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
-        $cleaned = $this->stripRecognizedEpisodeTitleSuffix($title);
+        // Strip a generic rerun-edition label only when the title also has a
+        // recognized episode suffix. This keeps the fallback global for episodic
+        // guide rows without shortening unrelated plain titles ending in Classics.
+        $trimmedTitle = trim($title);
+        $cleaned = $this->stripRecognizedEpisodeTitleSuffix($trimmedTitle);
+        $hasEpisodeSuffix = $cleaned !== $trimmedTitle
+            && ! preg_match('/\((?:19|20)\d{2}\)\s*$/', $trimmedTitle);
+        if ($hasEpisodeSuffix) {
+            $cleaned = preg_replace('/\s+Classics?\s*$/iu', '', $cleaned);
+        }
 
         // Strip trailing year markers like "(2010)" or " - 2009"
         $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
@@ -2867,8 +2869,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?string $forceMediaType = null,
         ?int $year = null,
         string $description = '',
+        ?array &$provisionalCompoundIdentity = null,
+        ?array $requiredCompoundIdentity = null,
     ): ?array
     {
+        $provisionalCompoundIdentity = null;
         $searchNorm = mb_strtolower(trim($searchTitle));
         $candidates = [];
 
@@ -2899,7 +2904,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             $best = $this->selectTmdbIdentityWinner($candidates);
+            if ($requiredCompoundIdentity !== null) {
+                $best = $this->confirmedCompoundIdentityCandidate(
+                    $candidates,
+                    $searchTitle,
+                    $requiredCompoundIdentity,
+                );
+            }
             if ($best === null) {
+                $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
+
                 return null;
             }
 
@@ -2962,7 +2976,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $best = $this->selectTmdbIdentityWinner($candidates);
+        if ($requiredCompoundIdentity !== null) {
+            $best = $this->confirmedCompoundIdentityCandidate(
+                $candidates,
+                $searchTitle,
+                $requiredCompoundIdentity,
+            );
+        }
         if ($best === null) {
+            $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
+
             return null;
         }
 
@@ -2976,6 +2999,82 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $best['_runtime_trusted_legacy'] = true;
 
         return $best;
+    }
+
+    private function provisionalCompoundIdentity(array $candidates, string $searchTitle): ?array
+    {
+        if (count($candidates) !== 1) {
+            return null;
+        }
+
+        $candidate = $candidates[0];
+        $searchBase = $this->compoundIdentityBase($searchTitle);
+        if ($searchBase === null || ! $this->candidateHasCompoundBase($candidate, $searchBase)) {
+            return null;
+        }
+
+        return [
+            'tmdb_id' => $candidate['tmdb_id'],
+            'media_type' => $candidate['_media_type'],
+        ];
+    }
+
+    private function confirmedCompoundIdentityCandidate(
+        array $candidates,
+        string $searchTitle,
+        array $requiredIdentity,
+    ): ?array {
+        if (count($candidates) !== 1) {
+            return null;
+        }
+
+        $candidate = $candidates[0];
+        $searchBase = $this->normalizeIdentityText($searchTitle);
+        if (! $this->isSubstantialIdentityBase($searchBase)
+            || ($candidate['tmdb_id'] ?? null) !== ($requiredIdentity['tmdb_id'] ?? null)
+            || ($candidate['_media_type'] ?? null) !== ($requiredIdentity['media_type'] ?? null)
+            || ! $this->candidateHasCompoundBase($candidate, $searchBase)) {
+            return null;
+        }
+
+        $candidate['_identity_valid'] = true;
+        $candidate['_identity_score'] = 76.0;
+
+        return $candidate;
+    }
+
+    private function candidateHasCompoundBase(array $candidate, string $expectedBase): bool
+    {
+        $fields = ($candidate['_media_type'] ?? null) === 'tv'
+            ? ['name', 'original_name']
+            : ['title', 'original_title'];
+        foreach ($fields as $field) {
+            $title = $candidate[$field] ?? null;
+            if (is_string($title) && $this->compoundIdentityBase($title) === $expectedBase) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function compoundIdentityBase(string $title): ?string
+    {
+        $identity = $this->normalizeIdentityText($title);
+        $base = $this->normalizeIdentityText((string) ($this->extractBaseTitle($title)['title'] ?? ''));
+
+        return $base !== $identity && $this->isSubstantialIdentityBase($base)
+            ? $base
+            : null;
+    }
+
+    private function isSubstantialIdentityBase(string $base): bool
+    {
+        $tokens = preg_split('/\s+/', $base, -1, PREG_SPLIT_NO_EMPTY);
+
+        return is_array($tokens)
+            && count($tokens) >= 2
+            && mb_strlen(str_replace(' ', '', $base)) >= 10;
     }
 
     private function isValidRawTmdbCandidate(mixed $candidate, string $mediaType): bool
@@ -3116,67 +3215,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
 
         return trim(preg_replace('/\s+/', ' ', $normalized));
-    }
-
-    private function reviewedTmdbIdentityForTitle(string $title): ?array
-    {
-        $identity = self::REVIEWED_TMDB_IDENTITIES[$this->normalizeIdentityText($title)] ?? null;
-        if (! is_array($identity)
-            || ! in_array($identity['media_type'] ?? null, ['tv', 'movie'], true)
-            || ! is_int($identity['tmdb_id'] ?? null)
-            || $identity['tmdb_id'] <= 0) {
-            return null;
-        }
-
-        return $identity;
-    }
-
-    private function reviewedTmdbIdentityForEpisodeTitle(string $title, string $baseTitle): ?array
-    {
-        if ($this->stripRecognizedEpisodeTitleSuffix($title) === trim($title)) {
-            return null;
-        }
-
-        $identity = $this->reviewedTmdbIdentityForTitle($baseTitle);
-
-        return ($identity['media_type'] ?? null) === 'tv' ? $identity : null;
-    }
-
-    private function loadReviewedTmdbIdentity(TmdbService $tmdb, array $identity): ?array
-    {
-        $mediaType = $identity['media_type'];
-        $tmdbId = $identity['tmdb_id'];
-
-        try {
-            $details = $mediaType === 'tv'
-                ? $tmdb->getTvSeriesDetails($tmdbId)
-                : $tmdb->getMovieDetails($tmdbId);
-        } catch (\Throwable) {
-            return null;
-        }
-
-        if (! is_array($details)
-            || ! is_int($details['tmdb_id'] ?? null)
-            || $details['tmdb_id'] <= 0
-            || $details['tmdb_id'] !== $tmdbId) {
-            return null;
-        }
-
-        $tmdbData = array_merge($details, ['_media_type' => $mediaType]);
-
-        return $this->hasValidTmdbDetailsShape($tmdbData, $mediaType)
-            ? $tmdbData
-            : null;
-    }
-
-    private function matchesReviewedTmdbIdentity(mixed $tmdbData, array $identity): bool
-    {
-        return is_array($tmdbData)
-            && ($tmdbData['_media_type'] ?? null) === $identity['media_type']
-            && is_int($tmdbData['tmdb_id'] ?? null)
-            && $tmdbData['tmdb_id'] > 0
-            && $tmdbData['tmdb_id'] === $identity['tmdb_id']
-            && $this->hasValidTmdbDetailsShape($tmdbData, $identity['media_type']);
     }
 
     private function hasValidTmdbDetailsShape(array $tmdbData, string $mediaType): bool

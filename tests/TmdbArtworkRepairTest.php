@@ -431,6 +431,8 @@ namespace App\Services {
         public int $movieCandidateSearches = 0;
         public array $tvLimits = [];
         public array $movieLimits = [];
+        public array $tvQueries = [];
+        public array $movieQueries = [];
 
         public function __construct(
             private array $tvCandidates = [],
@@ -439,6 +441,8 @@ namespace App\Services {
             private array $movieDetails = [],
             private bool $throwOnTvCandidates = false,
             private bool $throwOnMovieCandidates = false,
+            private array $tvCandidatesByQuery = [],
+            private array $movieCandidatesByQuery = [],
         ) {
             parent::__construct('candidate-api');
         }
@@ -447,22 +451,28 @@ namespace App\Services {
         {
             $this->tvCandidateSearches++;
             $this->tvLimits[] = $limit;
+            $this->tvQueries[] = $name;
             if ($this->throwOnTvCandidates) {
                 throw new \RuntimeException('synthetic TV candidate failure');
             }
 
-            return $this->tvCandidates;
+            return array_key_exists($name, $this->tvCandidatesByQuery)
+                ? $this->tvCandidatesByQuery[$name]
+                : $this->tvCandidates;
         }
 
         public function searchMovieCandidates(string $title, ?int $year = null, int $limit = 5): array
         {
             $this->movieCandidateSearches++;
             $this->movieLimits[] = $limit;
+            $this->movieQueries[] = $title;
             if ($this->throwOnMovieCandidates) {
                 throw new \RuntimeException('synthetic movie candidate failure');
             }
 
-            return $this->movieCandidates;
+            return array_key_exists($title, $this->movieCandidatesByQuery)
+                ? $this->movieCandidatesByQuery[$title]
+                : $this->movieCandidates;
         }
 
         public function getTvSeriesDetails(int $tmdbId): ?array
@@ -494,54 +504,6 @@ namespace App\Services {
         }
     }
 
-    class ReviewedIdentityTmdbService extends TmdbService
-    {
-        public int $tvCandidateSearches = 0;
-        public int $movieCandidateSearches = 0;
-
-        public function __construct(
-            public mixed $tvDetails = null,
-            public mixed $movieDetails = null,
-            public array $tvCandidates = [],
-            public array $movieCandidates = [],
-        ) {
-            parent::__construct('reviewed-identity');
-        }
-
-        public function searchTvSeriesCandidates(string $name, ?int $year = null, int $limit = 5): array
-        {
-            $this->tvCandidateSearches++;
-
-            return $this->tvCandidates;
-        }
-
-        public function searchMovieCandidates(string $title, ?int $year = null, int $limit = 5): array
-        {
-            $this->movieCandidateSearches++;
-
-            return $this->movieCandidates;
-        }
-
-        public function getTvSeriesDetails(int $tmdbId): mixed
-        {
-            $this->tvDetailsRequests++;
-            if ($this->tvDetails instanceof \Throwable) {
-                throw $this->tvDetails;
-            }
-
-            return $this->tvDetails;
-        }
-
-        public function getMovieDetails(int $tmdbId): mixed
-        {
-            $this->movieDetailsRequests++;
-            if ($this->movieDetails instanceof \Throwable) {
-                throw $this->movieDetails;
-            }
-
-            return $this->movieDetails;
-        }
-    }
 }
 
 namespace Tests {
@@ -549,7 +511,6 @@ namespace Tests {
 
     use App\Services\TmdbService;
     use App\Services\CandidateTmdbService;
-    use App\Services\ReviewedIdentityTmdbService;
     use App\Settings\GeneralSettings;
     use AppLocalPlugins\EpgEnricher\Plugin;
     use Illuminate\Support\Facades\FakeHttpResponse;
@@ -688,139 +649,216 @@ namespace Tests {
     $sanitizeTmdbCacheMethod = $reflection->getMethod('sanitizeTmdbCache');
     $sanitizeTmdbCacheMethod->setAccessible(true);
 
-    $reviewedTvDetails = normalizedTvDetailsFixture(
-        17892,
-        'Unter uns',
-        'A reviewed TV identity.',
-        'https://image.tmdb.org/t/p/w500/unter-uns-poster.jpg',
-        'https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg',
+    $genericClassicDetails = normalizedTvDetailsFixture(
+        701,
+        'Beacon Vale',
+        'A synthetic series used to verify generic edition-title matching.',
+        'https://image.tmdb.org/t/p/w500/beacon-vale-poster.jpg',
+        'https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg',
     );
-    $reviewedTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
-    $reviewedTvProgramme = ['title' => 'Unter uns Classics'];
-    $reviewedTvCache = [];
-    enrich($plugin, $method, $reviewedTvProgramme, $reviewedTv, $reviewedTvCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg', $reviewedTvProgramme['icon'] ?? null, 'Unter uns Classics should use its reviewed TV identity.');
-    assertSameValue([0, 0], [$reviewedTv->tvCandidateSearches, $reviewedTv->movieCandidateSearches], 'A reviewed TV identity must not search either media type.');
-    assertSameValue([1, 0], [$reviewedTv->tvDetailsRequests, $reviewedTv->movieDetailsRequests], 'A reviewed TV identity must load only its TV details once.');
-
-    $reviewedSharedCacheProgramme = ['title' => 'Unter uns Classics'];
-    enrich($plugin, $method, $reviewedSharedCacheProgramme, $reviewedTv, $reviewedTvCache);
-    assertSameValue($reviewedTvProgramme, $reviewedSharedCacheProgramme, 'A repeated reviewed title should produce the same trusted output.');
-    assertSameValue([0, 0], [$reviewedTv->tvCandidateSearches, $reviewedTv->movieCandidateSearches], 'A repeated reviewed title must not search either media type.');
-    assertSameValue([1, 0], [$reviewedTv->tvDetailsRequests, $reviewedTv->movieDetailsRequests], 'A repeated reviewed title must reuse its validated exact cache entry.');
-
-    foreach ([
-        'non-array' => null,
-        'missing media type' => ['tmdb_id' => 17892],
-        'wrong media type' => ['_media_type' => 'movie', 'tmdb_id' => 17892],
-        'numeric-string ID' => ['_media_type' => 'tv', 'tmdb_id' => '17892'],
-        'zero ID' => ['_media_type' => 'tv', 'tmdb_id' => 0],
-        'wrong native ID' => ['_media_type' => 'tv', 'tmdb_id' => 17893],
-        'missing normalized details' => ['_media_type' => 'tv', 'tmdb_id' => 17892],
-        'malformed poster URL' => array_merge(
-            $reviewedTvDetails,
-            ['_media_type' => 'tv', 'poster_url' => ['malformed']]
-        ),
-    ] as $label => $invalidCachedIdentity) {
-        $invalidCachedTmdb = new ReviewedIdentityTmdbService(tvDetails: null);
-        $invalidCachedProgramme = ['title' => 'Unter uns Classics'];
-        $invalidCachedBefore = $invalidCachedProgramme;
-        $invalidCachedCache = $reviewedTvCache;
-        $invalidCachedCache[array_key_first($invalidCachedCache)] = $invalidCachedIdentity;
-        enrich($plugin, $method, $invalidCachedProgramme, $invalidCachedTmdb, $invalidCachedCache);
-        assertSameValue($invalidCachedBefore, $invalidCachedProgramme, 'Invalid cached reviewed '.$label.' data must not modify programme data.');
-        assertSameValue([0, 0], [$invalidCachedTmdb->tvCandidateSearches, $invalidCachedTmdb->movieCandidateSearches], 'Invalid cached reviewed '.$label.' data must not fall back to search.');
-        assertSameValue([1, 0], [$invalidCachedTmdb->tvDetailsRequests, $invalidCachedTmdb->movieDetailsRequests], 'Invalid cached reviewed '.$label.' data must load reviewed details exactly once.');
-    }
-
-    $reviewedMovieDetails = normalizedMovieDetailsFixture(
-        717948,
-        'Cerro Kishtwar - Eine eiskalte Geschichte',
-        'A reviewed movie identity.',
-        'https://image.tmdb.org/t/p/w500/cerro-poster.jpg',
-        'https://image.tmdb.org/t/p/original/cerro-backdrop.jpg',
-    );
-    $reviewedMovie = new ReviewedIdentityTmdbService(movieDetails: $reviewedMovieDetails);
-    $reviewedMovieProgramme = ['title' => 'Cerro Kishtwar - Eine eiskalte Geschichte'];
-    $reviewedMovieCache = [];
-    enrich($plugin, $method, $reviewedMovieProgramme, $reviewedMovie, $reviewedMovieCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/cerro-backdrop.jpg', $reviewedMovieProgramme['icon'] ?? null, 'Cerro Kishtwar should use its reviewed movie identity.');
-    assertSameValue([0, 0], [$reviewedMovie->tvCandidateSearches, $reviewedMovie->movieCandidateSearches], 'A reviewed movie identity must not search either media type.');
-    assertSameValue([0, 1], [$reviewedMovie->tvDetailsRequests, $reviewedMovie->movieDetailsRequests], 'A reviewed movie identity must load only its movie details once.');
-
-    $normalizedReviewedTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
-    $normalizedReviewedProgramme = ['title' => '  UNTER-UNS,   CLASSICS  '];
-    $normalizedReviewedCache = [];
-    enrich($plugin, $method, $normalizedReviewedProgramme, $normalizedReviewedTv, $normalizedReviewedCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg', $normalizedReviewedProgramme['icon'] ?? null, 'Case, whitespace, and punctuation equivalents should retain exact reviewed matching.');
-    assertSameValue([0, 0], [$normalizedReviewedTv->tvCandidateSearches, $normalizedReviewedTv->movieCandidateSearches], 'Normalized reviewed titles must not search.');
-
-    foreach ([
-        'Unter uns Classics - Folge 1',
-        'Unter uns Classics S01E01',
-        'Unter uns Classics Folge 1',
-        'Unter uns Classics (12)',
-    ] as $reviewedEpisodeTitle) {
-        $reviewedEpisodeTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
-        $reviewedEpisodeProgramme = ['title' => $reviewedEpisodeTitle];
-        $reviewedEpisodeCache = [];
-        enrich($plugin, $method, $reviewedEpisodeProgramme, $reviewedEpisodeTv, $reviewedEpisodeCache);
-        assertSameValue('https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg', $reviewedEpisodeProgramme['icon'] ?? null, $reviewedEpisodeTitle.' should retain the reviewed identity.');
-        assertSameValue([0, 0], [$reviewedEpisodeTv->tvCandidateSearches, $reviewedEpisodeTv->movieCandidateSearches], $reviewedEpisodeTitle.' must not fall back to bounded search.');
-        assertSameValue([1, 0], [$reviewedEpisodeTv->tvDetailsRequests, $reviewedEpisodeTv->movieDetailsRequests], $reviewedEpisodeTitle.' must load only the reviewed TV details.');
-    }
-
-    foreach (['Unter uns', 'Unter uns Classics Extra'] as $nearMissTitle) {
-        $nearMissTmdb = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
-        $nearMissProgramme = ['title' => $nearMissTitle];
-        $nearMissCache = [];
-        enrich($plugin, $method, $nearMissProgramme, $nearMissTmdb, $nearMissCache);
-        assertSameValue(0, $nearMissTmdb->tvDetailsRequests, 'Near miss '.$nearMissTitle.' must not use reviewed TV details.');
-        assertTrueValue($nearMissTmdb->tvCandidateSearches + $nearMissTmdb->movieCandidateSearches > 0, 'Near miss '.$nearMissTitle.' must remain on the normal bounded search path.');
-        assertSameValue([], $nearMissCache, 'Near miss '.$nearMissTitle.' must not persist a reviewed identity.');
-    }
-
-    foreach ([
-        'exception' => new \RuntimeException('reviewed details failure'),
-        'null' => null,
-        'empty' => [],
-        'non-array' => (object) [],
-        'missing ID' => ['backdrop_url' => 'https://fixture.invalid/missing-id.jpg'],
-        'numeric-string ID' => ['tmdb_id' => '17892'],
-        'float ID' => ['tmdb_id' => 17892.0],
-        'zero ID' => ['tmdb_id' => 0],
-        'negative ID' => ['tmdb_id' => -17892],
-        'mismatched native ID' => ['tmdb_id' => 17893],
-    ] as $label => $invalidDetails) {
-        $invalidReviewedTmdb = new ReviewedIdentityTmdbService(tvDetails: $invalidDetails);
-        $invalidReviewedProgramme = ['title' => 'Unter uns Classics'];
-        $invalidReviewedBefore = $invalidReviewedProgramme;
-        $invalidReviewedCache = [];
-        enrich($plugin, $method, $invalidReviewedProgramme, $invalidReviewedTmdb, $invalidReviewedCache);
-        assertSameValue($invalidReviewedBefore, $invalidReviewedProgramme, 'Invalid reviewed '.$label.' details must not modify programme data.');
-        assertSameValue([], $invalidReviewedCache, 'Invalid reviewed '.$label.' details must not write a cache entry.');
-        assertSameValue([0, 0], [$invalidReviewedTmdb->tvCandidateSearches, $invalidReviewedTmdb->movieCandidateSearches], 'Invalid reviewed '.$label.' details must not fall back to search.');
-        assertSameValue([1, 0], [$invalidReviewedTmdb->tvDetailsRequests, $invalidReviewedTmdb->movieDetailsRequests], 'Invalid reviewed '.$label.' details must make only one TV details request.');
-    }
-
-    $trustedReviewedTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
-    $trustedReviewedProgramme = [
-        'title' => 'Unter uns Classics',
-        'icon' => 'https://provider.invalid/reviewed-primary.jpg',
-        'images' => [[
-            'url' => 'https://provider.invalid/reviewed-primary.jpg',
-            'type' => 'fanart',
-            'orient' => 'L',
-            'width' => 1920,
-            'height' => 1080,
-            'scope' => 'programme',
-        ]],
+    $genericClassicCandidate = [
+        'tmdb_id' => 701,
+        'name' => 'Beacon Vale',
+        'original_name' => 'Beacon Vale',
+        'first_air_date' => '1999-01-01',
+        'overview' => 'A synthetic series used to verify generic edition-title matching.',
     ];
-    $trustedReviewedCache = [];
-    enrich($plugin, $method, $trustedReviewedProgramme, $trustedReviewedTv, $trustedReviewedCache);
-    assertSameValue('https://provider.invalid/reviewed-primary.jpg', $trustedReviewedProgramme['icon'] ?? null, 'A trusted source landscape must remain primary for a valid reviewed identity.');
-    assertSameValue($trustedReviewedProgramme['icon'], $trustedReviewedProgramme['images'][0]['url'] ?? null, 'Reviewed identity serialization must retain the trusted primary first.');
-    assertSameValue($trustedReviewedProgramme['icon'], $trustedReviewedProgramme['images'][array_key_last($trustedReviewedProgramme['images'])]['url'] ?? null, 'Reviewed identity serialization must retain the trusted primary last.');
+    $genericClassicTmdb = new CandidateTmdbService(
+        tvDetails: [701 => $genericClassicDetails],
+        tvCandidatesByQuery: [
+            'Beacon Vale Classics (12)' => [],
+            'Beacon Vale' => [$genericClassicCandidate],
+        ],
+        movieCandidatesByQuery: [
+            'Beacon Vale Classics (12)' => [],
+            'Beacon Vale' => [],
+        ],
+    );
+    $genericClassicProgramme = ['title' => 'Beacon Vale Classics (12)'];
+    $genericClassicCache = [];
+    enrich($plugin, $method, $genericClassicProgramme, $genericClassicTmdb, $genericClassicCache);
+    assertSameValue(
+        'https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg',
+        $genericClassicProgramme['icon'] ?? null,
+        'Any episodic Classics title should retry the generic base series and select a validated TMDB candidate.'
+    );
+    assertSameValue(['Beacon Vale Classics (12)', 'Beacon Vale'], $genericClassicTmdb->tvQueries, 'Generic edition matching must search the full TV title before the derived base title.');
+    assertSameValue(['Beacon Vale Classics (12)', 'Beacon Vale'], $genericClassicTmdb->movieQueries, 'Generic edition matching must search the full movie title before the derived base title.');
+    assertSameValue([1, 0], [$genericClassicTmdb->tvDetailsRequests, $genericClassicTmdb->movieDetailsRequests], 'Only the globally validated generic edition winner should load details.');
+
+    $genericSeriesTmdb = new CandidateTmdbService(
+        tvCandidatesByQuery: ['Beacon Vale Classics' => []],
+        movieCandidatesByQuery: ['Beacon Vale Classics' => []],
+    );
+    $genericSeriesProgramme = ['title' => 'Beacon Vale Classics'];
+    $genericSeriesCache = [];
+    enrich($plugin, $method, $genericSeriesProgramme, $genericSeriesTmdb, $genericSeriesCache);
+    assertSameValue(null, $genericSeriesProgramme['icon'] ?? null, 'A plain Classics title without episode evidence must abstain when the full title has no validated candidate.');
+    assertSameValue(['Beacon Vale Classics'], $genericSeriesTmdb->tvQueries, 'A plain Classics title without episode evidence must not retry a shortened TV title.');
+    assertSameValue(['Beacon Vale Classics'], $genericSeriesTmdb->movieQueries, 'A plain Classics title without episode evidence must not retry a shortened movie title.');
+    assertSameValue([0, 0], [$genericSeriesTmdb->tvDetailsRequests, $genericSeriesTmdb->movieDetailsRequests], 'An abstaining plain Classics title must not load details.');
+
+    $genericSeriesReplay = ['title' => 'Beacon Vale Classics (12)'];
+    enrich($plugin, $method, $genericSeriesReplay, $genericClassicTmdb, $genericClassicCache);
+    assertSameValue($genericClassicProgramme, $genericSeriesReplay, 'A repeated globally matched episodic title should replay the same trusted output.');
+    assertSameValue(['Beacon Vale Classics (12)', 'Beacon Vale'], $genericClassicTmdb->tvQueries, 'A validated generic cache hit must not repeat TV candidate searches.');
+    assertSameValue(['Beacon Vale Classics (12)', 'Beacon Vale'], $genericClassicTmdb->movieQueries, 'A validated generic cache hit must not repeat movie candidate searches.');
+    assertSameValue([1, 0], [$genericClassicTmdb->tvDetailsRequests, $genericClassicTmdb->movieDetailsRequests], 'A validated generic cache hit must not repeat details requests.');
+
+    foreach ([
+        'Beacon Vale Classics - Folge 1',
+        'Beacon Vale Classics S01E01',
+        'Beacon Vale Classics Folge 1',
+        'Beacon Vale Classics (12)',
+    ] as $episodeTitle) {
+        $episodeTmdb = new CandidateTmdbService(
+            tvDetails: [701 => $genericClassicDetails],
+            tvCandidatesByQuery: [
+                $episodeTitle => [],
+                'Beacon Vale' => [$genericClassicCandidate],
+            ],
+            movieCandidatesByQuery: [
+                $episodeTitle => [],
+                'Beacon Vale' => [],
+            ],
+        );
+        $episodeProgramme = ['title' => $episodeTitle];
+        $episodeCache = [];
+        enrich($plugin, $method, $episodeProgramme, $episodeTmdb, $episodeCache);
+        assertSameValue('https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg', $episodeProgramme['icon'] ?? null, $episodeTitle.' should resolve through the same generic base-title pipeline.');
+        assertSameValue([$episodeTitle, 'Beacon Vale'], $episodeTmdb->tvQueries, $episodeTitle.' should search the full TV title before the derived base title.');
+        assertSameValue([$episodeTitle, 'Beacon Vale'], $episodeTmdb->movieQueries, $episodeTitle.' should search the full movie title before the derived base title.');
+        assertSameValue([1, 0], [$episodeTmdb->tvDetailsRequests, $episodeTmdb->movieDetailsRequests], $episodeTitle.' should load only the globally validated TV winner.');
+    }
+
+    $normalizedEditionTmdb = new CandidateTmdbService(
+        tvDetails: [701 => $genericClassicDetails],
+        tvCandidatesByQuery: [
+            '  BEACON-VALE,   CLASSICS Folge 9  ' => [],
+            'BEACON-VALE,' => [$genericClassicCandidate],
+        ],
+        movieCandidatesByQuery: [
+            '  BEACON-VALE,   CLASSICS Folge 9  ' => [],
+            'BEACON-VALE,' => [],
+        ],
+    );
+    $normalizedEditionProgramme = ['title' => '  BEACON-VALE,   CLASSICS Folge 9  '];
+    $normalizedEditionCache = [];
+    enrich($plugin, $method, $normalizedEditionProgramme, $normalizedEditionTmdb, $normalizedEditionCache);
+    assertSameValue('https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg', $normalizedEditionProgramme['icon'] ?? null, 'Case, whitespace, and punctuation variants should use generic normalized candidate matching.');
+    assertSameValue(['  BEACON-VALE,   CLASSICS Folge 9  ', 'BEACON-VALE,'], $normalizedEditionTmdb->tvQueries, 'Normalized title variants must preserve the full-then-base TV query order.');
+    assertSameValue(['  BEACON-VALE,   CLASSICS Folge 9  ', 'BEACON-VALE,'], $normalizedEditionTmdb->movieQueries, 'Normalized title variants must preserve the full-then-base movie query order.');
+
+    $globalMovieDetails = normalizedMovieDetailsFixture(
+        702,
+        'Kestrel Ridge - A Winter Chronicle',
+        'A synthetic movie regression exercised through the global candidate pipeline.',
+        'https://image.tmdb.org/t/p/w500/kestrel-ridge-poster.jpg',
+        'https://image.tmdb.org/t/p/original/kestrel-ridge-backdrop.jpg',
+    );
+    $globalMovieTmdb = new CandidateTmdbService(
+        movieCandidates: [[
+            'tmdb_id' => 702,
+            'title' => 'Kestrel Ridge: Summit of Ice',
+            'original_title' => 'Kestrel Ridge: Summit of Ice',
+            'release_date' => '2020-01-01',
+            'overview' => 'A synthetic movie regression exercised through the global candidate pipeline.',
+        ]],
+        movieDetails: [702 => $globalMovieDetails],
+    );
+    $globalMovieProgramme = ['title' => 'Kestrel Ridge - A Winter Chronicle'];
+    $globalMovieCache = [];
+    enrich($plugin, $method, $globalMovieProgramme, $globalMovieTmdb, $globalMovieCache);
+    assertSameValue('https://image.tmdb.org/t/p/original/kestrel-ridge-backdrop.jpg', $globalMovieProgramme['icon'] ?? null, 'A unique compound-title variant with the same substantial base should resolve globally.');
+    assertSameValue([2, 2], [$globalMovieTmdb->tvCandidateSearches, $globalMovieTmdb->movieCandidateSearches], 'A weak compound-title identity must be confirmed by full and base TV/movie searches.');
+    assertSameValue(['Kestrel Ridge - A Winter Chronicle', 'Kestrel Ridge'], $globalMovieTmdb->tvQueries, 'Compound confirmation must search the full then base TV title.');
+    assertSameValue(['Kestrel Ridge - A Winter Chronicle', 'Kestrel Ridge'], $globalMovieTmdb->movieQueries, 'Compound confirmation must search the full then base movie title.');
+    assertSameValue([0, 1], [$globalMovieTmdb->tvDetailsRequests, $globalMovieTmdb->movieDetailsRequests], 'Only the global movie winner should load details.');
+
+    $shortCompoundTmdb = new CandidateTmdbService(movieCandidates: [[
+        'tmdb_id' => 704,
+        'title' => 'All In - League Show',
+        'original_title' => 'All In - League Show',
+        'release_date' => '2024-01-01',
+        'overview' => 'A different synthetic programme.',
+    ]]);
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $shortCompoundTmdb, 'All In - Documentary'),
+        'A short common compound base must not receive the substantial-base identity boost.'
+    );
+
+    $ambiguousCompoundTmdb = new CandidateTmdbService(movieCandidates: [
+        [
+            'tmdb_id' => 705,
+            'title' => 'Kestrel Ridge: Summit of Ice',
+            'original_title' => 'Kestrel Ridge: Summit of Ice',
+            'release_date' => '2020-01-01',
+            'overview' => 'First ambiguous synthetic candidate.',
+        ],
+        [
+            'tmdb_id' => 706,
+            'title' => 'Kestrel Ridge: Frozen Pass',
+            'original_title' => 'Kestrel Ridge: Frozen Pass',
+            'release_date' => '2020-01-01',
+            'overview' => 'Second ambiguous synthetic candidate.',
+        ],
+    ]);
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $ambiguousCompoundTmdb, 'Kestrel Ridge - A Winter Chronicle'),
+        'Equal compound-base candidates must remain ambiguous and fail closed.'
+    );
+    assertSameValue(0, $ambiguousCompoundTmdb->movieDetailsRequests, 'Ambiguous compound-base candidates must not load details.');
+
+    $mismatchedCompoundTmdb = new CandidateTmdbService(
+        movieDetails: [707 => normalizedMovieDetailsFixture(707, 'Kestrel Ridge: Summit of Ice', 'First candidate.')],
+        movieCandidatesByQuery: [
+            'Kestrel Ridge - A Winter Chronicle' => [[
+                'tmdb_id' => 707,
+                'title' => 'Kestrel Ridge: Summit of Ice',
+                'original_title' => 'Kestrel Ridge: Summit of Ice',
+                'release_date' => '2020-01-01',
+                'overview' => 'First candidate.',
+            ]],
+            'Kestrel Ridge' => [[
+                'tmdb_id' => 707,
+                'title' => 'Kestrel Ridge',
+                'original_title' => 'Kestrel Ridge',
+                'release_date' => '2020-01-01',
+                'overview' => 'Same identity but non-compound base response.',
+            ]],
+        ],
+    );
+    $mismatchedCompoundProgramme = ['title' => 'Kestrel Ridge - A Winter Chronicle'];
+    $mismatchedCompoundCache = [];
+    enrich($plugin, $method, $mismatchedCompoundProgramme, $mismatchedCompoundTmdb, $mismatchedCompoundCache);
+    assertSameValue(null, $mismatchedCompoundProgramme['icon'] ?? null, 'A base-only same-ID response must not bypass compound-shape confirmation.');
+    assertSameValue(0, $mismatchedCompoundTmdb->movieDetailsRequests, 'A non-compound base confirmation must not load details.');
+
+    $literalClassicsDetails = normalizedTvDetailsFixture(
+        703,
+        'Fictional Archive Classics',
+        'An exact synthetic TMDB title whose final word is Classics.',
+        backdropUrl: 'https://image.tmdb.org/t/p/original/fictional-archive-classics.jpg',
+    );
+    $literalClassicsTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 703,
+            'name' => 'Fictional Archive Classics',
+            'original_name' => 'Fictional Archive Classics',
+            'first_air_date' => '2021-01-01',
+            'overview' => 'An exact synthetic TMDB title whose final word is Classics.',
+        ]],
+        tvDetails: [703 => $literalClassicsDetails],
+    );
+    $literalClassicsProgramme = ['title' => 'Fictional Archive Classics'];
+    $literalClassicsCache = [];
+    enrich($plugin, $method, $literalClassicsProgramme, $literalClassicsTmdb, $literalClassicsCache);
+    assertSameValue('https://image.tmdb.org/t/p/original/fictional-archive-classics.jpg', $literalClassicsProgramme['icon'] ?? null, 'An exact TMDB title ending in Classics must win before the generic base fallback.');
+    assertSameValue([1, 1], [$literalClassicsTmdb->tvCandidateSearches, $literalClassicsTmdb->movieCandidateSearches], 'An exact Classics title must stop after the full-title candidate lookup.');
+    assertSameValue(['Fictional Archive Classics'], $literalClassicsTmdb->tvQueries, 'An exact Classics title must use only the full TV query.');
+    assertSameValue(['Fictional Archive Classics'], $literalClassicsTmdb->movieQueries, 'An exact Classics title must use only the full movie query.');
 
     $rankedTmdb = new CandidateTmdbService(
         tvCandidates: [
