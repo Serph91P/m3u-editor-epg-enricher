@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.19.0-global-identity-matching';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.20.0-global-compound-identity';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1514,11 +1514,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
-            $tmdbData = $this->searchTmdbWithValidation($tmdb, $title, $forcedMediaType, $year, $description);
+            $compoundIdentity = null;
+            $tmdbData = $this->searchTmdbWithValidation(
+                $tmdb,
+                $title,
+                $forcedMediaType,
+                $year,
+                $description,
+                $compoundIdentity,
+            );
             $matchedViaBase = false;
 
             if (! $tmdbData && $baseTitle !== $title) {
-                $tmdbData = $this->searchTmdbWithValidation($tmdb, $baseTitle, $forcedMediaType, $year, $description);
+                $unusedCompoundIdentity = null;
+                $tmdbData = $this->searchTmdbWithValidation(
+                    $tmdb,
+                    $baseTitle,
+                    $forcedMediaType,
+                    $year,
+                    $description,
+                    $unusedCompoundIdentity,
+                    $compoundIdentity,
+                );
                 $matchedViaBase = $tmdbData !== null;
             }
 
@@ -2852,8 +2869,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?string $forceMediaType = null,
         ?int $year = null,
         string $description = '',
+        ?array &$provisionalCompoundIdentity = null,
+        ?array $requiredCompoundIdentity = null,
     ): ?array
     {
+        $provisionalCompoundIdentity = null;
         $searchNorm = mb_strtolower(trim($searchTitle));
         $candidates = [];
 
@@ -2884,7 +2904,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             $best = $this->selectTmdbIdentityWinner($candidates);
+            if ($requiredCompoundIdentity !== null) {
+                $best = $this->confirmedCompoundIdentityCandidate(
+                    $candidates,
+                    $searchTitle,
+                    $requiredCompoundIdentity,
+                );
+            }
             if ($best === null) {
+                $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
+
                 return null;
             }
 
@@ -2947,7 +2976,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $best = $this->selectTmdbIdentityWinner($candidates);
+        if ($requiredCompoundIdentity !== null) {
+            $best = $this->confirmedCompoundIdentityCandidate(
+                $candidates,
+                $searchTitle,
+                $requiredCompoundIdentity,
+            );
+        }
         if ($best === null) {
+            $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
+
             return null;
         }
 
@@ -2961,6 +2999,82 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $best['_runtime_trusted_legacy'] = true;
 
         return $best;
+    }
+
+    private function provisionalCompoundIdentity(array $candidates, string $searchTitle): ?array
+    {
+        if (count($candidates) !== 1) {
+            return null;
+        }
+
+        $candidate = $candidates[0];
+        $searchBase = $this->compoundIdentityBase($searchTitle);
+        if ($searchBase === null || ! $this->candidateHasCompoundBase($candidate, $searchBase)) {
+            return null;
+        }
+
+        return [
+            'tmdb_id' => $candidate['tmdb_id'],
+            'media_type' => $candidate['_media_type'],
+        ];
+    }
+
+    private function confirmedCompoundIdentityCandidate(
+        array $candidates,
+        string $searchTitle,
+        array $requiredIdentity,
+    ): ?array {
+        if (count($candidates) !== 1) {
+            return null;
+        }
+
+        $candidate = $candidates[0];
+        $searchBase = $this->normalizeIdentityText($searchTitle);
+        if (! $this->isSubstantialIdentityBase($searchBase)
+            || ($candidate['tmdb_id'] ?? null) !== ($requiredIdentity['tmdb_id'] ?? null)
+            || ($candidate['_media_type'] ?? null) !== ($requiredIdentity['media_type'] ?? null)
+            || ! $this->candidateHasCompoundBase($candidate, $searchBase)) {
+            return null;
+        }
+
+        $candidate['_identity_valid'] = true;
+        $candidate['_identity_score'] = 76.0;
+
+        return $candidate;
+    }
+
+    private function candidateHasCompoundBase(array $candidate, string $expectedBase): bool
+    {
+        $fields = ($candidate['_media_type'] ?? null) === 'tv'
+            ? ['name', 'original_name']
+            : ['title', 'original_title'];
+        foreach ($fields as $field) {
+            $title = $candidate[$field] ?? null;
+            if (is_string($title) && $this->compoundIdentityBase($title) === $expectedBase) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function compoundIdentityBase(string $title): ?string
+    {
+        $identity = $this->normalizeIdentityText($title);
+        $base = $this->normalizeIdentityText((string) ($this->extractBaseTitle($title)['title'] ?? ''));
+
+        return $base !== $identity && $this->isSubstantialIdentityBase($base)
+            ? $base
+            : null;
+    }
+
+    private function isSubstantialIdentityBase(string $base): bool
+    {
+        $tokens = preg_split('/\s+/', $base, -1, PREG_SPLIT_NO_EMPTY);
+
+        return is_array($tokens)
+            && count($tokens) >= 2
+            && mb_strlen(str_replace(' ', '', $base)) >= 10;
     }
 
     private function isValidRawTmdbCandidate(mixed $candidate, string $mediaType): bool

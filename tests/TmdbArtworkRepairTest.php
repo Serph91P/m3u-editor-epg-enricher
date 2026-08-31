@@ -759,8 +759,8 @@ namespace Tests {
     $globalMovieTmdb = new CandidateTmdbService(
         movieCandidates: [[
             'tmdb_id' => 702,
-            'title' => 'Kestrel Ridge - A Winter Chronicle',
-            'original_title' => 'Kestrel Ridge - A Winter Chronicle',
+            'title' => 'Kestrel Ridge: Summit of Ice',
+            'original_title' => 'Kestrel Ridge: Summit of Ice',
             'release_date' => '2020-01-01',
             'overview' => 'A synthetic movie regression exercised through the global candidate pipeline.',
         ]],
@@ -769,11 +769,72 @@ namespace Tests {
     $globalMovieProgramme = ['title' => 'Kestrel Ridge - A Winter Chronicle'];
     $globalMovieCache = [];
     enrich($plugin, $method, $globalMovieProgramme, $globalMovieTmdb, $globalMovieCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/kestrel-ridge-backdrop.jpg', $globalMovieProgramme['icon'] ?? null, 'A movie should resolve through global TV/movie candidate ranking.');
-    assertSameValue([1, 1], [$globalMovieTmdb->tvCandidateSearches, $globalMovieTmdb->movieCandidateSearches], 'A non-episodic title must use global TV/movie candidate ranking.');
-    assertSameValue(['Kestrel Ridge - A Winter Chronicle'], $globalMovieTmdb->tvQueries, 'A validated full movie title must not trigger a shortened TV query.');
-    assertSameValue(['Kestrel Ridge - A Winter Chronicle'], $globalMovieTmdb->movieQueries, 'A validated full movie title must not trigger a shortened movie query.');
+    assertSameValue('https://image.tmdb.org/t/p/original/kestrel-ridge-backdrop.jpg', $globalMovieProgramme['icon'] ?? null, 'A unique compound-title variant with the same substantial base should resolve globally.');
+    assertSameValue([2, 2], [$globalMovieTmdb->tvCandidateSearches, $globalMovieTmdb->movieCandidateSearches], 'A weak compound-title identity must be confirmed by full and base TV/movie searches.');
+    assertSameValue(['Kestrel Ridge - A Winter Chronicle', 'Kestrel Ridge'], $globalMovieTmdb->tvQueries, 'Compound confirmation must search the full then base TV title.');
+    assertSameValue(['Kestrel Ridge - A Winter Chronicle', 'Kestrel Ridge'], $globalMovieTmdb->movieQueries, 'Compound confirmation must search the full then base movie title.');
     assertSameValue([0, 1], [$globalMovieTmdb->tvDetailsRequests, $globalMovieTmdb->movieDetailsRequests], 'Only the global movie winner should load details.');
+
+    $shortCompoundTmdb = new CandidateTmdbService(movieCandidates: [[
+        'tmdb_id' => 704,
+        'title' => 'All In - League Show',
+        'original_title' => 'All In - League Show',
+        'release_date' => '2024-01-01',
+        'overview' => 'A different synthetic programme.',
+    ]]);
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $shortCompoundTmdb, 'All In - Documentary'),
+        'A short common compound base must not receive the substantial-base identity boost.'
+    );
+
+    $ambiguousCompoundTmdb = new CandidateTmdbService(movieCandidates: [
+        [
+            'tmdb_id' => 705,
+            'title' => 'Kestrel Ridge: Summit of Ice',
+            'original_title' => 'Kestrel Ridge: Summit of Ice',
+            'release_date' => '2020-01-01',
+            'overview' => 'First ambiguous synthetic candidate.',
+        ],
+        [
+            'tmdb_id' => 706,
+            'title' => 'Kestrel Ridge: Frozen Pass',
+            'original_title' => 'Kestrel Ridge: Frozen Pass',
+            'release_date' => '2020-01-01',
+            'overview' => 'Second ambiguous synthetic candidate.',
+        ],
+    ]);
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $ambiguousCompoundTmdb, 'Kestrel Ridge - A Winter Chronicle'),
+        'Equal compound-base candidates must remain ambiguous and fail closed.'
+    );
+    assertSameValue(0, $ambiguousCompoundTmdb->movieDetailsRequests, 'Ambiguous compound-base candidates must not load details.');
+
+    $mismatchedCompoundTmdb = new CandidateTmdbService(
+        movieDetails: [707 => normalizedMovieDetailsFixture(707, 'Kestrel Ridge: Summit of Ice', 'First candidate.')],
+        movieCandidatesByQuery: [
+            'Kestrel Ridge - A Winter Chronicle' => [[
+                'tmdb_id' => 707,
+                'title' => 'Kestrel Ridge: Summit of Ice',
+                'original_title' => 'Kestrel Ridge: Summit of Ice',
+                'release_date' => '2020-01-01',
+                'overview' => 'First candidate.',
+            ]],
+            'Kestrel Ridge' => [[
+                'tmdb_id' => 707,
+                'title' => 'Kestrel Ridge',
+                'original_title' => 'Kestrel Ridge',
+                'release_date' => '2020-01-01',
+                'overview' => 'Same identity but non-compound base response.',
+            ]],
+        ],
+    );
+    $mismatchedCompoundProgramme = ['title' => 'Kestrel Ridge - A Winter Chronicle'];
+    $mismatchedCompoundCache = [];
+    enrich($plugin, $method, $mismatchedCompoundProgramme, $mismatchedCompoundTmdb, $mismatchedCompoundCache);
+    assertSameValue(null, $mismatchedCompoundProgramme['icon'] ?? null, 'A base-only same-ID response must not bypass compound-shape confirmation.');
+    assertSameValue(0, $mismatchedCompoundTmdb->movieDetailsRequests, 'A non-compound base confirmation must not load details.');
 
     $literalClassicsDetails = normalizedTvDetailsFixture(
         703,
