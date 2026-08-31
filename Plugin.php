@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.15.0-reviewed-identity-cache';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.16.0-reviewed-episode-identity';
 
     /** @var array<string, array{media_type: 'tv'|'movie', tmdb_id: int}> */
     private const array REVIEWED_TMDB_IDENTITIES = [
@@ -1497,7 +1497,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may
         // reuse a separately validated, exact primary TV-series match across episode titles.
-        $reviewedIdentity = $this->reviewedTmdbIdentityForTitle($title);
+        $reviewedIdentity = $this->reviewedTmdbIdentityForTitle($title)
+            ?? $this->reviewedTmdbIdentityForEpisodeTitle($title, $baseTitle);
         if ($reviewedIdentity !== null) {
             $matchedViaBase = false;
             if (array_key_exists($fullCacheKey, $cache)
@@ -3087,6 +3088,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return $identity;
+    }
+
+    private function reviewedTmdbIdentityForEpisodeTitle(string $title, string $baseTitle): ?array
+    {
+        if (! preg_match('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', $title)) {
+            return null;
+        }
+
+        $identity = $this->reviewedTmdbIdentityForTitle($baseTitle);
+
+        return ($identity['media_type'] ?? null) === 'tv' ? $identity : null;
     }
 
     private function loadReviewedTmdbIdentity(TmdbService $tmdb, array $identity): ?array

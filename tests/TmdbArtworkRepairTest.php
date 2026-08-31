@@ -692,7 +692,15 @@ namespace Tests {
     assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $normalizedReviewedProgramme['icon'] ?? null, 'Case, whitespace, and punctuation equivalents should retain exact reviewed matching.');
     assertSameValue([0, 0], [$normalizedReviewedTv->tvCandidateSearches, $normalizedReviewedTv->movieCandidateSearches], 'Normalized reviewed titles must not search.');
 
-    foreach (['Unter uns', 'Unter uns Classics Extra', 'Unter uns Classics - Folge 1'] as $nearMissTitle) {
+    $reviewedEpisodeTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
+    $reviewedEpisodeProgramme = ['title' => 'Unter uns Classics - Folge 1'];
+    $reviewedEpisodeCache = [];
+    enrich($plugin, $method, $reviewedEpisodeProgramme, $reviewedEpisodeTv, $reviewedEpisodeCache);
+    assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $reviewedEpisodeProgramme['icon'] ?? null, 'A reviewed series title with a recognized episode suffix should retain the reviewed identity.');
+    assertSameValue([0, 0], [$reviewedEpisodeTv->tvCandidateSearches, $reviewedEpisodeTv->movieCandidateSearches], 'A reviewed series episode suffix must not fall back to bounded search.');
+    assertSameValue([1, 0], [$reviewedEpisodeTv->tvDetailsRequests, $reviewedEpisodeTv->movieDetailsRequests], 'A reviewed series episode suffix must load only the reviewed TV details.');
+
+    foreach (['Unter uns', 'Unter uns Classics Extra'] as $nearMissTitle) {
         $nearMissTmdb = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
         $nearMissProgramme = ['title' => $nearMissTitle];
         $nearMissCache = [];
@@ -1646,6 +1654,7 @@ namespace Tests {
             'scope' => 'programme',
         ]],
     ];
+    $sourceLandscapeInput = $sourceLandscape;
     $sourceLandscapeCache = [];
     $sourceLandscapeImagesCache = [];
     Http::$responses[] = new FakeHttpResponse(true, [
@@ -1705,6 +1714,24 @@ namespace Tests {
             && ! str_contains($serializedSourceDecision, $sourceLandscape['desc']),
         'Artwork provenance must not serialize the provider host or raw programme description.'
     );
+    $sourceLandscapeReplay = $sourceLandscapeInput;
+    $sourceLandscapeReplayResult = enrich(
+        $plugin,
+        $method,
+        $sourceLandscapeReplay,
+        new TmdbService('backdrop-quality'),
+        $sourceLandscapeCache,
+        [],
+        $sourceLandscapeSeasonCache,
+        $sourceLandscapeImagesCache,
+    );
+    assertSameValue(true, $sourceLandscapeReplayResult['cache_hit'], 'The repeated programme should reuse its validated identity cache entry.');
+    assertSameValue(false, $sourceLandscape['artwork_decision']['cache_hit'] ?? null, 'The first artwork decision must persist the cache miss provenance.');
+    assertSameValue(true, $sourceLandscapeReplay['artwork_decision']['cache_hit'] ?? null, 'The repeated artwork decision must persist the cache hit provenance.');
+    $sourceLandscapeComparable = $sourceLandscape;
+    $sourceLandscapeReplayComparable = $sourceLandscapeReplay;
+    unset($sourceLandscapeComparable['artwork_decision']['cache_hit'], $sourceLandscapeReplayComparable['artwork_decision']['cache_hit']);
+    assertSameValue($sourceLandscapeComparable, $sourceLandscapeReplayComparable, 'Artwork output must remain deterministic apart from the required cache provenance.');
     $branchBEvidence = [
         'canonical_details_preferred' => 1,
         'source_primary_lookup_evaluated' => 1,
