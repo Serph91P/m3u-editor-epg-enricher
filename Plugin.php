@@ -43,7 +43,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.30-v1.14.0-top-n-identity';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.15.0-reviewed-identity-cache';
+
+    /** @var array<string, array{media_type: 'tv'|'movie', tmdb_id: int}> */
+    private const array REVIEWED_TMDB_IDENTITIES = [
+        'unter uns classics' => ['media_type' => 'tv', 'tmdb_id' => 17892],
+        'cerro kishtwar eine eiskalte geschichte' => ['media_type' => 'movie', 'tmdb_id' => 717948],
+    ];
+
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -1490,7 +1497,23 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may
         // reuse a separately validated, exact primary TV-series match across episode titles.
-        if (isset($cache[$fullCacheKey])) {
+        $reviewedIdentity = $this->reviewedTmdbIdentityForTitle($title);
+        if ($reviewedIdentity !== null) {
+            $matchedViaBase = false;
+            if (array_key_exists($fullCacheKey, $cache)
+                && $this->matchesReviewedTmdbIdentity($cache[$fullCacheKey], $reviewedIdentity)) {
+                $result['cache_hit'] = true;
+                $tmdbData = $cache[$fullCacheKey];
+            } else {
+                $result['lookup'] = true;
+                $tmdbData = $this->loadReviewedTmdbIdentity($tmdb, $reviewedIdentity);
+                if ($tmdbData === null) {
+                    return $result;
+                }
+
+                $cache[$fullCacheKey] = $tmdbData;
+            }
+        } elseif (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
         } elseif ($baseCacheKey !== null && isset($cache[$baseCacheKey])) {
@@ -3051,6 +3074,51 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
 
         return trim(preg_replace('/\s+/', ' ', $normalized));
+    }
+
+    private function reviewedTmdbIdentityForTitle(string $title): ?array
+    {
+        $identity = self::REVIEWED_TMDB_IDENTITIES[$this->normalizeIdentityText($title)] ?? null;
+        if (! is_array($identity)
+            || ! in_array($identity['media_type'] ?? null, ['tv', 'movie'], true)
+            || ! is_int($identity['tmdb_id'] ?? null)
+            || $identity['tmdb_id'] <= 0) {
+            return null;
+        }
+
+        return $identity;
+    }
+
+    private function loadReviewedTmdbIdentity(TmdbService $tmdb, array $identity): ?array
+    {
+        $mediaType = $identity['media_type'];
+        $tmdbId = $identity['tmdb_id'];
+
+        try {
+            $details = $mediaType === 'tv'
+                ? $tmdb->getTvSeriesDetails($tmdbId)
+                : $tmdb->getMovieDetails($tmdbId);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        if (! is_array($details)
+            || ! is_int($details['tmdb_id'] ?? null)
+            || $details['tmdb_id'] <= 0
+            || $details['tmdb_id'] !== $tmdbId) {
+            return null;
+        }
+
+        return array_merge($details, ['_media_type' => $mediaType]);
+    }
+
+    private function matchesReviewedTmdbIdentity(mixed $tmdbData, array $identity): bool
+    {
+        return is_array($tmdbData)
+            && ($tmdbData['_media_type'] ?? null) === $identity['media_type']
+            && is_int($tmdbData['tmdb_id'] ?? null)
+            && $tmdbData['tmdb_id'] > 0
+            && $tmdbData['tmdb_id'] === $identity['tmdb_id'];
     }
 
     private function isReusableBaseSeriesMatch(mixed $tmdbData, string $baseTitle): bool

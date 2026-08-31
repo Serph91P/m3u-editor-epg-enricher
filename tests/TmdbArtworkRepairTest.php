@@ -188,7 +188,7 @@ namespace App\Services {
             };
         }
 
-        public function getTvSeriesDetails(int $tmdbId): ?array
+        public function getTvSeriesDetails(int $tmdbId): mixed
         {
             $this->tvDetailsRequests++;
 
@@ -322,7 +322,7 @@ namespace App\Services {
             };
         }
 
-        public function getMovieDetails(int $tmdbId): ?array
+        public function getMovieDetails(int $tmdbId): mixed
         {
             $this->movieDetailsRequests++;
 
@@ -493,6 +493,55 @@ namespace App\Services {
             return [];
         }
     }
+
+    class ReviewedIdentityTmdbService extends TmdbService
+    {
+        public int $tvCandidateSearches = 0;
+        public int $movieCandidateSearches = 0;
+
+        public function __construct(
+            public mixed $tvDetails = null,
+            public mixed $movieDetails = null,
+            public array $tvCandidates = [],
+            public array $movieCandidates = [],
+        ) {
+            parent::__construct('reviewed-identity');
+        }
+
+        public function searchTvSeriesCandidates(string $name, ?int $year = null, int $limit = 5): array
+        {
+            $this->tvCandidateSearches++;
+
+            return $this->tvCandidates;
+        }
+
+        public function searchMovieCandidates(string $title, ?int $year = null, int $limit = 5): array
+        {
+            $this->movieCandidateSearches++;
+
+            return $this->movieCandidates;
+        }
+
+        public function getTvSeriesDetails(int $tmdbId): mixed
+        {
+            $this->tvDetailsRequests++;
+            if ($this->tvDetails instanceof \Throwable) {
+                throw $this->tvDetails;
+            }
+
+            return $this->tvDetails;
+        }
+
+        public function getMovieDetails(int $tmdbId): mixed
+        {
+            $this->movieDetailsRequests++;
+            if ($this->movieDetails instanceof \Throwable) {
+                throw $this->movieDetails;
+            }
+
+            return $this->movieDetails;
+        }
+    }
 }
 
 namespace Tests {
@@ -500,6 +549,7 @@ namespace Tests {
 
     use App\Services\TmdbService;
     use App\Services\CandidateTmdbService;
+    use App\Services\ReviewedIdentityTmdbService;
     use App\Settings\GeneralSettings;
     use AppLocalPlugins\EpgEnricher\Plugin;
     use Illuminate\Support\Facades\FakeHttpResponse;
@@ -579,6 +629,120 @@ namespace Tests {
     $method->setAccessible(true);
     $searchMethod = $reflection->getMethod('searchTmdbWithValidation');
     $searchMethod->setAccessible(true);
+
+    $reviewedTvDetails = [
+        'tmdb_id' => 17892,
+        'name' => 'Unter uns',
+        'overview' => 'A reviewed TV identity.',
+        'poster_url' => 'https://fixture.invalid/unter-uns-poster.jpg',
+        'backdrop_url' => 'https://fixture.invalid/unter-uns-backdrop.jpg',
+    ];
+    $reviewedTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
+    $reviewedTvProgramme = ['title' => 'Unter uns Classics'];
+    $reviewedTvCache = [];
+    enrich($plugin, $method, $reviewedTvProgramme, $reviewedTv, $reviewedTvCache);
+    assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $reviewedTvProgramme['icon'] ?? null, 'Unter uns Classics should use its reviewed TV identity.');
+    assertSameValue([0, 0], [$reviewedTv->tvCandidateSearches, $reviewedTv->movieCandidateSearches], 'A reviewed TV identity must not search either media type.');
+    assertSameValue([1, 0], [$reviewedTv->tvDetailsRequests, $reviewedTv->movieDetailsRequests], 'A reviewed TV identity must load only its TV details once.');
+
+    $reviewedSharedCacheProgramme = ['title' => 'Unter uns Classics'];
+    enrich($plugin, $method, $reviewedSharedCacheProgramme, $reviewedTv, $reviewedTvCache);
+    assertSameValue($reviewedTvProgramme, $reviewedSharedCacheProgramme, 'A repeated reviewed title should produce the same trusted output.');
+    assertSameValue([0, 0], [$reviewedTv->tvCandidateSearches, $reviewedTv->movieCandidateSearches], 'A repeated reviewed title must not search either media type.');
+    assertSameValue([1, 0], [$reviewedTv->tvDetailsRequests, $reviewedTv->movieDetailsRequests], 'A repeated reviewed title must reuse its validated exact cache entry.');
+
+    foreach ([
+        'non-array' => null,
+        'missing media type' => ['tmdb_id' => 17892],
+        'wrong media type' => ['_media_type' => 'movie', 'tmdb_id' => 17892],
+        'numeric-string ID' => ['_media_type' => 'tv', 'tmdb_id' => '17892'],
+        'zero ID' => ['_media_type' => 'tv', 'tmdb_id' => 0],
+        'wrong native ID' => ['_media_type' => 'tv', 'tmdb_id' => 17893],
+    ] as $label => $invalidCachedIdentity) {
+        $invalidCachedTmdb = new ReviewedIdentityTmdbService(tvDetails: null);
+        $invalidCachedProgramme = ['title' => 'Unter uns Classics'];
+        $invalidCachedBefore = $invalidCachedProgramme;
+        $invalidCachedCache = $reviewedTvCache;
+        $invalidCachedCache[array_key_first($invalidCachedCache)] = $invalidCachedIdentity;
+        enrich($plugin, $method, $invalidCachedProgramme, $invalidCachedTmdb, $invalidCachedCache);
+        assertSameValue($invalidCachedBefore, $invalidCachedProgramme, 'Invalid cached reviewed '.$label.' data must not modify programme data.');
+        assertSameValue([0, 0], [$invalidCachedTmdb->tvCandidateSearches, $invalidCachedTmdb->movieCandidateSearches], 'Invalid cached reviewed '.$label.' data must not fall back to search.');
+        assertSameValue([1, 0], [$invalidCachedTmdb->tvDetailsRequests, $invalidCachedTmdb->movieDetailsRequests], 'Invalid cached reviewed '.$label.' data must load reviewed details exactly once.');
+    }
+
+    $reviewedMovieDetails = [
+        'tmdb_id' => 717948,
+        'title' => 'Cerro Kishtwar - Eine eiskalte Geschichte',
+        'overview' => 'A reviewed movie identity.',
+        'poster_url' => 'https://fixture.invalid/cerro-poster.jpg',
+        'backdrop_url' => 'https://fixture.invalid/cerro-backdrop.jpg',
+    ];
+    $reviewedMovie = new ReviewedIdentityTmdbService(movieDetails: $reviewedMovieDetails);
+    $reviewedMovieProgramme = ['title' => 'Cerro Kishtwar - Eine eiskalte Geschichte'];
+    $reviewedMovieCache = [];
+    enrich($plugin, $method, $reviewedMovieProgramme, $reviewedMovie, $reviewedMovieCache);
+    assertSameValue('https://fixture.invalid/cerro-backdrop.jpg', $reviewedMovieProgramme['icon'] ?? null, 'Cerro Kishtwar should use its reviewed movie identity.');
+    assertSameValue([0, 0], [$reviewedMovie->tvCandidateSearches, $reviewedMovie->movieCandidateSearches], 'A reviewed movie identity must not search either media type.');
+    assertSameValue([0, 1], [$reviewedMovie->tvDetailsRequests, $reviewedMovie->movieDetailsRequests], 'A reviewed movie identity must load only its movie details once.');
+
+    $normalizedReviewedTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
+    $normalizedReviewedProgramme = ['title' => '  UNTER-UNS,   CLASSICS  '];
+    $normalizedReviewedCache = [];
+    enrich($plugin, $method, $normalizedReviewedProgramme, $normalizedReviewedTv, $normalizedReviewedCache);
+    assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $normalizedReviewedProgramme['icon'] ?? null, 'Case, whitespace, and punctuation equivalents should retain exact reviewed matching.');
+    assertSameValue([0, 0], [$normalizedReviewedTv->tvCandidateSearches, $normalizedReviewedTv->movieCandidateSearches], 'Normalized reviewed titles must not search.');
+
+    foreach (['Unter uns', 'Unter uns Classics Extra', 'Unter uns Classics - Folge 1'] as $nearMissTitle) {
+        $nearMissTmdb = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
+        $nearMissProgramme = ['title' => $nearMissTitle];
+        $nearMissCache = [];
+        enrich($plugin, $method, $nearMissProgramme, $nearMissTmdb, $nearMissCache);
+        assertSameValue(0, $nearMissTmdb->tvDetailsRequests, 'Near miss '.$nearMissTitle.' must not use reviewed TV details.');
+        assertTrueValue($nearMissTmdb->tvCandidateSearches + $nearMissTmdb->movieCandidateSearches > 0, 'Near miss '.$nearMissTitle.' must remain on the normal bounded search path.');
+        assertSameValue([], $nearMissCache, 'Near miss '.$nearMissTitle.' must not persist a reviewed identity.');
+    }
+
+    foreach ([
+        'exception' => new \RuntimeException('reviewed details failure'),
+        'null' => null,
+        'empty' => [],
+        'non-array' => (object) [],
+        'missing ID' => ['backdrop_url' => 'https://fixture.invalid/missing-id.jpg'],
+        'numeric-string ID' => ['tmdb_id' => '17892'],
+        'float ID' => ['tmdb_id' => 17892.0],
+        'zero ID' => ['tmdb_id' => 0],
+        'negative ID' => ['tmdb_id' => -17892],
+        'mismatched native ID' => ['tmdb_id' => 17893],
+    ] as $label => $invalidDetails) {
+        $invalidReviewedTmdb = new ReviewedIdentityTmdbService(tvDetails: $invalidDetails);
+        $invalidReviewedProgramme = ['title' => 'Unter uns Classics'];
+        $invalidReviewedBefore = $invalidReviewedProgramme;
+        $invalidReviewedCache = [];
+        enrich($plugin, $method, $invalidReviewedProgramme, $invalidReviewedTmdb, $invalidReviewedCache);
+        assertSameValue($invalidReviewedBefore, $invalidReviewedProgramme, 'Invalid reviewed '.$label.' details must not modify programme data.');
+        assertSameValue([], $invalidReviewedCache, 'Invalid reviewed '.$label.' details must not write a cache entry.');
+        assertSameValue([0, 0], [$invalidReviewedTmdb->tvCandidateSearches, $invalidReviewedTmdb->movieCandidateSearches], 'Invalid reviewed '.$label.' details must not fall back to search.');
+        assertSameValue([1, 0], [$invalidReviewedTmdb->tvDetailsRequests, $invalidReviewedTmdb->movieDetailsRequests], 'Invalid reviewed '.$label.' details must make only one TV details request.');
+    }
+
+    $trustedReviewedTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
+    $trustedReviewedProgramme = [
+        'title' => 'Unter uns Classics',
+        'icon' => 'https://provider.invalid/reviewed-primary.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/reviewed-primary.jpg',
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+        ]],
+    ];
+    $trustedReviewedCache = [];
+    enrich($plugin, $method, $trustedReviewedProgramme, $trustedReviewedTv, $trustedReviewedCache);
+    assertSameValue('https://provider.invalid/reviewed-primary.jpg', $trustedReviewedProgramme['icon'] ?? null, 'A trusted source landscape must remain primary for a valid reviewed identity.');
+    assertSameValue($trustedReviewedProgramme['icon'], $trustedReviewedProgramme['images'][0]['url'] ?? null, 'Reviewed identity serialization must retain the trusted primary first.');
+    assertSameValue($trustedReviewedProgramme['icon'], $trustedReviewedProgramme['images'][array_key_last($trustedReviewedProgramme['images'])]['url'] ?? null, 'Reviewed identity serialization must retain the trusted primary last.');
 
     $rankedTmdb = new CandidateTmdbService(
         tvCandidates: [
