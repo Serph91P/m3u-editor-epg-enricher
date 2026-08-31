@@ -43,7 +43,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.29-v1.14.0-deterministic-artwork';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.18.0-persisted-cache-guard';
+
+    /** @var array<string, array{media_type: 'tv'|'movie', tmdb_id: int}> */
+    private const array REVIEWED_TMDB_IDENTITIES = [
+        'unter uns classics' => ['media_type' => 'tv', 'tmdb_id' => 17892],
+        'cerro kishtwar eine eiskalte geschichte' => ['media_type' => 'movie', 'tmdb_id' => 717948],
+    ];
+
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
      *
@@ -1490,7 +1497,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may
         // reuse a separately validated, exact primary TV-series match across episode titles.
-        if (isset($cache[$fullCacheKey])) {
+        $reviewedIdentity = $this->reviewedTmdbIdentityForTitle($title)
+            ?? $this->reviewedTmdbIdentityForEpisodeTitle($title, $baseTitle);
+        $this->removeInvalidTmdbCacheEntries($cache, [
+            $fullCacheKey,
+            $baseCacheKey,
+            $seriesBaseCacheKey,
+        ]);
+        if ($reviewedIdentity !== null) {
+            $matchedViaBase = false;
+            if (array_key_exists($fullCacheKey, $cache)
+                && $this->matchesReviewedTmdbIdentity($cache[$fullCacheKey], $reviewedIdentity)) {
+                $result['cache_hit'] = true;
+                $tmdbData = $cache[$fullCacheKey];
+            } else {
+                $result['lookup'] = true;
+                $tmdbData = $this->loadReviewedTmdbIdentity($tmdb, $reviewedIdentity);
+                if ($tmdbData === null) {
+                    return $result;
+                }
+
+                $cache[$fullCacheKey] = $tmdbData;
+            }
+        } elseif (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
         } elseif ($baseCacheKey !== null && isset($cache[$baseCacheKey])) {
@@ -1516,18 +1545,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $matchedViaBase = $tmdbData !== null;
             }
 
-            // Cache under full title key
-            $cache[$fullCacheKey] = $tmdbData;
-
-            // Preserve the evidence-specific base entry and separately record exact primary
-            // TV-series identities that are safe to reuse across strongly episodic titles.
-            if ($matchedViaBase && $baseCacheKey !== null) {
-                $cache[$baseCacheKey] = $tmdbData;
-            }
-            if ($matchedViaBase
-                && $seriesBaseCacheKey !== null
-                && $this->isReusableBaseSeriesMatch($tmdbData, $baseTitle)) {
-                $cache[$seriesBaseCacheKey] = $tmdbData;
+            if ($tmdbData !== null) {
+                // Preserve successful evidence-specific identities. Abstentions are retried
+                // because a transient candidate error must not become a durable cache miss.
+                $cache[$fullCacheKey] = $tmdbData;
+                if ($matchedViaBase && $baseCacheKey !== null) {
+                    $cache[$baseCacheKey] = $tmdbData;
+                }
+                if ($matchedViaBase
+                    && $seriesBaseCacheKey !== null
+                    && $this->isReusableBaseSeriesMatch($tmdbData, $baseTitle)) {
+                    $cache[$seriesBaseCacheKey] = $tmdbData;
+                }
             }
         }
 
@@ -1925,8 +1954,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $data = json_decode(Storage::disk('local')->get($path), true);
+        if (! is_array($data)) {
+            return [];
+        }
 
-        return is_array($data) ? $data : [];
+        $this->sanitizeTmdbCache($data);
+
+        return $data;
     }
 
     /**
@@ -1953,6 +1987,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function saveTmdbCache(array $cache): void
     {
+        $this->sanitizeTmdbCache($cache);
         Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
         Storage::disk('local')->put(
             'plugin-data/epg-enricher/tmdb-cache.json',
@@ -2788,11 +2823,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
-        $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', $title);
-        $cleaned = preg_replace('/\s*S\d{1,2}E\d{1,2}\s*$/i', '', $cleaned);
-        $cleaned = preg_replace('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
-        $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
-        $cleaned = rtrim(trim($cleaned), "-\u{2013}\u{2014} ");
+        $cleaned = $this->stripRecognizedEpisodeTitleSuffix($title);
 
         // Strip trailing year markers like "(2010)" or " - 2009"
         $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
@@ -2810,6 +2841,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return ['title' => $cleaned, 'year' => $year];
+    }
+
+    private function stripRecognizedEpisodeTitleSuffix(string $title): string
+    {
+        $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', trim($title));
+        $cleaned = preg_replace('/\s*S\d{1,2}E\d{1,2}\s*$/i', '', $cleaned);
+        $cleaned = preg_replace('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
+        $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
+
+        return rtrim(trim($cleaned), "-\u{2013}\u{2014} ");
     }
 
     /**
@@ -2830,6 +2871,71 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     {
         $searchNorm = mb_strtolower(trim($searchTitle));
         $candidates = [];
+
+        if (method_exists($tmdb, 'searchTvSeriesCandidates')
+            && method_exists($tmdb, 'searchMovieCandidates')) {
+            try {
+                if ($forceMediaType !== 'movie') {
+                    $tvCandidates = array_slice($tmdb->searchTvSeriesCandidates($searchTitle, $year, 5), 0, 5);
+                    foreach ($tvCandidates as $candidate) {
+                        if (! $this->isValidRawTmdbCandidate($candidate, 'tv')) {
+                            return null;
+                        }
+                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'tv', $searchNorm, $year, $description, []);
+                    }
+                }
+
+                if ($forceMediaType !== 'tv') {
+                    $movieCandidates = array_slice($tmdb->searchMovieCandidates($searchTitle, $year, 5), 0, 5);
+                    foreach ($movieCandidates as $candidate) {
+                        if (! $this->isValidRawTmdbCandidate($candidate, 'movie')) {
+                            return null;
+                        }
+                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'movie', $searchNorm, $year, $description, []);
+                    }
+                }
+            } catch (\Throwable) {
+                return null;
+            }
+
+            $best = $this->selectTmdbIdentityWinner($candidates);
+            if ($best === null) {
+                return null;
+            }
+
+            try {
+                $details = $best['_media_type'] === 'tv'
+                    ? $tmdb->getTvSeriesDetails((int) $best['tmdb_id'])
+                    : $tmdb->getMovieDetails((int) $best['tmdb_id']);
+            } catch (\Throwable) {
+                return null;
+            }
+            $selectedTmdbId = $best['tmdb_id'];
+            $selectedMediaType = $best['_media_type'];
+            if (! is_array($details)
+                || ! is_int($details['tmdb_id'] ?? null)
+                || $details['tmdb_id'] !== $selectedTmdbId
+                || (array_key_exists('_media_type', $details)
+                    && $details['_media_type'] !== $selectedMediaType)) {
+                return null;
+            }
+            $details = array_merge($details, ['_media_type' => $selectedMediaType]);
+            if (! $this->hasValidTmdbDetailsShape($details, $selectedMediaType)) {
+                return null;
+            }
+            $best = array_merge($best, $details, [
+                'tmdb_id' => $selectedTmdbId,
+                '_media_type' => $selectedMediaType,
+            ]);
+
+            unset($best['_identity_valid'], $best['_identity_score']);
+
+            if (! $this->hasValidTmdbDetailsShape($best, $selectedMediaType)) {
+                return null;
+            }
+
+            return $best;
+        }
 
         if ($forceMediaType !== 'movie') {
             $tvResult = $tmdb->searchTvSeries($searchTitle, $year);
@@ -2855,6 +2961,49 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
+        $best = $this->selectTmdbIdentityWinner($candidates);
+        if ($best === null) {
+            return null;
+        }
+
+        unset($best['_identity_valid'], $best['_identity_score']);
+
+        if (! is_int($best['tmdb_id'] ?? null)
+            || $best['tmdb_id'] <= 0
+            || ! in_array($best['_media_type'] ?? null, ['tv', 'movie'], true)) {
+            return null;
+        }
+        $best['_runtime_trusted_legacy'] = true;
+
+        return $best;
+    }
+
+    private function isValidRawTmdbCandidate(mixed $candidate, string $mediaType): bool
+    {
+        if (! is_array($candidate)
+            || ! is_int($candidate['tmdb_id'] ?? null)
+            || $candidate['tmdb_id'] <= 0) {
+            return false;
+        }
+
+        $requiredFields = $mediaType === 'tv'
+            ? ['name', 'original_name', 'first_air_date', 'overview']
+            : ['title', 'original_title', 'release_date', 'overview'];
+        foreach ($requiredFields as $field) {
+            if (! array_key_exists($field, $candidate)
+                || ($candidate[$field] !== null && ! is_scalar($candidate[$field]))) {
+                return false;
+            }
+        }
+
+        $titleFields = $mediaType === 'tv' ? ['name', 'original_name'] : ['title', 'original_title'];
+
+        return trim((string) $candidate[$titleFields[0]]) !== ''
+            || trim((string) $candidate[$titleFields[1]]) !== '';
+    }
+
+    private function selectTmdbIdentityWinner(array $candidates): ?array
+    {
         usort($candidates, fn (array $a, array $b): int => $b['_identity_score'] <=> $a['_identity_score']);
         $best = $candidates[0] ?? null;
         if ($best === null || $best['_identity_score'] < 76.0 || ! $best['_identity_valid']) {
@@ -2863,8 +3012,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (isset($candidates[1]) && ($best['_identity_score'] - $candidates[1]['_identity_score']) < 8.0) {
             return null;
         }
-
-        unset($best['_identity_valid']);
 
         return $best;
     }
@@ -2971,9 +3118,227 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return trim(preg_replace('/\s+/', ' ', $normalized));
     }
 
+    private function reviewedTmdbIdentityForTitle(string $title): ?array
+    {
+        $identity = self::REVIEWED_TMDB_IDENTITIES[$this->normalizeIdentityText($title)] ?? null;
+        if (! is_array($identity)
+            || ! in_array($identity['media_type'] ?? null, ['tv', 'movie'], true)
+            || ! is_int($identity['tmdb_id'] ?? null)
+            || $identity['tmdb_id'] <= 0) {
+            return null;
+        }
+
+        return $identity;
+    }
+
+    private function reviewedTmdbIdentityForEpisodeTitle(string $title, string $baseTitle): ?array
+    {
+        if ($this->stripRecognizedEpisodeTitleSuffix($title) === trim($title)) {
+            return null;
+        }
+
+        $identity = $this->reviewedTmdbIdentityForTitle($baseTitle);
+
+        return ($identity['media_type'] ?? null) === 'tv' ? $identity : null;
+    }
+
+    private function loadReviewedTmdbIdentity(TmdbService $tmdb, array $identity): ?array
+    {
+        $mediaType = $identity['media_type'];
+        $tmdbId = $identity['tmdb_id'];
+
+        try {
+            $details = $mediaType === 'tv'
+                ? $tmdb->getTvSeriesDetails($tmdbId)
+                : $tmdb->getMovieDetails($tmdbId);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        if (! is_array($details)
+            || ! is_int($details['tmdb_id'] ?? null)
+            || $details['tmdb_id'] <= 0
+            || $details['tmdb_id'] !== $tmdbId) {
+            return null;
+        }
+
+        $tmdbData = array_merge($details, ['_media_type' => $mediaType]);
+
+        return $this->hasValidTmdbDetailsShape($tmdbData, $mediaType)
+            ? $tmdbData
+            : null;
+    }
+
+    private function matchesReviewedTmdbIdentity(mixed $tmdbData, array $identity): bool
+    {
+        return is_array($tmdbData)
+            && ($tmdbData['_media_type'] ?? null) === $identity['media_type']
+            && is_int($tmdbData['tmdb_id'] ?? null)
+            && $tmdbData['tmdb_id'] > 0
+            && $tmdbData['tmdb_id'] === $identity['tmdb_id']
+            && $this->hasValidTmdbDetailsShape($tmdbData, $identity['media_type']);
+    }
+
+    private function hasValidTmdbDetailsShape(array $tmdbData, string $mediaType): bool
+    {
+        $schemas = [
+            'tv' => [
+                'tmdb_id' => 'positive-int',
+                '_media_type' => 'media-type',
+                'tvdb_id' => 'int-null',
+                'imdb_id' => 'string-null',
+                'name' => 'string-null',
+                'original_name' => 'string-null',
+                'overview' => 'string-null',
+                'poster_url' => 'string-null',
+                'backdrop_url' => 'string-null',
+                'first_air_date' => 'string-null',
+                'genres' => 'string',
+                'vote_average' => 'number-null',
+                'vote_count' => 'int-null',
+                'status' => 'string-null',
+                'number_of_seasons' => 'int-null',
+                'number_of_episodes' => 'int-null',
+                'cast' => 'string-null',
+                'director' => 'string-null',
+                'youtube_trailer' => 'string-null',
+            ],
+            'movie' => [
+                'tmdb_id' => 'positive-int',
+                '_media_type' => 'media-type',
+                'imdb_id' => 'string-null',
+                'title' => 'string-null',
+                'original_title' => 'string-null',
+                'overview' => 'string-null',
+                'poster_url' => 'string-null',
+                'backdrop_url' => 'string-null',
+                'release_date' => 'string-null',
+                'genres' => 'string',
+                'vote_average' => 'number-null',
+                'vote_count' => 'int-null',
+                'runtime' => 'int-null',
+                'status' => 'string-null',
+                'cast' => 'string-list',
+                'director' => 'string-list',
+                'youtube_trailer' => 'string-null',
+            ],
+        ];
+        $schema = $schemas[$mediaType] ?? null;
+        if ($schema === null
+            || array_diff_key($schema, $tmdbData) !== []
+            || array_diff_key($tmdbData, $schema) !== []) {
+            return false;
+        }
+
+        foreach ($schema as $field => $type) {
+            $value = $tmdbData[$field];
+            $valid = match ($type) {
+                'positive-int' => is_int($value) && $value > 0,
+                'media-type' => $value === $mediaType,
+                'int-null' => is_int($value) || $value === null,
+                'string' => is_string($value),
+                'string-null' => is_string($value) || $value === null,
+                'number-null' => is_int($value) || is_float($value) || $value === null,
+                'string-list' => is_array($value)
+                    && array_is_list($value)
+                    && count(array_filter($value, 'is_string')) === count($value),
+                default => false,
+            };
+            if (! $valid) {
+                return false;
+            }
+        }
+
+        foreach (['poster_url', 'backdrop_url'] as $field) {
+            if ($tmdbData[$field] !== null
+                && ! $this->isTrustedTmdbImageUrl($tmdbData[$field])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function isTrustedTmdbImageUrl(string $url): bool
+    {
+        $parts = parse_url($url);
+
+        return is_array($parts)
+            && ($parts['scheme'] ?? null) === 'https'
+            && ($parts['host'] ?? null) === 'image.tmdb.org'
+            && ! isset($parts['port'], $parts['user'], $parts['pass'], $parts['query'], $parts['fragment'])
+            && str_starts_with((string) ($parts['path'] ?? ''), '/t/p/');
+    }
+
+    private function isValidTmdbCacheEntry(mixed $tmdbData, bool $allowRuntimeLegacy = false): bool
+    {
+        if (! is_array($tmdbData)) {
+            return false;
+        }
+
+        $mediaType = $tmdbData['_media_type'] ?? null;
+        if (is_string($mediaType)
+            && $this->hasValidTmdbDetailsShape($tmdbData, $mediaType)) {
+            return true;
+        }
+
+        if (! $allowRuntimeLegacy
+            || ($tmdbData['_runtime_trusted_legacy'] ?? null) !== true
+            || ! in_array($mediaType, ['tv', 'movie'], true)
+            || ! is_int($tmdbData['tmdb_id'] ?? null)
+            || $tmdbData['tmdb_id'] <= 0) {
+            return false;
+        }
+
+        foreach (['poster_url', 'backdrop_url', 'overview', 'genres'] as $field) {
+            if (array_key_exists($field, $tmdbData)
+                && ! is_string($tmdbData[$field])
+                && $tmdbData[$field] !== null) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $cache
+     */
+    private function sanitizeTmdbCache(array &$cache): void
+    {
+        foreach ($cache as $key => $entry) {
+            if ($key === '__language') {
+                if (! is_string($entry)) {
+                    unset($cache[$key]);
+                }
+
+                continue;
+            }
+
+            if (! $this->isValidTmdbCacheEntry($entry)) {
+                unset($cache[$key]);
+            }
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $cache
+     * @param  array<int, string|null>  $keys
+     */
+    private function removeInvalidTmdbCacheEntries(array &$cache, array $keys): void
+    {
+        foreach (array_unique(array_filter($keys, 'is_string')) as $key) {
+            if (array_key_exists($key, $cache)
+                && ! $this->isValidTmdbCacheEntry($cache[$key], true)) {
+                unset($cache[$key]);
+            }
+        }
+    }
+
     private function isReusableBaseSeriesMatch(mixed $tmdbData, string $baseTitle): bool
     {
-        if (! is_array($tmdbData) || ($tmdbData['_media_type'] ?? null) !== 'tv') {
+        if (! $this->isValidTmdbCacheEntry($tmdbData, true)
+            || $tmdbData['_media_type'] !== 'tv') {
             return false;
         }
 
