@@ -692,13 +692,19 @@ namespace Tests {
     assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $normalizedReviewedProgramme['icon'] ?? null, 'Case, whitespace, and punctuation equivalents should retain exact reviewed matching.');
     assertSameValue([0, 0], [$normalizedReviewedTv->tvCandidateSearches, $normalizedReviewedTv->movieCandidateSearches], 'Normalized reviewed titles must not search.');
 
-    $reviewedEpisodeTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
-    $reviewedEpisodeProgramme = ['title' => 'Unter uns Classics - Folge 1'];
-    $reviewedEpisodeCache = [];
-    enrich($plugin, $method, $reviewedEpisodeProgramme, $reviewedEpisodeTv, $reviewedEpisodeCache);
-    assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $reviewedEpisodeProgramme['icon'] ?? null, 'A reviewed series title with a recognized episode suffix should retain the reviewed identity.');
-    assertSameValue([0, 0], [$reviewedEpisodeTv->tvCandidateSearches, $reviewedEpisodeTv->movieCandidateSearches], 'A reviewed series episode suffix must not fall back to bounded search.');
-    assertSameValue([1, 0], [$reviewedEpisodeTv->tvDetailsRequests, $reviewedEpisodeTv->movieDetailsRequests], 'A reviewed series episode suffix must load only the reviewed TV details.');
+    foreach ([
+        'Unter uns Classics - Folge 1',
+        'Unter uns Classics S01E01',
+        'Unter uns Classics Folge 1',
+    ] as $reviewedEpisodeTitle) {
+        $reviewedEpisodeTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
+        $reviewedEpisodeProgramme = ['title' => $reviewedEpisodeTitle];
+        $reviewedEpisodeCache = [];
+        enrich($plugin, $method, $reviewedEpisodeProgramme, $reviewedEpisodeTv, $reviewedEpisodeCache);
+        assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $reviewedEpisodeProgramme['icon'] ?? null, $reviewedEpisodeTitle.' should retain the reviewed identity.');
+        assertSameValue([0, 0], [$reviewedEpisodeTv->tvCandidateSearches, $reviewedEpisodeTv->movieCandidateSearches], $reviewedEpisodeTitle.' must not fall back to bounded search.');
+        assertSameValue([1, 0], [$reviewedEpisodeTv->tvDetailsRequests, $reviewedEpisodeTv->movieDetailsRequests], $reviewedEpisodeTitle.' must load only the reviewed TV details.');
+    }
 
     foreach (['Unter uns', 'Unter uns Classics Extra'] as $nearMissTitle) {
         $nearMissTmdb = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);

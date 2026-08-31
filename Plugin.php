@@ -2813,10 +2813,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Strip trailing episode markers: "(12)", "S01E03", "Folge 5", "Teil 2", etc.
         $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', $title);
-        $cleaned = preg_replace('/\s*S\d{1,2}E\d{1,2}\s*$/i', '', $cleaned);
-        $cleaned = preg_replace('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
-        $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/i', '', $cleaned);
-        $cleaned = rtrim(trim($cleaned), "-\u{2013}\u{2014} ");
+        $cleaned = $this->stripRecognizedEpisodeTitleSuffix($cleaned);
 
         // Strip trailing year markers like "(2010)" or " - 2009"
         $cleaned = preg_replace('/\s*\((?:19\d{2}|20\d{2})\)\s*$/', '', $cleaned);
@@ -2834,6 +2831,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return ['title' => $cleaned, 'year' => $year];
+    }
+
+    private function stripRecognizedEpisodeTitleSuffix(string $title): string
+    {
+        $cleaned = preg_replace('/\s*S\d{1,2}E\d{1,2}\s*$/i', '', trim($title));
+        $cleaned = preg_replace('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
+        $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
+
+        return rtrim(trim($cleaned), "-\u{2013}\u{2014} ");
     }
 
     /**
@@ -3092,7 +3098,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
     private function reviewedTmdbIdentityForEpisodeTitle(string $title, string $baseTitle): ?array
     {
-        if (! preg_match('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', $title)) {
+        if ($this->stripRecognizedEpisodeTitleSuffix($title) === trim($title)) {
             return null;
         }
 
