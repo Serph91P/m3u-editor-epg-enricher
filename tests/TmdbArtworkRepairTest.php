@@ -685,19 +685,21 @@ namespace Tests {
     $method->setAccessible(true);
     $searchMethod = $reflection->getMethod('searchTmdbWithValidation');
     $searchMethod->setAccessible(true);
+    $sanitizeTmdbCacheMethod = $reflection->getMethod('sanitizeTmdbCache');
+    $sanitizeTmdbCacheMethod->setAccessible(true);
 
     $reviewedTvDetails = normalizedTvDetailsFixture(
         17892,
         'Unter uns',
         'A reviewed TV identity.',
-        'https://fixture.invalid/unter-uns-poster.jpg',
-        'https://fixture.invalid/unter-uns-backdrop.jpg',
+        'https://image.tmdb.org/t/p/w500/unter-uns-poster.jpg',
+        'https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg',
     );
     $reviewedTv = new ReviewedIdentityTmdbService(tvDetails: $reviewedTvDetails);
     $reviewedTvProgramme = ['title' => 'Unter uns Classics'];
     $reviewedTvCache = [];
     enrich($plugin, $method, $reviewedTvProgramme, $reviewedTv, $reviewedTvCache);
-    assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $reviewedTvProgramme['icon'] ?? null, 'Unter uns Classics should use its reviewed TV identity.');
+    assertSameValue('https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg', $reviewedTvProgramme['icon'] ?? null, 'Unter uns Classics should use its reviewed TV identity.');
     assertSameValue([0, 0], [$reviewedTv->tvCandidateSearches, $reviewedTv->movieCandidateSearches], 'A reviewed TV identity must not search either media type.');
     assertSameValue([1, 0], [$reviewedTv->tvDetailsRequests, $reviewedTv->movieDetailsRequests], 'A reviewed TV identity must load only its TV details once.');
 
@@ -735,14 +737,14 @@ namespace Tests {
         717948,
         'Cerro Kishtwar - Eine eiskalte Geschichte',
         'A reviewed movie identity.',
-        'https://fixture.invalid/cerro-poster.jpg',
-        'https://fixture.invalid/cerro-backdrop.jpg',
+        'https://image.tmdb.org/t/p/w500/cerro-poster.jpg',
+        'https://image.tmdb.org/t/p/original/cerro-backdrop.jpg',
     );
     $reviewedMovie = new ReviewedIdentityTmdbService(movieDetails: $reviewedMovieDetails);
     $reviewedMovieProgramme = ['title' => 'Cerro Kishtwar - Eine eiskalte Geschichte'];
     $reviewedMovieCache = [];
     enrich($plugin, $method, $reviewedMovieProgramme, $reviewedMovie, $reviewedMovieCache);
-    assertSameValue('https://fixture.invalid/cerro-backdrop.jpg', $reviewedMovieProgramme['icon'] ?? null, 'Cerro Kishtwar should use its reviewed movie identity.');
+    assertSameValue('https://image.tmdb.org/t/p/original/cerro-backdrop.jpg', $reviewedMovieProgramme['icon'] ?? null, 'Cerro Kishtwar should use its reviewed movie identity.');
     assertSameValue([0, 0], [$reviewedMovie->tvCandidateSearches, $reviewedMovie->movieCandidateSearches], 'A reviewed movie identity must not search either media type.');
     assertSameValue([0, 1], [$reviewedMovie->tvDetailsRequests, $reviewedMovie->movieDetailsRequests], 'A reviewed movie identity must load only its movie details once.');
 
@@ -750,7 +752,7 @@ namespace Tests {
     $normalizedReviewedProgramme = ['title' => '  UNTER-UNS,   CLASSICS  '];
     $normalizedReviewedCache = [];
     enrich($plugin, $method, $normalizedReviewedProgramme, $normalizedReviewedTv, $normalizedReviewedCache);
-    assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $normalizedReviewedProgramme['icon'] ?? null, 'Case, whitespace, and punctuation equivalents should retain exact reviewed matching.');
+    assertSameValue('https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg', $normalizedReviewedProgramme['icon'] ?? null, 'Case, whitespace, and punctuation equivalents should retain exact reviewed matching.');
     assertSameValue([0, 0], [$normalizedReviewedTv->tvCandidateSearches, $normalizedReviewedTv->movieCandidateSearches], 'Normalized reviewed titles must not search.');
 
     foreach ([
@@ -763,7 +765,7 @@ namespace Tests {
         $reviewedEpisodeProgramme = ['title' => $reviewedEpisodeTitle];
         $reviewedEpisodeCache = [];
         enrich($plugin, $method, $reviewedEpisodeProgramme, $reviewedEpisodeTv, $reviewedEpisodeCache);
-        assertSameValue('https://fixture.invalid/unter-uns-backdrop.jpg', $reviewedEpisodeProgramme['icon'] ?? null, $reviewedEpisodeTitle.' should retain the reviewed identity.');
+        assertSameValue('https://image.tmdb.org/t/p/original/unter-uns-backdrop.jpg', $reviewedEpisodeProgramme['icon'] ?? null, $reviewedEpisodeTitle.' should retain the reviewed identity.');
         assertSameValue([0, 0], [$reviewedEpisodeTv->tvCandidateSearches, $reviewedEpisodeTv->movieCandidateSearches], $reviewedEpisodeTitle.' must not fall back to bounded search.');
         assertSameValue([1, 0], [$reviewedEpisodeTv->tvDetailsRequests, $reviewedEpisodeTv->movieDetailsRequests], $reviewedEpisodeTitle.' must load only the reviewed TV details.');
     }
@@ -832,7 +834,7 @@ namespace Tests {
             602,
             'Ranked Target',
             'The correct synthetic result.',
-            backdropUrl: 'https://fixture.invalid/ranked-target.jpg',
+            backdropUrl: 'https://image.tmdb.org/t/p/original/ranked-target.jpg',
         )],
     );
     $rankedWinner = validatedSearch($plugin, $searchMethod, $rankedTmdb, 'Ranked Target', null, 2024);
@@ -862,7 +864,7 @@ namespace Tests {
             612,
             'Global Choice',
             'The matching synthetic movie.',
-            backdropUrl: 'https://fixture.invalid/global-movie.jpg',
+            backdropUrl: 'https://image.tmdb.org/t/p/original/global-movie.jpg',
         )],
     );
     $globalWinner = validatedSearch($plugin, $searchMethod, $globalTmdb, 'Global Choice', null, 2024);
@@ -899,14 +901,14 @@ namespace Tests {
             702,
             'Details Identity',
             'The selected bounded candidate.',
-            backdropUrl: 'https://fixture.invalid/wrong-id.jpg',
+            backdropUrl: 'https://image.tmdb.org/t/p/original/wrong-id.jpg',
         ),
         'mismatched media type' => array_merge(
             normalizedTvDetailsFixture(
                 701,
                 'Details Identity',
                 'The selected bounded candidate.',
-                backdropUrl: 'https://fixture.invalid/wrong-type.jpg',
+                backdropUrl: 'https://image.tmdb.org/t/p/original/wrong-type.jpg',
             ),
             ['_media_type' => 'movie']
         ),
@@ -928,6 +930,71 @@ namespace Tests {
         );
         assertSameValue(1, $invalidWinnerTmdb->tvDetailsRequests, 'Bounded candidate '.$label.' must make exactly one details request.');
     }
+
+    $cacheGuardService = static fn (bool $throwOnCandidates = false): CandidateTmdbService => new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 711,
+            'name' => 'Cache Guard Series',
+            'original_name' => 'Cache Guard Series',
+            'first_air_date' => '2024-01-01',
+            'overview' => 'A bounded cache guard series.',
+        ]],
+        tvDetails: [711 => normalizedTvDetailsFixture(
+            711,
+            'Cache Guard Series',
+            'A bounded cache guard series.',
+            backdropUrl: 'https://image.tmdb.org/t/p/original/cache-guard.jpg',
+        )],
+        throwOnTvCandidates: $throwOnCandidates,
+    );
+    $cacheGuardProgramme = ['title' => 'Cache Guard Series', 'episode_num' => '0.0.'];
+    $cacheGuardSeed = $cacheGuardProgramme;
+    $cacheGuardCache = [];
+    enrich($plugin, $method, $cacheGuardSeed, $cacheGuardService(), $cacheGuardCache);
+    $cacheGuardKey = array_key_first($cacheGuardCache);
+    assertSameValue(true, is_string($cacheGuardKey), 'A valid bounded lookup should persist its full cache key.');
+
+    $maliciousCacheEntry = array_merge(
+        normalizedTvDetailsFixture(
+            777,
+            'Cache Guard Series',
+            'A poisoned persisted cache entry.',
+            backdropUrl: 'https://attacker.invalid/cache-poison.jpg',
+        ),
+        ['_media_type' => 'tv']
+    );
+    $cacheGuardCache[$cacheGuardKey] = $maliciousCacheEntry;
+    $cacheGuardReplay = $cacheGuardProgramme;
+    $cacheGuardRepairTmdb = $cacheGuardService();
+    $cacheGuardRepairResult = enrich($plugin, $method, $cacheGuardReplay, $cacheGuardRepairTmdb, $cacheGuardCache);
+    assertSameValue(false, $cacheGuardRepairResult['cache_hit'] ?? null, 'Malformed generic cache data must not count as a cache hit.');
+    assertSameValue('https://image.tmdb.org/t/p/original/cache-guard.jpg', $cacheGuardReplay['icon'] ?? null, 'Malformed generic cache data must reload the bounded validated identity.');
+    assertSameValue([1, 1], [$cacheGuardRepairTmdb->tvCandidateSearches, $cacheGuardRepairTmdb->movieCandidateSearches], 'Malformed generic cache data must perform at most one bounded lookup per media type.');
+    assertSameValue(711, $cacheGuardCache[$cacheGuardKey]['tmdb_id'] ?? null, 'A repaired generic cache entry must persist the validated native identity.');
+
+    $cacheGuardCache[$cacheGuardKey] = $maliciousCacheEntry;
+    $cacheGuardFailure = $cacheGuardProgramme;
+    $cacheGuardFailureBefore = $cacheGuardFailure;
+    enrich($plugin, $method, $cacheGuardFailure, $cacheGuardService(true), $cacheGuardCache);
+    assertSameValue($cacheGuardFailureBefore, $cacheGuardFailure, 'Malformed generic cache data must fail closed when bounded reload fails.');
+    assertSameValue(false, array_key_exists($cacheGuardKey, $cacheGuardCache), 'Malformed generic cache data must not remain persisted after bounded reload fails.');
+
+    $persistedCache = [
+        '__language' => 'de-DE',
+        'full' => $maliciousCacheEntry,
+        'base' => array_merge($maliciousCacheEntry, ['_runtime_trusted_legacy' => true]),
+        'series' => ['_media_type' => 'movie', 'tmdb_id' => 0],
+        'valid' => array_merge(
+            normalizedTvDetailsFixture(711, 'Cache Guard Series', 'A bounded cache guard series.'),
+            ['_media_type' => 'tv']
+        ),
+    ];
+    $sanitizeTmdbCacheMethod->invokeArgs($plugin, [&$persistedCache]);
+    assertSameValue(
+        ['__language', 'valid'],
+        array_keys($persistedCache),
+        'Persisted full, base, and series cache entries must all use the exact normalized schema.'
+    );
 
     $thresholdTmdb = new CandidateTmdbService(tvCandidates: [[
         'tmdb_id' => 631,

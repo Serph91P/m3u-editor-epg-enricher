@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.17.0-identity-details-guard';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.18.0-persisted-cache-guard';
 
     /** @var array<string, array{media_type: 'tv'|'movie', tmdb_id: int}> */
     private const array REVIEWED_TMDB_IDENTITIES = [
@@ -1499,6 +1499,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // reuse a separately validated, exact primary TV-series match across episode titles.
         $reviewedIdentity = $this->reviewedTmdbIdentityForTitle($title)
             ?? $this->reviewedTmdbIdentityForEpisodeTitle($title, $baseTitle);
+        $this->removeInvalidTmdbCacheEntries($cache, [
+            $fullCacheKey,
+            $baseCacheKey,
+            $seriesBaseCacheKey,
+        ]);
         if ($reviewedIdentity !== null) {
             $matchedViaBase = false;
             if (array_key_exists($fullCacheKey, $cache)
@@ -1949,8 +1954,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $data = json_decode(Storage::disk('local')->get($path), true);
+        if (! is_array($data)) {
+            return [];
+        }
 
-        return is_array($data) ? $data : [];
+        $this->sanitizeTmdbCache($data);
+
+        return $data;
     }
 
     /**
@@ -1977,6 +1987,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function saveTmdbCache(array $cache): void
     {
+        $this->sanitizeTmdbCache($cache);
         Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
         Storage::disk('local')->put(
             'plugin-data/epg-enricher/tmdb-cache.json',
@@ -2917,7 +2928,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 '_media_type' => $selectedMediaType,
             ]);
 
-            unset($best['_identity_valid']);
+            unset($best['_identity_valid'], $best['_identity_score']);
+
+            if (! $this->hasValidTmdbDetailsShape($best, $selectedMediaType)) {
+                return null;
+            }
 
             return $best;
         }
@@ -2951,7 +2966,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return null;
         }
 
-        unset($best['_identity_valid']);
+        unset($best['_identity_valid'], $best['_identity_score']);
+
+        if (! is_int($best['tmdb_id'] ?? null)
+            || $best['tmdb_id'] <= 0
+            || ! in_array($best['_media_type'] ?? null, ['tv', 'movie'], true)) {
+            return null;
+        }
+        $best['_runtime_trusted_legacy'] = true;
 
         return $best;
     }
@@ -3227,12 +3249,96 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
+        foreach (['poster_url', 'backdrop_url'] as $field) {
+            if ($tmdbData[$field] !== null
+                && ! $this->isTrustedTmdbImageUrl($tmdbData[$field])) {
+                return false;
+            }
+        }
+
         return true;
+    }
+
+    private function isTrustedTmdbImageUrl(string $url): bool
+    {
+        $parts = parse_url($url);
+
+        return is_array($parts)
+            && ($parts['scheme'] ?? null) === 'https'
+            && ($parts['host'] ?? null) === 'image.tmdb.org'
+            && ! isset($parts['port'], $parts['user'], $parts['pass'], $parts['query'], $parts['fragment'])
+            && str_starts_with((string) ($parts['path'] ?? ''), '/t/p/');
+    }
+
+    private function isValidTmdbCacheEntry(mixed $tmdbData, bool $allowRuntimeLegacy = false): bool
+    {
+        if (! is_array($tmdbData)) {
+            return false;
+        }
+
+        $mediaType = $tmdbData['_media_type'] ?? null;
+        if (is_string($mediaType)
+            && $this->hasValidTmdbDetailsShape($tmdbData, $mediaType)) {
+            return true;
+        }
+
+        if (! $allowRuntimeLegacy
+            || ($tmdbData['_runtime_trusted_legacy'] ?? null) !== true
+            || ! in_array($mediaType, ['tv', 'movie'], true)
+            || ! is_int($tmdbData['tmdb_id'] ?? null)
+            || $tmdbData['tmdb_id'] <= 0) {
+            return false;
+        }
+
+        foreach (['poster_url', 'backdrop_url', 'overview', 'genres'] as $field) {
+            if (array_key_exists($field, $tmdbData)
+                && ! is_string($tmdbData[$field])
+                && $tmdbData[$field] !== null) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $cache
+     */
+    private function sanitizeTmdbCache(array &$cache): void
+    {
+        foreach ($cache as $key => $entry) {
+            if ($key === '__language') {
+                if (! is_string($entry)) {
+                    unset($cache[$key]);
+                }
+
+                continue;
+            }
+
+            if (! $this->isValidTmdbCacheEntry($entry)) {
+                unset($cache[$key]);
+            }
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $cache
+     * @param  array<int, string|null>  $keys
+     */
+    private function removeInvalidTmdbCacheEntries(array &$cache, array $keys): void
+    {
+        foreach (array_unique(array_filter($keys, 'is_string')) as $key) {
+            if (array_key_exists($key, $cache)
+                && ! $this->isValidTmdbCacheEntry($cache[$key], true)) {
+                unset($cache[$key]);
+            }
+        }
     }
 
     private function isReusableBaseSeriesMatch(mixed $tmdbData, string $baseTitle): bool
     {
-        if (! is_array($tmdbData) || ($tmdbData['_media_type'] ?? null) !== 'tv') {
+        if (! $this->isValidTmdbCacheEntry($tmdbData, true)
+            || $tmdbData['_media_type'] !== 'tv') {
             return false;
         }
 
