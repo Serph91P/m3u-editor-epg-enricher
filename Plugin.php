@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.08.31-v1.20.0-global-compound-identity';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.01-xmltv-ns-trailing-dot';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -3537,7 +3537,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $subtitle = trim((string) ($programme['subtitle'] ?? ''));
         $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
 
-        [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+        $season = null;
+        $episode = null;
+        $typedEpisodeNums = is_array($programme['episode_nums'] ?? null)
+            ? $programme['episode_nums']
+            : [];
+        foreach ($typedEpisodeNums as $typedEpisodeNum) {
+            if (! is_array($typedEpisodeNum)
+                || strtolower(trim((string) ($typedEpisodeNum['system'] ?? ''))) !== 'xmltv_ns') {
+                continue;
+            }
+
+            $value = trim((string) ($typedEpisodeNum['value'] ?? ''));
+            if (preg_match('/^(\d+)\.(\d+)(?:\.\d*)?(?:\/\d+)?$/', $value, $matches)) {
+                $season = (int) $matches[1] + 1;
+                $episode = (int) $matches[2] + 1;
+                break;
+            }
+        }
+
+        if ($season === null && $episode === null) {
+            [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
+        }
         $seFromText = false;
         if ($season === null && $episode === null) {
             $haystack = $subtitle.' '.trim((string) ($programme['desc'] ?? ''));
