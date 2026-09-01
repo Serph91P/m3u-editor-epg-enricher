@@ -648,6 +648,25 @@ namespace Tests {
     $searchMethod->setAccessible(true);
     $sanitizeTmdbCacheMethod = $reflection->getMethod('sanitizeTmdbCache');
     $sanitizeTmdbCacheMethod->setAccessible(true);
+    $detectSeriesSignalsMethod = $reflection->getMethod('detectSeriesSignals');
+    $detectSeriesSignalsMethod->setAccessible(true);
+
+    assertSameValue(
+        [
+            'is_series_episode' => true,
+            'season' => 23,
+            'episode' => 7,
+            'confidence' => 'high',
+        ],
+        $detectSeriesSignalsMethod->invoke($plugin, [
+            'subtitle' => 'Episode fixture',
+            'episode_num' => '22.6.',
+            'episode_nums' => [
+                ['system' => 'xmltv_ns', 'value' => '22.6.'],
+            ],
+        ]),
+        'A trailing-dot XMLTV NS value should resolve its zero-based season and episode.'
+    );
 
     $genericClassicDetails = normalizedTvDetailsFixture(
         701,
@@ -1371,7 +1390,10 @@ namespace Tests {
     $episodeStill = [
         'title' => 'Ghosts - Der Fahrgeist',
         'desc' => 'Ein Ausflug bringt die Geister durcheinander.',
-        'episode_num' => '0.5',
+        'episode_num' => '0.5.',
+        'episode_nums' => [
+            ['system' => 'xmltv_ns', 'value' => '0.5.'],
+        ],
         'category' => 'Series',
         'icon' => 'https://fixture.invalid/ghosts-backdrop.jpg',
         'images' => [
