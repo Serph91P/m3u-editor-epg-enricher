@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.01-xmltv-ns-trailing-dot';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.02-series-movie-primary';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1395,7 +1395,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && ! $isSeriesLikeCategory;
 
         if (! $overwrite
-            && (! $wantsArtwork || $trustedLandscapeIcon)
+            && (! $wantsArtwork || ($trustedLandscapeIcon && ! $trustedEpisodeStillIcon))
             && ! $trustedNonTmdbLandscapeIcon
             && ($hasCategory || ! $enrichCategories)
             && ($hasDesc || ! $enrichDescriptions)
@@ -1716,10 +1716,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $backdropUrl = $tmdbData['backdrop_url'] ?? null;
         }
 
-        // Primary <icon> in XMLTV: prefer a quality-qualified landscape backdrop over a
-        // portrait poster. Exact episode stills below retain their higher priority.
+        // Primary <icon> in XMLTV: prefer the correctly matched series or movie backdrop.
+        // Exact episode stills remain typed secondary artwork for capable clients.
         if ($enrichBackdrops && $backdropUrl
-            && ($overwrite || ! $trustedLandscapeIcon)
+            && ($overwrite || ! $trustedLandscapeIcon || $trustedEpisodeStillIcon)
             && ($programme['icon'] ?? null) !== $backdropUrl) {
             $programme['icon'] = $backdropUrl;
             $result['poster'] = true;
@@ -1838,11 +1838,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                             'source' => 'tmdb',
                             'scope' => 'episode',
                         ];
-                        $result['changed'] = true;
-                    }
-                    if (($programme['icon'] ?? null) !== $stillUrl) {
-                        $programme['icon'] = $stillUrl;
-                        $result['poster'] = true;
                         $result['changed'] = true;
                     }
                 }
@@ -2527,11 +2522,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Sort $programme['images'][] by orientation+type+width so the first usable
-     * landscape image becomes the primary. Attribute-blind clients (Emby,
-     * Tvheadend) only read the first <icon>; this guarantees they get a wide
-     * image. Attribute-aware clients (Kodi, Jellyfin, Plex) keep using
-     * type/orient/width to pick the right variant per view.
+     * Sort $programme['images'][] by role, orientation, and width so the
+     * correctly matched series or movie backdrop outranks secondary episode
+     * stills, posters, and logos. Finalization then brackets those secondary
+     * images with the selected primary for both first-only and last-wins XMLTV
+     * consumers, while attribute-aware clients retain every typed variant.
      *
      * Type and orientation rank before width, so a large logo or portrait can
      * never outrank a real landscape image.
@@ -2549,11 +2544,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $type = strtolower((string) ($img['type'] ?? 'poster'));
             $orient = strtoupper((string) ($img['orient'] ?? 'P'));
             $width = (int) ($img['width'] ?? 0);
-            $isEpisodeStill = $type === 'screenshot'
-                && ($img['source'] ?? null) === 'tmdb'
-                && ($img['scope'] ?? null) === 'episode';
             $base = match ($type) {
-                'screenshot' => $isEpisodeStill && $orient === 'L' ? 600 : ($orient === 'L' ? 300 : 130),
+                'screenshot' => $orient === 'L' ? 300 : 130,
                 'backdrop' => $orient === 'L' ? 500 : 150,
                 'fanart' => $orient === 'L' ? 400 : 140,
                 'poster' => 100,
