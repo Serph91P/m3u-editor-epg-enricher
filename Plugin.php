@@ -2522,11 +2522,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Sort $programme['images'][] by orientation+type+width so the first usable
-     * landscape image becomes the primary. Attribute-blind clients (Emby,
-     * Tvheadend) only read the first <icon>; this guarantees they get a wide
-     * image. Attribute-aware clients (Kodi, Jellyfin, Plex) keep using
-     * type/orient/width to pick the right variant per view.
+     * Sort $programme['images'][] by role, orientation, and width so the
+     * correctly matched series or movie backdrop outranks secondary episode
+     * stills, posters, and logos. Finalization then brackets those secondary
+     * images with the selected primary for both first-only and last-wins XMLTV
+     * consumers, while attribute-aware clients retain every typed variant.
      *
      * Type and orientation rank before width, so a large logo or portrait can
      * never outrank a real landscape image.
