@@ -1430,18 +1430,19 @@ namespace Tests {
         true,
     );
     assertSameValue(
-        'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
+        'https://fixture.invalid/ghosts-backdrop.jpg',
         $episodeStill['icon'] ?? null,
-        'An exact episode still should be the programme icon even when a series backdrop exists.'
+        'A correctly matched series backdrop should remain the programme icon when an exact episode still exists.'
     );
     assertSameValue(
-        ['screenshot', 'backdrop', 'poster', 'screenshot'],
+        ['backdrop', 'screenshot', 'poster', 'backdrop'],
         array_column($episodeStill['images'] ?? [], 'type'),
-        'The exact episode still should bracket series backdrop and poster alternatives.'
+        'The series backdrop should bracket the typed episode still and poster alternatives.'
     );
-    assertSameValue('tmdb', $episodeStill['images'][0]['source'] ?? null, 'Validated episode-still provenance should win URL deduplication.');
-    assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal episode image should duplicate the exact still primary.');
-    assertSameValue('screenshot', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal episode primary duplicate should retain its screenshot type.');
+    assertSameValue('tmdb', $episodeStill['images'][1]['source'] ?? null, 'The exact episode still should retain its TMDB provenance as secondary artwork.');
+    assertSameValue('episode', $episodeStill['images'][1]['scope'] ?? null, 'The exact episode still should remain explicitly episode-scoped.');
+    assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal image should duplicate the series-backdrop primary.');
+    assertSameValue('backdrop', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal primary duplicate should retain its backdrop type.');
 
     $nextEpisodeStill = [
         'title' => 'Ghosts - Es bleibt in der Familie',
@@ -1460,8 +1461,73 @@ namespace Tests {
         $episodeImagesCache,
         true,
     );
-    assertSameValue('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should select its own exact still.');
+    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should keep the correctly matched series backdrop primary.');
+    assertTrueValue(
+        in_array('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', array_column($nextEpisodeStill['images'] ?? [], 'url'), true),
+        'A second episode should retain its exact still as secondary artwork.'
+    );
     assertSameValue(1, $episodeTmdb->seasonRequests, 'Episodes in one validated series season should safely reuse the season payload.');
+
+    $persistedEpisodePrimary = [
+        'title' => 'Ghosts - Der Fahrgeist',
+        'desc' => 'Ein Ausflug bringt die Geister durcheinander.',
+        'episode_num' => '0.5.',
+        'category' => 'Series',
+        'icon' => 'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
+        'images' => [
+            [
+                'url' => 'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
+                'type' => 'screenshot',
+                'orient' => 'L',
+                'width' => 1280,
+                'height' => 720,
+                'size' => 2,
+                'source' => 'tmdb',
+                'scope' => 'episode',
+            ],
+            [
+                'url' => 'https://fixture.invalid/ghosts-backdrop.jpg',
+                'type' => 'backdrop',
+                'orient' => 'L',
+                'width' => 1920,
+                'height' => 1080,
+                'size' => 1,
+                'source' => 'tmdb',
+                'scope' => 'series',
+                'artwork_quality' => 'tmdb_vote_evidence',
+            ],
+        ],
+    ];
+    enrich(
+        $plugin,
+        $method,
+        $persistedEpisodePrimary,
+        $episodeTmdb,
+        $episodeStillCache,
+        [],
+        $episodeSeasonCache,
+        $episodeImagesCache,
+        true,
+    );
+    assertSameValue(
+        'https://fixture.invalid/ghosts-backdrop.jpg',
+        $persistedEpisodePrimary['icon'] ?? null,
+        'A rerun should replace a persisted episode-still primary with the correctly matched series backdrop.'
+    );
+    assertSameValue(
+        $persistedEpisodePrimary['icon'],
+        $persistedEpisodePrimary['images'][0]['url'] ?? null,
+        'The repaired series backdrop should be the first XMLTV image.'
+    );
+    assertSameValue(
+        $persistedEpisodePrimary['icon'],
+        $persistedEpisodePrimary['images'][array_key_last($persistedEpisodePrimary['images'])]['url'] ?? null,
+        'The repaired series backdrop should be the final XMLTV image.'
+    );
+    assertTrueValue(
+        in_array('https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg', array_column($persistedEpisodePrimary['images'] ?? [], 'url'), true),
+        'Repairing a persisted primary should preserve the exact episode still as secondary artwork.'
+    );
 
     $episodeWithoutStill = [
         'title' => 'Ghosts - Ohne Szenenbild',
