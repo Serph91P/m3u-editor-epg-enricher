@@ -43,6 +43,7 @@ jobs:
           php -l Plugin.php
           echo "✓ Plugin.php has no syntax errors"
           php scripts/validate-plugin.php
+          python3 tests/release_metadata_test.py
 
       - name: Determine bump type from commits
         id: bump
@@ -63,18 +64,7 @@ jobs:
             COMMITS=$(git log --pretty=format:'%s' --no-merges)
           fi
 
-          BUMP="none"
-
-          # Check for breaking changes → major
-          if echo "$COMMITS" | grep -qiE '^[a-z]+(\(.+\))?!:|BREAKING CHANGE'; then
-            BUMP="major"
-          # Check for feat: → minor
-          elif echo "$COMMITS" | grep -qiE '^feat(\(.+\))?:'; then
-            BUMP="minor"
-          # Check for fix:/perf:/refactor: → patch
-          elif echo "$COMMITS" | grep -qiE '^(fix|perf|refactor|style|build|ci|chore|docs|test)(\(.+\))?:'; then
-            BUMP="patch"
-          fi
+          BUMP=$(printf '%s\n' "$COMMITS" | scripts/release-commit-metadata.sh classify)
 
           echo "type=$BUMP" >> "$GITHUB_OUTPUT"
           echo "Bump type (auto-detected): $BUMP"
@@ -113,6 +103,7 @@ jobs:
           else
             COMMITS=$(git log --pretty=format:'%s' --no-merges | grep -v '^chore: bump version' || true)
           fi
+          COMMITS=$(printf '%s\n' "$COMMITS" | scripts/release-commit-metadata.sh normalize)
 
           # Group commits by type
           FEATURES=$(echo "$COMMITS" | grep -iE '^feat(\(.+\))?:' | sed 's/^feat\([^)]*\)\?: *//' | sed 's/^/- /' || true)
