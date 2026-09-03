@@ -3170,13 +3170,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             : [$candidate['title'] ?? '', $candidate['original_title'] ?? ''];
         $bestTitleScore = 0.0;
         $bestTitleSource = 'primary';
-        $hasCompleteTitlePrefix = false;
         foreach ($titleFields as $title) {
             $title = (string) $title;
             $titleScore = $this->titleMatchScore($searchNorm, $title);
             if ($mediaType === 'tv' && $this->isCompleteTitlePrefix($searchNorm, $title)) {
-                $titleScore = max($titleScore, 0.9);
-                $hasCompleteTitlePrefix = true;
+                $titleScore = max($titleScore, 0.95);
             }
             $bestTitleScore = max($bestTitleScore, $titleScore);
         }
@@ -3211,8 +3209,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $candidate['_media_type'] = $mediaType;
         $candidate['_identity_score'] = round($identityScore, 3);
-        $candidate['_identity_valid'] = $alternativeIsStrong
-            && (! $hasCompleteTitlePrefix || $descriptionScore >= 4);
+        $candidate['_identity_valid'] = $alternativeIsStrong;
 
         return $candidate;
     }
@@ -3282,9 +3279,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return false;
         }
 
-        return (preg_match('/[!?]$/u', $candidateTitle) === 1
-                && preg_match('/^\s+\S/u', $suffix) === 1)
-            || preg_match('/^\s+(?:-|\x{2013}|\x{2014}|\||:)\s+\S/u', $suffix) === 1;
+        return preg_match('/[!?]$/u', $candidateTitle) === 1
+            && preg_match('/^\s+\S/u', $suffix) === 1;
     }
 
     private function hasValidTmdbDetailsShape(array $tmdbData, string $mediaType): bool

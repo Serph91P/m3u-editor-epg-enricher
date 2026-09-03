@@ -1095,13 +1095,16 @@ namespace Tests {
     );
     assertSameValue(1, $titlePrefixTmdb->tvDetailsRequests, 'A corroborated complete title prefix should load its validated TV details.');
 
-    $uncorroboratedPrefixTmdb = new CandidateTmdbService(tvCandidates: [$titlePrefixCandidate]);
-    assertSameValue(
-        null,
-        validatedSearch($plugin, $searchMethod, $uncorroboratedPrefixTmdb, 'Signal Patrol! We Take Care Of It', 'tv'),
-        'A complete title prefix without corroborating description evidence must remain rejected.'
+    $punctuatedPrefixWithoutDescriptionTmdb = new CandidateTmdbService(
+        tvCandidates: [$titlePrefixCandidate],
+        tvDetails: [632 => $titlePrefixDetails],
     );
-    assertSameValue(0, $uncorroboratedPrefixTmdb->tvDetailsRequests, 'An uncorroborated title prefix must not load details.');
+    assertSameValue(
+        632,
+        validatedSearch($plugin, $searchMethod, $punctuatedPrefixWithoutDescriptionTmdb, 'Signal Patrol! We Take Care Of It', 'tv')['tmdb_id'] ?? null,
+        'A complete multi-word TV title ending in punctuation should remain strong identity evidence without description overlap.'
+    );
+    assertSameValue(1, $punctuatedPrefixWithoutDescriptionTmdb->tvDetailsRequests, 'A punctuated complete-title prefix should load the validated TV details exactly once.');
 
     $plainWordPrefixCandidate = $titlePrefixCandidate;
     $plainWordPrefixCandidate['name'] = 'Signal Patrol';
