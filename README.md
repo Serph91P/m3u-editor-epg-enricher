@@ -56,9 +56,9 @@ Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because n
 
 ## Artwork Ordering and Emby
 
-When a validated TMDB landscape backdrop is added, it is written as the programme icon and both the first and final `images` entries. This is standards-compatible with XMLTV consumers that use either the first or final icon. Useful source portraits remain between those primary boundaries for clients that support multiple artwork variants, and an existing verified source landscape is preserved unless overwrite is enabled.
+When a validated TMDB episode still is available, it is written as the programme icon and both the first and final `images` entries. The matched series backdrop remains typed secondary artwork for clients that can distinguish screenshot and backdrop roles. Movies and episodes without a still use the matched backdrop; when no usable landscape artwork exists, a validated poster is the fallback. Logos are never placed at the primary boundaries. This is compatible with XMLTV consumers that use either the first or final icon. With overwrite disabled, an existing verified provider landscape remains primary and the exact TMDB still is retained as a typed alternative.
 
-The enriched JSONL cache and generated XMLTV can be correct while Emby still displays older guide artwork. Emby imports and persists programme images separately and may continue serving its stored image after the XMLTV source changes. Refreshing or clearing stale guide data in Emby is a downstream maintenance action; this plugin does not use Emby-specific overwrites or change programme identities to force an artwork refresh.
+Emby 4.9.5 imports the final XMLTV icon as a single programme `Primary` image and does not reliably preserve the custom screenshot/backdrop distinction; Kodi can use the typed alternatives. The enriched JSONL cache and generated XMLTV can therefore contain both roles while Emby shows the selected programme thumbnail in both guide and detail views. Emby also persists imported programme images separately and may continue serving an older image after the XMLTV source changes. Refreshing or clearing stale guide data in Emby is a downstream maintenance action; this plugin does not use Emby-specific overwrites or change programme identities to force an artwork refresh.
 
 ## Version History
 

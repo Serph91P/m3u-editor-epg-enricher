@@ -1403,6 +1403,7 @@ namespace Tests {
                 'orient' => 'L',
                 'width' => 1920,
                 'height' => 1080,
+                'source' => 'tmdb',
                 'scope' => 'series',
             ],
             [
@@ -1430,19 +1431,19 @@ namespace Tests {
         true,
     );
     assertSameValue(
-        'https://fixture.invalid/ghosts-backdrop.jpg',
+        'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
         $episodeStill['icon'] ?? null,
-        'A correctly matched series backdrop should remain the programme icon when an exact episode still exists.'
+        'An exact episode still should be the programme thumbnail when it exists.'
     );
     assertSameValue(
-        ['backdrop', 'screenshot', 'poster', 'backdrop'],
+        ['screenshot', 'backdrop', 'poster', 'screenshot'],
         array_column($episodeStill['images'] ?? [], 'type'),
-        'The series backdrop should bracket the typed episode still and poster alternatives.'
+        'The episode still should bracket the series backdrop and poster alternatives.'
     );
-    assertSameValue('tmdb', $episodeStill['images'][1]['source'] ?? null, 'The exact episode still should retain its TMDB provenance as secondary artwork.');
-    assertSameValue('episode', $episodeStill['images'][1]['scope'] ?? null, 'The exact episode still should remain explicitly episode-scoped.');
-    assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal image should duplicate the series-backdrop primary.');
-    assertSameValue('backdrop', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal primary duplicate should retain its backdrop type.');
+    assertSameValue('tmdb', $episodeStill['images'][0]['source'] ?? null, 'The exact episode still should retain its TMDB provenance as primary artwork.');
+    assertSameValue('episode', $episodeStill['images'][0]['scope'] ?? null, 'The exact episode still should remain explicitly episode-scoped.');
+    assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal image should duplicate the episode-still primary.');
+    assertSameValue('screenshot', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal primary duplicate should retain its screenshot type.');
 
     $nextEpisodeStill = [
         'title' => 'Ghosts - Es bleibt in der Familie',
@@ -1461,12 +1462,58 @@ namespace Tests {
         $episodeImagesCache,
         true,
     );
-    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should keep the correctly matched series backdrop primary.');
+    assertSameValue('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should use its own exact still as the programme thumbnail.');
     assertTrueValue(
         in_array('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', array_column($nextEpisodeStill['images'] ?? [], 'url'), true),
-        'A second episode should retain its exact still as secondary artwork.'
+        'A second episode should retain its exact still as primary artwork.'
     );
     assertSameValue(1, $episodeTmdb->seasonRequests, 'Episodes in one validated series season should safely reuse the season payload.');
+
+    $trustedProviderEpisode = [
+        'title' => 'Ghosts - Hau den Putz',
+        'desc' => 'Die Geister versuchen, das Haus zu retten.',
+        'episode_nums' => [
+            ['system' => 'xmltv_ns', 'value' => '0.5.'],
+        ],
+        'category' => 'Series',
+        'icon' => 'https://provider.invalid/ghosts-s01e06.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/ghosts-s01e06.jpg',
+            'type' => 'screenshot',
+            'orient' => 'L',
+            'width' => 1280,
+            'height' => 720,
+            'size' => 2,
+            'source' => 'schedules_direct',
+            'scope' => 'programme',
+        ]],
+    ];
+    $trustedProviderCache = [];
+    $trustedProviderSeasonCache = [];
+    $trustedProviderImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $trustedProviderEpisode,
+        new TmdbService('ghosts'),
+        $trustedProviderCache,
+        [],
+        $trustedProviderSeasonCache,
+        $trustedProviderImagesCache,
+        true,
+        false,
+    );
+    assertSameValue(
+        'https://provider.invalid/ghosts-s01e06.jpg',
+        $trustedProviderEpisode['icon'] ?? null,
+        'A trusted provider programme thumbnail must survive exact episode lookup when overwrite is disabled.'
+    );
+    assertSameValue($trustedProviderEpisode['icon'], $trustedProviderEpisode['images'][0]['url'] ?? null, 'The preserved provider thumbnail should be the first XMLTV image.');
+    assertSameValue($trustedProviderEpisode['icon'], $trustedProviderEpisode['images'][array_key_last($trustedProviderEpisode['images'])]['url'] ?? null, 'The preserved provider thumbnail should be the final XMLTV image.');
+    assertTrueValue(
+        in_array('https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg', array_column($trustedProviderEpisode['images'] ?? [], 'url'), true),
+        'The exact TMDB episode still should remain available as a typed alternative.'
+    );
 
     $persistedEpisodePrimary = [
         'title' => 'Ghosts - Der Fahrgeist',
@@ -1509,24 +1556,25 @@ namespace Tests {
         $episodeImagesCache,
         true,
     );
+
     assertSameValue(
-        'https://fixture.invalid/ghosts-backdrop.jpg',
+        'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
         $persistedEpisodePrimary['icon'] ?? null,
-        'A rerun should replace a persisted episode-still primary with the correctly matched series backdrop.'
+        'A rerun should preserve a valid persisted episode-still primary.'
     );
     assertSameValue(
         $persistedEpisodePrimary['icon'],
         $persistedEpisodePrimary['images'][0]['url'] ?? null,
-        'The repaired series backdrop should be the first XMLTV image.'
+        'The episode still should be the first XMLTV image.'
     );
     assertSameValue(
         $persistedEpisodePrimary['icon'],
         $persistedEpisodePrimary['images'][array_key_last($persistedEpisodePrimary['images'])]['url'] ?? null,
-        'The repaired series backdrop should be the final XMLTV image.'
+        'The episode still should be the final XMLTV image.'
     );
     assertTrueValue(
-        in_array('https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg', array_column($persistedEpisodePrimary['images'] ?? [], 'url'), true),
-        'Repairing a persisted primary should preserve the exact episode still as secondary artwork.'
+        in_array('https://fixture.invalid/ghosts-backdrop.jpg', array_column($persistedEpisodePrimary['images'] ?? [], 'url'), true),
+        'The series backdrop should remain available as secondary artwork.'
     );
 
     $episodeWithoutStill = [
@@ -1681,8 +1729,10 @@ namespace Tests {
     ];
     $posterOnlyCache = [];
     enrich($plugin, $method, $posterOnly, new TmdbService('poster-only'), $posterOnlyCache);
-    assertSameValue(null, $posterOnly['icon'] ?? null, 'Portrait posters and logos should not be promoted when no landscape programme artwork exists.');
-    assertSameValue(['poster', 'logo'], array_column($posterOnly['images'] ?? [], 'type'), 'Poster and logo roles should remain ordered without a landscape primary.');
+    assertSameValue('https://fixture.invalid/poster-only.jpg', $posterOnly['icon'] ?? null, 'A poster should be the programme-thumbnail fallback when no landscape artwork exists.');
+    assertSameValue(['poster', 'logo', 'poster'], array_column($posterOnly['images'] ?? [], 'type'), 'The poster fallback should bracket secondary artwork so a logo can never become Emby Primary.');
+    assertSameValue($posterOnly['icon'], $posterOnly['images'][0]['url'] ?? null, 'The poster fallback should be the first XMLTV image.');
+    assertSameValue($posterOnly['icon'], $posterOnly['images'][array_key_last($posterOnly['images'])]['url'] ?? null, 'The poster fallback should also be the final XMLTV image.');
 
     $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
     $GLOBALS['tmdbTestSettings']->tmdb_language = 'de-DE';
@@ -1766,7 +1816,10 @@ namespace Tests {
         false,
         false,
     );
-    assertSameValue(null, $roteRosenNoOverwrite['icon'] ?? null, 'Rote Rosen must retain zero-vote abstention when overwrite is disabled.');
+    $roteRosenPoster = 'https://image.tmdb.org/t/p/w500/rote-rosen-poster.jpg';
+    assertSameValue($roteRosenPoster, $roteRosenNoOverwrite['icon'] ?? null, 'Rote Rosen should use the validated poster fallback without promoting an unrated backdrop.');
+    assertSameValue($roteRosenPoster, $roteRosenNoOverwrite['images'][0]['url'] ?? null, 'The validated poster fallback should be the first image.');
+    assertSameValue($roteRosenPoster, $roteRosenNoOverwrite['images'][array_key_last($roteRosenNoOverwrite['images'])]['url'] ?? null, 'The validated poster fallback should also be the final image.');
 
     $roteRosenOverwrite = [
         'title' => 'Rote Rosen',

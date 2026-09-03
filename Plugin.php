@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.02-series-movie-primary';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.03-programme-thumbnail-primary';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1716,10 +1716,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $backdropUrl = $tmdbData['backdrop_url'] ?? null;
         }
 
-        // Primary <icon> in XMLTV: prefer the correctly matched series or movie backdrop.
-        // Exact episode stills remain typed secondary artwork for capable clients.
+        // Establish the matched series or movie backdrop as the broad fallback. Exact
+        // episode stills are selected later as programme thumbnails when available.
         if ($enrichBackdrops && $backdropUrl
-            && ($overwrite || ! $trustedLandscapeIcon || $trustedEpisodeStillIcon)
+            && ($overwrite || ! $trustedLandscapeIcon)
             && ($programme['icon'] ?? null) !== $backdropUrl) {
             $programme['icon'] = $backdropUrl;
             $result['poster'] = true;
@@ -1813,7 +1813,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
-                    // Exact episode art outranks series-level art for programme clients.
+                    // Programme grids need the exact episode thumbnail. Keep the series
+                    // backdrop as typed secondary artwork for details-capable clients.
                     $hasTmdbEpisodeStill = false;
                     foreach (($programme['images'] ?? []) as $image) {
                         if (($image['url'] ?? null) === $stillUrl
@@ -1840,6 +1841,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         ];
                         $result['changed'] = true;
                     }
+                    if (($overwrite || ! $trustedNonTmdbLandscapeIcon)
+                        && ($programme['icon'] ?? null) !== $stillUrl) {
+                        $programme['icon'] = $stillUrl;
+                        $result['poster'] = true;
+                        $result['changed'] = true;
+                    }
+                    $trustedLandscapeIcon = true;
                 }
             }
         }
@@ -2606,7 +2614,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Keep a selected trusted landscape primary at both XMLTV image boundaries.
+     * Keep the selected programme thumbnail at both XMLTV image boundaries.
+     *
+     * Emby currently imports the final XMLTV icon as its sole Primary image, while
+     * clients such as Kodi can consume the typed alternatives. Bracketing prevents a
+     * secondary logo from becoming Emby's Primary without dropping richer metadata.
      */
     private function finalizeImageSerialization(array &$programme, bool $trustedLandscapeIcon, bool $overwrite): bool
     {
@@ -2619,30 +2631,48 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $programme['images'] = $this->prioritizeImages($programme['images']);
         $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
 
-        if ($trustedLandscapeIcon && ! $overwrite) {
-            $trustedUrl = (string) ($programme['icon'] ?? '');
+        $primaryIndex = null;
+        $currentPrimaryUrl = trim((string) ($programme['icon'] ?? ''));
+        foreach ($programme['images'] as $index => $image) {
+            if (($image['url'] ?? null) !== $currentPrimaryUrl) {
+                continue;
+            }
+            if ($trustedLandscapeIcon || $this->isProgrammeThumbnailImage($image)) {
+                $primaryIndex = $index;
+            }
+            break;
+        }
+
+        if ($primaryIndex === null) {
             foreach ($programme['images'] as $index => $image) {
-                if (($image['url'] ?? null) !== $trustedUrl) {
+                if (! $this->isTrustedLandscapeImage($image)) {
                     continue;
                 }
-                if ($index > 0) {
-                    array_unshift($programme['images'], array_splice($programme['images'], $index, 1)[0]);
-                }
+                $programme['icon'] = $image['url'];
+                $primaryIndex = $index;
                 break;
             }
-        } else {
-            foreach ($programme['images'] as $image) {
-                if ($this->isTrustedLandscapeImage($image)) {
-                    $programme['icon'] = $image['url'];
-                    break;
+        }
+
+        if ($primaryIndex === null) {
+            foreach ($programme['images'] as $index => $image) {
+                if (($image['type'] ?? null) !== 'poster') {
+                    continue;
                 }
+                $programme['icon'] = $image['url'];
+                $primaryIndex = $index;
+                break;
             }
+        }
+
+        if ($primaryIndex !== null && $primaryIndex > 0) {
+            array_unshift($programme['images'], array_splice($programme['images'], $primaryIndex, 1)[0]);
         }
 
         $primaryUrl = trim((string) ($programme['icon'] ?? ''));
         if ($primaryUrl !== '') {
             foreach ($programme['images'] as $image) {
-                if (($image['url'] ?? null) === $primaryUrl && $this->isTrustedLandscapeImage($image)) {
+                if (($image['url'] ?? null) === $primaryUrl && $this->isProgrammeThumbnailImage($image)) {
                     $programme['images'][] = $image;
                     break;
                 }
@@ -2651,6 +2681,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         return $programme['images'] !== $imagesBeforeFinalization
             || ($programme['icon'] ?? null) !== $iconBeforeFinalization;
+    }
+
+    /**
+     * A programme thumbnail may be landscape artwork or a portrait poster fallback,
+     * but never a logo. Exact episode stills qualify through the landscape checks.
+     */
+    private function isProgrammeThumbnailImage(array $image): bool
+    {
+        return $this->isTrustedLandscapeImage($image)
+            || (($image['type'] ?? null) === 'poster' && ! empty($image['url']));
     }
 
     /**
