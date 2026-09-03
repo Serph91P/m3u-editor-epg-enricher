@@ -1063,6 +1063,107 @@ namespace Tests {
     assertSameValue(null, validatedSearch($plugin, $searchMethod, $thresholdTmdb, 'Threshold Target', 'tv', 2024), 'A candidate below identity threshold should abstain.');
     assertSameValue(0, $thresholdTmdb->tvDetailsRequests, 'Threshold misses must not load details.');
 
+    $titlePrefixDetails = normalizedTvDetailsFixture(
+        632,
+        'Signal Patrol!',
+        'Inspectors solve routine problems for local residents.',
+        backdropUrl: 'https://image.tmdb.org/t/p/original/signal-patrol-backdrop.jpg',
+    );
+    $titlePrefixCandidate = [
+        'tmdb_id' => 632,
+        'name' => 'Signal Patrol!',
+        'original_name' => 'Signal Patrol!',
+        'first_air_date' => '2008-06-02',
+        'overview' => 'Inspectors solve routine problems for local residents.',
+    ];
+    $titlePrefixTmdb = new CandidateTmdbService(
+        tvCandidates: [$titlePrefixCandidate],
+        tvDetails: [632 => $titlePrefixDetails],
+    );
+    assertSameValue(
+        632,
+        validatedSearch(
+            $plugin,
+            $searchMethod,
+            $titlePrefixTmdb,
+            'Signal Patrol! We Take Care Of It',
+            'tv',
+            null,
+            'Inspectors solve routine problems for local residents.',
+        )['tmdb_id'] ?? null,
+        'A longer programme title should accept a complete TMDB title prefix only with corroborating description evidence.'
+    );
+    assertSameValue(1, $titlePrefixTmdb->tvDetailsRequests, 'A corroborated complete title prefix should load its validated TV details.');
+
+    $uncorroboratedPrefixTmdb = new CandidateTmdbService(tvCandidates: [$titlePrefixCandidate]);
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $uncorroboratedPrefixTmdb, 'Signal Patrol! We Take Care Of It', 'tv'),
+        'A complete title prefix without corroborating description evidence must remain rejected.'
+    );
+    assertSameValue(0, $uncorroboratedPrefixTmdb->tvDetailsRequests, 'An uncorroborated title prefix must not load details.');
+
+    $plainWordPrefixCandidate = $titlePrefixCandidate;
+    $plainWordPrefixCandidate['name'] = 'Signal Patrol';
+    $plainWordPrefixCandidate['original_name'] = 'Signal Patrol';
+    $plainWordPrefixTmdb = new CandidateTmdbService(
+        tvCandidates: [$plainWordPrefixCandidate],
+        tvDetails: [632 => $titlePrefixDetails],
+    );
+    assertSameValue(
+        null,
+        validatedSearch(
+            $plugin,
+            $searchMethod,
+            $plainWordPrefixTmdb,
+            'Signal Patrol Stories',
+            'tv',
+            null,
+            'Inspectors solve routine problems for local residents.',
+        ),
+        'A plain word prefix must not use the complete-title-prefix exception even with description overlap.'
+    );
+    assertSameValue(0, $plainWordPrefixTmdb->tvDetailsRequests, 'A plain word prefix must not load details.');
+
+    $nearPrefixTmdb = new CandidateTmdbService(tvCandidates: [$titlePrefixCandidate]);
+    assertSameValue(
+        null,
+        validatedSearch(
+            $plugin,
+            $searchMethod,
+            $nearPrefixTmdb,
+            'Signal Patrols! We Take Care Of It',
+            'tv',
+            null,
+            'Inspectors solve routine problems for local residents.',
+        ),
+        'A near-prefix must not use the complete-title-prefix exception.'
+    );
+    assertSameValue(0, $nearPrefixTmdb->tvDetailsRequests, 'A near-prefix must not load details.');
+
+    $ambiguousSilenceTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 633,
+            'name' => 'The Silence',
+            'original_name' => 'The Silence',
+            'first_air_date' => '2019-01-01',
+            'overview' => 'A synthetic television result.',
+        ]],
+        movieCandidates: [[
+            'tmdb_id' => 634,
+            'title' => 'The Silence',
+            'original_title' => 'The Silence',
+            'release_date' => '2019-01-01',
+            'overview' => 'A synthetic movie result.',
+        ]],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $ambiguousSilenceTmdb, 'The Silence'),
+        'An ambiguous title without year, media-type, or corroborating description evidence must fail closed.'
+    );
+    assertSameValue([0, 0], [$ambiguousSilenceTmdb->tvDetailsRequests, $ambiguousSilenceTmdb->movieDetailsRequests], 'An ambiguous title must not load candidate details.');
+
     $marginTmdb = new CandidateTmdbService(tvCandidates: [
         ['tmdb_id' => 641, 'name' => 'Margin Target', 'original_name' => 'Margin Target', 'first_air_date' => '2024-01-01', 'overview' => 'No overlap.'],
         ['tmdb_id' => 642, 'name' => 'Margin Target', 'original_name' => 'Margin Target', 'first_air_date' => '2023-01-01', 'overview' => 'Shared alpha evidence.'],
@@ -1431,19 +1532,24 @@ namespace Tests {
         true,
     );
     assertSameValue(
-        'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
+        'https://fixture.invalid/ghosts-backdrop.jpg',
         $episodeStill['icon'] ?? null,
-        'An exact episode still should be the programme thumbnail when it exists.'
+        'A trusted series backdrop should remain the programme icon when an exact episode still exists.'
     );
     assertSameValue(
-        ['screenshot', 'backdrop', 'poster', 'screenshot'],
+        ['backdrop', 'screenshot', 'poster', 'backdrop'],
         array_column($episodeStill['images'] ?? [], 'type'),
-        'The episode still should bracket the series backdrop and poster alternatives.'
+        'The series backdrop should bracket typed episode and poster alternatives.'
     );
-    assertSameValue('tmdb', $episodeStill['images'][0]['source'] ?? null, 'The exact episode still should retain its TMDB provenance as primary artwork.');
-    assertSameValue('episode', $episodeStill['images'][0]['scope'] ?? null, 'The exact episode still should remain explicitly episode-scoped.');
-    assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal image should duplicate the episode-still primary.');
-    assertSameValue('screenshot', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal primary duplicate should retain its screenshot type.');
+    $episodeStills = array_values(array_filter(
+        $episodeStill['images'] ?? [],
+        fn (array $image): bool => ($image['url'] ?? null) === 'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg'
+            && ($image['type'] ?? null) === 'screenshot'
+    ));
+    assertSameValue('tmdb', $episodeStills[0]['source'] ?? null, 'The exact episode still should retain its TMDB provenance as secondary artwork.');
+    assertSameValue('episode', $episodeStills[0]['scope'] ?? null, 'The exact episode still should remain explicitly episode-scoped.');
+    assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal image should duplicate the series-backdrop primary.');
+    assertSameValue('backdrop', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal primary duplicate should retain its backdrop type.');
 
     $nextEpisodeStill = [
         'title' => 'Ghosts - Es bleibt in der Familie',
@@ -1462,10 +1568,10 @@ namespace Tests {
         $episodeImagesCache,
         true,
     );
-    assertSameValue('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should use its own exact still as the programme thumbnail.');
+    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should keep the trusted series backdrop primary.');
     assertTrueValue(
         in_array('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', array_column($nextEpisodeStill['images'] ?? [], 'url'), true),
-        'A second episode should retain its exact still as primary artwork.'
+        'A second episode should retain its exact still as secondary artwork.'
     );
     assertSameValue(1, $episodeTmdb->seasonRequests, 'Episodes in one validated series season should safely reuse the season payload.');
 
@@ -1558,23 +1664,23 @@ namespace Tests {
     );
 
     assertSameValue(
-        'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
+        'https://fixture.invalid/ghosts-backdrop.jpg',
         $persistedEpisodePrimary['icon'] ?? null,
-        'A rerun should preserve a valid persisted episode-still primary.'
+        'A rerun should repair a persisted episode-still primary to the trusted series backdrop.'
     );
     assertSameValue(
         $persistedEpisodePrimary['icon'],
         $persistedEpisodePrimary['images'][0]['url'] ?? null,
-        'The episode still should be the first XMLTV image.'
+        'The repaired series backdrop should be the first XMLTV image.'
     );
     assertSameValue(
         $persistedEpisodePrimary['icon'],
         $persistedEpisodePrimary['images'][array_key_last($persistedEpisodePrimary['images'])]['url'] ?? null,
-        'The episode still should be the final XMLTV image.'
+        'The repaired series backdrop should be the final XMLTV image.'
     );
     assertTrueValue(
-        in_array('https://fixture.invalid/ghosts-backdrop.jpg', array_column($persistedEpisodePrimary['images'] ?? [], 'url'), true),
-        'The series backdrop should remain available as secondary artwork.'
+        in_array('https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg', array_column($persistedEpisodePrimary['images'] ?? [], 'url'), true),
+        'Repairing a persisted primary should preserve the exact episode still as secondary artwork.'
     );
 
     $episodeWithoutStill = [

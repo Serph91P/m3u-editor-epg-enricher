@@ -43,7 +43,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.03-programme-thumbnail-primary';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.03-backdrop-first-candidate';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1716,10 +1716,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $backdropUrl = $tmdbData['backdrop_url'] ?? null;
         }
 
-        // Establish the matched series or movie backdrop as the broad fallback. Exact
-        // episode stills are selected later as programme thumbnails when available.
+        // The correctly matched series or movie backdrop remains the XMLTV primary.
+        // Exact episode stills are retained as typed secondary artwork.
         if ($enrichBackdrops && $backdropUrl
-            && ($overwrite || ! $trustedLandscapeIcon)
+            && ($overwrite || ! $trustedLandscapeIcon || $trustedEpisodeStillIcon)
             && ($programme['icon'] ?? null) !== $backdropUrl) {
             $programme['icon'] = $backdropUrl;
             $result['poster'] = true;
@@ -1729,11 +1729,21 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Add a details fallback backdrop only when no images metadata was available.
         if ($enrichBackdrops && $backdropUrl) {
             $hasTmdbBackdrop = false;
-            foreach (($programme['images'] ?? []) as $image) {
+            foreach (($programme['images'] ?? []) as $index => $image) {
                 if (($image['url'] ?? null) === $backdropUrl
                     && ($image['type'] ?? null) === 'backdrop'
                     && ($image['source'] ?? null) === 'tmdb') {
                     $hasTmdbBackdrop = true;
+                    if (! $this->isTrustedLandscapeImage($image)) {
+                        $image['orient'] = 'L';
+                        $image['width'] = 1920;
+                        $image['height'] = 1080;
+                        $image['size'] = 1;
+                        $image['scope'] = 'programme';
+                        $image['artwork_quality'] = 'details_fallback';
+                        $programme['images'][$index] = $image;
+                        $result['changed'] = true;
+                    }
                     break;
                 }
             }
@@ -1813,8 +1823,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
-                    // Programme grids need the exact episode thumbnail. Keep the series
-                    // backdrop as typed secondary artwork for details-capable clients.
+                    // Keep exact episode art available without replacing the trusted
+                    // series or movie backdrop at the XMLTV primary boundaries.
                     $hasTmdbEpisodeStill = false;
                     foreach (($programme['images'] ?? []) as $image) {
                         if (($image['url'] ?? null) === $stillUrl
@@ -1841,13 +1851,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         ];
                         $result['changed'] = true;
                     }
-                    if (($overwrite || ! $trustedNonTmdbLandscapeIcon)
-                        && ($programme['icon'] ?? null) !== $stillUrl) {
-                        $programme['icon'] = $stillUrl;
+                    if ($backdropUrl
+                        && ($overwrite || ! $trustedNonTmdbLandscapeIcon)
+                        && ($programme['icon'] ?? null) !== $backdropUrl) {
+                        $programme['icon'] = $backdropUrl;
                         $result['poster'] = true;
                         $result['changed'] = true;
                     }
-                    $trustedLandscapeIcon = true;
                 }
             }
         }
@@ -3160,8 +3170,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             : [$candidate['title'] ?? '', $candidate['original_title'] ?? ''];
         $bestTitleScore = 0.0;
         $bestTitleSource = 'primary';
+        $hasCompleteTitlePrefix = false;
         foreach ($titleFields as $title) {
-            $bestTitleScore = max($bestTitleScore, $this->titleMatchScore($searchNorm, (string) $title));
+            $title = (string) $title;
+            $titleScore = $this->titleMatchScore($searchNorm, $title);
+            if ($mediaType === 'tv' && $this->isCompleteTitlePrefix($searchNorm, $title)) {
+                $titleScore = max($titleScore, 0.9);
+                $hasCompleteTitlePrefix = true;
+            }
+            $bestTitleScore = max($bestTitleScore, $titleScore);
         }
         foreach ($alternativeTitles as $alternative) {
             $alternativeTitle = (string) ($alternative['title'] ?? $alternative['name'] ?? '');
@@ -3194,7 +3211,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $candidate['_media_type'] = $mediaType;
         $candidate['_identity_score'] = round($identityScore, 3);
-        $candidate['_identity_valid'] = $alternativeIsStrong;
+        $candidate['_identity_valid'] = $alternativeIsStrong
+            && (! $hasCompleteTitlePrefix || $descriptionScore >= 4);
 
         return $candidate;
     }
@@ -3247,6 +3265,26 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
 
         return trim(preg_replace('/\s+/', ' ', $normalized));
+    }
+
+    private function isCompleteTitlePrefix(string $searchTitle, string $candidateTitle): bool
+    {
+        $searchTitle = mb_strtolower(trim($searchTitle));
+        $candidateTitle = mb_strtolower(trim($candidateTitle));
+        $candidateIdentity = $this->normalizeIdentityText($candidateTitle);
+        if (! $this->isSubstantialIdentityBase($candidateIdentity)
+            || ! str_starts_with($searchTitle, $candidateTitle)) {
+            return false;
+        }
+
+        $suffix = mb_substr($searchTitle, mb_strlen($candidateTitle));
+        if ($suffix === '') {
+            return false;
+        }
+
+        return (preg_match('/[!?]$/u', $candidateTitle) === 1
+                && preg_match('/^\s+\S/u', $suffix) === 1)
+            || preg_match('/^\s+(?:-|\x{2013}|\x{2014}|\||:)\s+\S/u', $suffix) === 1;
     }
 
     private function hasValidTmdbDetailsShape(array $tmdbData, string $mediaType): bool
