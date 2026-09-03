@@ -1624,6 +1624,56 @@ namespace Tests {
         'The exact TMDB episode still should remain available as a typed alternative.'
     );
 
+    $trustedProviderEpisodeScope = [
+        'title' => 'Ghosts - Hau den Putz',
+        'desc' => 'Die Geister versuchen, das Haus zu retten.',
+        'episode_nums' => [
+            ['system' => 'xmltv_ns', 'value' => '0.5.'],
+        ],
+        'category' => 'Series',
+        'icon' => 'https://provider.invalid/ghosts-s01e06.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/ghosts-s01e06.jpg',
+            'type' => 'screenshot',
+            'orient' => 'L',
+            'width' => 1280,
+            'height' => 720,
+            'size' => 2,
+            'source' => 'schedules_direct',
+            'scope' => 'episode',
+        ]],
+    ];
+    $trustedProviderEpisodeScopeCache = [];
+    $trustedProviderEpisodeScopeSeasonCache = [];
+    $trustedProviderEpisodeScopeImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $trustedProviderEpisodeScope,
+        new TmdbService('ghosts'),
+        $trustedProviderEpisodeScopeCache,
+        [],
+        $trustedProviderEpisodeScopeSeasonCache,
+        $trustedProviderEpisodeScopeImagesCache,
+        true,
+        false,
+    );
+    assertSameValue(
+        'https://provider.invalid/ghosts-s01e06.jpg',
+        $trustedProviderEpisodeScope['icon'] ?? null,
+        'A trusted provider episode thumbnail must survive exact episode lookup when overwrite is disabled.'
+    );
+    assertSameValue($trustedProviderEpisodeScope['icon'], $trustedProviderEpisodeScope['images'][0]['url'] ?? null, 'The preserved provider episode thumbnail should be the first XMLTV image.');
+    assertSameValue($trustedProviderEpisodeScope['icon'], $trustedProviderEpisodeScope['images'][array_key_last($trustedProviderEpisodeScope['images'])]['url'] ?? null, 'The preserved provider episode thumbnail should be the final XMLTV image.');
+    assertTrueValue(
+        in_array('https://fixture.invalid/ghosts-backdrop.jpg', array_column($trustedProviderEpisodeScope['images'] ?? [], 'url'), true),
+        'The TMDB series backdrop should remain available as a typed alternative.'
+    );
+    assertTrueValue(
+        in_array('https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg', array_column($trustedProviderEpisodeScope['images'] ?? [], 'url'), true),
+        'The exact TMDB episode still should remain available as a typed alternative.'
+    );
+
     $persistedEpisodePrimary = [
         'title' => 'Ghosts - Der Fahrgeist',
         'desc' => 'Ein Ausflug bringt die Geister durcheinander.',
@@ -2256,6 +2306,32 @@ namespace Tests {
 
     $finalizeImageSerialization = $reflection->getMethod('finalizeImageSerialization');
     $finalizeImageSerialization->setAccessible(true);
+    $mixedArtworkProgramme = [
+        'icon' => 'https://provider.invalid/mixed-poster.jpg',
+        'images' => [
+            [
+                'url' => 'https://provider.invalid/mixed-poster.jpg',
+                'type' => 'poster',
+                'orient' => 'P',
+                'width' => 800,
+                'height' => 1200,
+                'scope' => 'programme',
+            ],
+            [
+                'url' => 'https://provider.invalid/mixed-fanart.jpg',
+                'type' => 'fanart',
+                'orient' => 'L',
+                'width' => 1920,
+                'height' => 1080,
+                'scope' => 'programme',
+            ],
+        ],
+    ];
+    $finalizeImageSerialization->invokeArgs($plugin, [&$mixedArtworkProgramme, false, false]);
+    assertSameValue('https://provider.invalid/mixed-fanart.jpg', $mixedArtworkProgramme['icon'], 'Trusted fanart must outrank a current provider poster as the programme primary.');
+    assertSameValue($mixedArtworkProgramme['icon'], $mixedArtworkProgramme['images'][0]['url'], 'Trusted fanart must be the first XMLTV image.');
+    assertSameValue($mixedArtworkProgramme['icon'], $mixedArtworkProgramme['images'][array_key_last($mixedArtworkProgramme['images'])]['url'], 'Trusted fanart must be the final XMLTV image.');
+    assertSameValue('poster', $mixedArtworkProgramme['images'][1]['type'] ?? null, 'The provider poster must remain a typed secondary alternative.');
     $benchmarkParity = ['denominator' => 0, 'numerator' => 0];
     foreach (range(1, 101) as $index) {
         $primaryType = ['backdrop', 'fanart', 'screenshot'][($index - 1) % 3];

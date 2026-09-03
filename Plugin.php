@@ -1719,7 +1719,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // The correctly matched series or movie backdrop remains the XMLTV primary.
         // Exact episode stills are retained as typed secondary artwork.
         if ($enrichBackdrops && $backdropUrl
-            && ($overwrite || ! $trustedLandscapeIcon || $trustedEpisodeStillIcon)
+            && ($overwrite || ! $trustedNonTmdbLandscapeIcon)
             && ($programme['icon'] ?? null) !== $backdropUrl) {
             $programme['icon'] = $backdropUrl;
             $result['poster'] = true;
@@ -2647,7 +2647,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             if (($image['url'] ?? null) !== $currentPrimaryUrl) {
                 continue;
             }
-            if ($trustedLandscapeIcon || $this->isProgrammeThumbnailImage($image)) {
+            if ($this->isTrustedLandscapeImage($image)) {
                 $primaryIndex = $index;
             }
             break;
