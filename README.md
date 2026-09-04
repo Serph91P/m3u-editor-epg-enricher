@@ -60,6 +60,12 @@ When a validated TMDB landscape backdrop is available, it is written as the prog
 
 The enriched JSONL cache and generated XMLTV can be correct while Emby still displays older guide artwork. Attribute-aware consumers can use the typed poster, backdrop, screenshot, and logo alternatives, while first-only or last-wins consumers receive the same selected primary at both boundaries. Emby also persists imported programme images separately and may continue serving an older image after the XMLTV source changes. Refreshing or clearing stale guide data in Emby is a downstream maintenance action; this plugin does not use Emby-specific overwrites or change programme identities to force an artwork refresh.
 
+## Matching Diagnostics
+
+Before TMDB lookup, each programme receives a bounded applicability decision. Generic live sports, news, and provider-brand rows without stable catalogue identity skip candidate searches; trusted programme artwork is preserved, otherwise a fallback is recorded. Candidate decisions contain only normalized input and candidate fingerprints, score/margin, typed episode evidence, and safe reason codes. Raw descriptions, provider URLs, hosts, and credentials are not stored in these diagnostics.
+
+Run the deterministic offline replay gate with `php tests/issue55_offline_replay_test.php`. It uses mock candidate sets only, returns nonzero on a golden mismatch, and does not validate Emby integration.
+
 ## Version History
 
 ### 1.9.0

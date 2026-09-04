@@ -1033,7 +1033,10 @@ namespace Tests {
     $cacheGuardFailure = $cacheGuardProgramme;
     $cacheGuardFailureBefore = $cacheGuardFailure;
     enrich($plugin, $method, $cacheGuardFailure, $cacheGuardService(true), $cacheGuardCache);
-    assertSameValue($cacheGuardFailureBefore, $cacheGuardFailure, 'Malformed generic cache data must fail closed when bounded reload fails.');
+    $cacheGuardFailureComparable = $cacheGuardFailure;
+    unset($cacheGuardFailureComparable['tmdb_decision']);
+    assertSameValue($cacheGuardFailureBefore, $cacheGuardFailureComparable, 'Malformed generic cache data must fail closed when bounded reload fails.');
+    assertSameValue('unmatched', $cacheGuardFailure['tmdb_decision']['result'] ?? null, 'A bounded reload failure must retain unmatched decision evidence.');
     assertSameValue(false, array_key_exists($cacheGuardKey, $cacheGuardCache), 'Malformed generic cache data must not remain persisted after bounded reload fails.');
 
     $persistedCache = [
@@ -1217,7 +1220,10 @@ namespace Tests {
         enrich($plugin, $method, $invalidIdProgramme, $invalidIdTmdb, $invalidIdCache);
 
         assertSameValue(0, $invalidIdTmdb->tvDetailsRequests, ucfirst($label).' raw candidate ID must not trigger a details request.');
-        assertSameValue($invalidIdBefore, $invalidIdProgramme, ucfirst($label).' raw candidate ID must not modify programme data.');
+        $invalidIdComparable = $invalidIdProgramme;
+        unset($invalidIdComparable['tmdb_decision']);
+        assertSameValue($invalidIdBefore, $invalidIdComparable, ucfirst($label).' raw candidate ID must not modify programme data.');
+        assertSameValue('unmatched', $invalidIdProgramme['tmdb_decision']['result'] ?? null, ucfirst($label).' raw candidate ID must retain unmatched evidence.');
         assertSameValue([], $invalidIdCache, ucfirst($label).' raw candidate ID must not write a TMDB cache entry.');
     }
 
@@ -1244,7 +1250,10 @@ namespace Tests {
     $missingDetailsBefore = $missingDetailsProgramme;
     $missingDetailsCache = [];
     enrich($plugin, $method, $missingDetailsProgramme, $missingDetailsEnrichmentTmdb, $missingDetailsCache);
-    assertSameValue($missingDetailsBefore, $missingDetailsProgramme, 'Missing winner details should not modify programme data.');
+    $missingDetailsComparable = $missingDetailsProgramme;
+    unset($missingDetailsComparable['tmdb_decision']);
+    assertSameValue($missingDetailsBefore, $missingDetailsComparable, 'Missing winner details should not modify programme data.');
+    assertSameValue('unmatched', $missingDetailsProgramme['tmdb_decision']['result'] ?? null, 'Missing winner details must retain unmatched decision evidence.');
     assertSameValue([], $missingDetailsCache, 'Missing winner details should not write a TMDB cache entry.');
     assertSameValue(1, $missingDetailsEnrichmentTmdb->tvDetailsRequests, 'Normal enrichment should request only the validated winner details.');
 
@@ -1280,7 +1289,10 @@ namespace Tests {
     $abstentionBefore = $abstentionProgramme;
     $abstentionCache = [];
     enrich($plugin, $method, $abstentionProgramme, $abstentionTmdb, $abstentionCache);
-    assertSameValue($abstentionBefore, $abstentionProgramme, 'Identity abstention should not modify programme data.');
+    $abstentionComparable = $abstentionProgramme;
+    unset($abstentionComparable['tmdb_decision']);
+    assertSameValue($abstentionBefore, $abstentionComparable, 'Identity abstention should not modify programme data.');
+    assertSameValue('ambiguous_identity', $abstentionProgramme['tmdb_decision']['class'] ?? null, 'A global tie must retain ambiguous identity evidence.');
     assertSameValue([], $abstentionCache, 'Identity abstention should not write a TMDB cache entry.');
     assertSameValue(0, $abstentionTmdb->tvDetailsRequests + $abstentionTmdb->movieDetailsRequests, 'A global tie must not load any details.');
 
@@ -1377,7 +1389,10 @@ namespace Tests {
     ];
     $weakBefore = $weakIlluminati;
     enrich($plugin, $method, $weakIlluminati, $illuminatiTmdb, $illuminatiCache);
-    assertSameValue($weakBefore, $weakIlluminati, 'Alternative-title matches without description corroboration should fail closed.');
+    $weakIlluminatiComparable = $weakIlluminati;
+    unset($weakIlluminatiComparable['tmdb_decision']);
+    assertSameValue($weakBefore, $weakIlluminatiComparable, 'Alternative-title matches without description corroboration should fail closed.');
+    assertSameValue('unmatched', $weakIlluminati['tmdb_decision']['result'] ?? null, 'Alternative-title rejection must retain unmatched evidence.');
     assertSameValue(1, count($illuminatiCache), 'Identity abstention should not persist a cache entry.');
 
     $sourceCache = [];
@@ -1842,7 +1857,10 @@ namespace Tests {
     $ambiguousBefore = $ambiguous;
     $ambiguousCache = [];
     enrich($plugin, $method, $ambiguous, new TmdbService('ambiguous'), $ambiguousCache);
-    assertSameValue($ambiguousBefore, $ambiguous, 'Ambiguous TV and movie candidates should leave the programme unchanged.');
+    $ambiguousComparable = $ambiguous;
+    unset($ambiguousComparable['tmdb_decision']);
+    assertSameValue($ambiguousBefore, $ambiguousComparable, 'Ambiguous TV and movie candidates should leave the programme unchanged.');
+    assertSameValue('ambiguous_identity', $ambiguous['tmdb_decision']['class'] ?? null, 'Ambiguous TV/movie candidates must retain an explicit ambiguity decision.');
 
     $courtShow = [
         'title' => 'Ulrich Wetzel - Das Strafgericht',
@@ -1853,7 +1871,10 @@ namespace Tests {
     $courtShowBefore = $courtShow;
     $courtShowCache = [];
     enrich($plugin, $method, $courtShow, new TmdbService('ulrich-wetzel'), $courtShowCache);
-    assertSameValue($courtShowBefore, $courtShow, 'An unresolved court-show media-type tie should fail closed after full and base-title validation.');
+    $courtShowComparable = $courtShow;
+    unset($courtShowComparable['tmdb_decision']);
+    assertSameValue($courtShowBefore, $courtShowComparable, 'An unresolved court-show media-type tie should fail closed after full and base-title validation.');
+    assertSameValue('unmatched', $courtShow['tmdb_decision']['result'] ?? null, 'An unresolved media-type tie must retain unmatched evidence.');
 
     $boston = [
         'title' => 'Boston',
@@ -2369,6 +2390,74 @@ namespace Tests {
         $finalizeImageSerialization->invokeArgs($plugin, [&$benchmarkProgramme, true, false]);
         assertSameValue($serializedBenchmarkProgramme, json_encode($benchmarkProgramme, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Issue 47 serialization should be deterministic on repeat runs.');
     }
+
+    $skySport = [
+        'title' => 'Sky Sport News Live',
+        'desc' => 'Provider-only bulletin from https://provider.example.invalid/export.',
+        'category' => 'Sports',
+        'icon' => 'https://provider.example.invalid/sky-sport.jpg',
+        'images' => [[
+            'url' => 'https://provider.example.invalid/sky-sport.jpg',
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+        ]],
+    ];
+    $skySportTmdb = new CandidateTmdbService();
+    $skySportCache = [];
+    enrich($plugin, $method, $skySport, $skySportTmdb, $skySportCache);
+    assertSameValue([0, 0], [$skySportTmdb->tvCandidateSearches, $skySportTmdb->movieCandidateSearches], 'A generic Sky Sport live row must not search TMDB when category mapping is disabled.');
+    assertSameValue('provider_art_preserved', $skySport['tmdb_decision']['class'] ?? null, 'Trusted provider artwork must be explicitly preserved for generic live sports.');
+    assertSameValue($skySport['icon'], $skySport['images'][0]['url'] ?? null, 'Preserved provider artwork must remain the first XMLTV primary.');
+    assertSameValue($skySport['icon'], $skySport['images'][array_key_last($skySport['images'])]['url'] ?? null, 'Preserved provider artwork must remain the final XMLTV primary.');
+
+    $dazn = ['title' => 'DAZN Live', 'category' => 'Sports'];
+    $daznTmdb = new CandidateTmdbService();
+    $daznCache = [];
+    enrich($plugin, $method, $dazn, $daznTmdb, $daznCache);
+    assertSameValue([0, 0], [$daznTmdb->tvCandidateSearches, $daznTmdb->movieCandidateSearches], 'A DAZN-shaped row without identity must not search TMDB.');
+    assertSameValue('sports_or_live_fallback', $dazn['tmdb_decision']['class'] ?? null, 'Generic live sports without trusted artwork must retain an explicit fallback decision.');
+
+    $catalogueControlDetails = normalizedTvDetailsFixture(
+        801,
+        'Archive Sprint',
+        'A clearly identified non-live sports documentary.',
+        backdropUrl: 'https://image.tmdb.org/t/p/original/archive-sprint.jpg',
+    );
+    $catalogueControlTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 801,
+            'name' => 'Archive Sprint',
+            'original_name' => 'Archive Sprint',
+            'first_air_date' => '2024-01-01',
+            'overview' => 'A clearly identified non-live sports documentary.',
+        ]],
+        tvDetails: [801 => $catalogueControlDetails],
+    );
+    $catalogueControl = ['title' => 'Archive Sprint', 'category' => 'Sports'];
+    $catalogueControlCache = [];
+    enrich($plugin, $method, $catalogueControl, $catalogueControlTmdb, $catalogueControlCache);
+    assertTrueValue($catalogueControlTmdb->tvCandidateSearches > 0, 'A clearly identified non-live catalogue programme must remain eligible for TMDB matching.');
+    assertSameValue('catalogue_candidate', $catalogueControl['tmdb_decision']['class'] ?? null, 'Eligible catalogue rows must retain their applicability class.');
+    assertSameValue('selected', $catalogueControl['tmdb_decision']['result'] ?? null, 'A selected candidate must retain selected decision evidence.');
+    assertTrueValue(is_numeric($catalogueControl['tmdb_decision']['score'] ?? null), 'Selected decision evidence must retain its bounded score.');
+
+    $pickupReadback = ['title' => 'Pick-up Truckers', 'episode_num' => '0.0'];
+    $pickupTmdb = new CandidateTmdbService();
+    $pickupCache = [];
+    enrich($plugin, $method, $pickupReadback, $pickupTmdb, $pickupCache);
+    assertSameValue('unmatched', $pickupReadback['tmdb_decision']['result'] ?? null, 'A zero readback hit must be represented as unmatched evidence rather than success.');
+    assertTrueValue(! isset($pickupReadback['tmdb_decision']['selected_candidate_fingerprint']), 'Unmatched evidence must not claim a selected candidate.');
+
+    $serializedDecision = json_encode($skySport['tmdb_decision'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    assertTrueValue(
+        ! str_contains($serializedDecision, 'provider.example.invalid')
+            && ! str_contains($serializedDecision, $skySport['desc'])
+            && ! str_contains($serializedDecision, 'https://'),
+        'TMDB decisions must not persist provider hosts, raw descriptions, or URLs.'
+    );
 
     echo "TMDB artwork repair tests passed.\n";
     echo json_encode([
