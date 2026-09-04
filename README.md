@@ -66,6 +66,8 @@ Before TMDB lookup, each programme receives a bounded applicability decision. Ge
 
 Run the deterministic offline replay gate with `php tests/issue55_offline_replay_test.php`. It uses mock candidate sets only, returns nonzero on a golden mismatch, and does not validate Emby integration.
 
+Generate the deterministic, self-contained pre-Canary review preview with `php tests/issue55_offline_replay_test.php --preview-dir=/tmp/issue55-preview`. The output directory contains a privacy-safe `manifest.json` and escaped static `gallery.html`; it uses fixture-controlled data only and performs no network, database, cache, or production writes.
+
 ## Version History
 
 ### 1.9.0
