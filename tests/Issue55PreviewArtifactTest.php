@@ -72,6 +72,7 @@ namespace Tests {
         previewAssert(mb_strlen((string) ($case['evidence']['title'] ?? '')) <= 160, 'Raw fixture display titles must remain bounded.');
         previewAssert(! array_key_exists('description', $case['evidence'] ?? []), 'Replay evidence must never include raw descriptions.');
     }
+    previewAssert(['source' => 'original'] === ($casesById['catalogue']['selected_title_provenance'] ?? null), 'The preview must expose privacy-safe original-title provenance for an accepted identity.');
     previewAssert(str_contains((string) file_get_contents($firstGallery), '&lt;script&gt;'), 'The gallery must HTML-escape fixture evidence.');
     $serialized = (string) file_get_contents($firstManifest).(string) file_get_contents($firstGallery);
     previewAssert(! str_contains($serialized, 'provider.invalid') && ! str_contains($serialized, 'https://') && ! str_contains($serialized, 'private fixture description'), 'The preview artifact must redact provider hosts, URLs, and descriptions.');

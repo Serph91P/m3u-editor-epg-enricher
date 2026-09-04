@@ -56,9 +56,23 @@ namespace App\Services {
         {
             return [
                 'tmdb_id' => $tmdbId,
+                'tvdb_id' => null,
+                'imdb_id' => null,
                 'name' => 'Profile Matrix Fixture',
+                'original_name' => 'Profile Matrix Fixture',
                 'genres' => 'Basketball',
                 'overview' => '',
+                'poster_url' => null,
+                'backdrop_url' => null,
+                'first_air_date' => '2024-01-01',
+                'vote_average' => null,
+                'vote_count' => null,
+                'status' => null,
+                'number_of_seasons' => null,
+                'number_of_episodes' => null,
+                'cast' => null,
+                'director' => null,
+                'youtube_trailer' => null,
             ];
         }
 
@@ -158,7 +172,11 @@ namespace Tests {
         'emby_and_kodi' => [true, true, 'Basketball'],
     ];
     foreach ($profileMatrix as $profile => [$mapEmby, $mapKodi, $expectedCategory]) {
-        $programme = ['title' => 'Profile Matrix Fixture'];
+        $programme = [
+            'title' => 'Profile Matrix Fixture',
+            'tmdb_id' => 42,
+            'tmdb_media_type' => 'tv',
+        ];
         $cache = [];
         $seasonCache = [];
         $imagesCache = [];
