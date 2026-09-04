@@ -156,6 +156,8 @@ namespace Tests {
                     artwork('fixture://logo-a', 'logo', 'tmdb', 'programme'),
                 ],
             ],
+            'expected_primary' => 'fixture://tmdb-backdrop',
+            'landscape_primary' => true,
             'roles' => ['backdrop', 'poster', 'logo'],
         ],
         'TMDB fanart primary' => [
@@ -167,6 +169,8 @@ namespace Tests {
                     artwork('fixture://logo-b', 'logo', 'tmdb', 'programme'),
                 ],
             ],
+            'expected_primary' => 'fixture://tmdb-fanart',
+            'landscape_primary' => true,
             'roles' => ['fanart', 'poster', 'logo'],
         ],
         'Exact episode still secondary' => [
@@ -179,6 +183,8 @@ namespace Tests {
                     artwork('fixture://logo-c', 'logo', 'tmdb', 'programme'),
                 ],
             ],
+            'expected_primary' => 'fixture://series-backdrop',
+            'landscape_primary' => true,
             'roles' => ['backdrop', 'screenshot', 'poster', 'logo'],
         ],
         'Poster-only fallback' => [
@@ -188,6 +194,8 @@ namespace Tests {
                     artwork('fixture://poster-d', 'poster', 'tmdb', 'programme'),
                 ],
             ],
+            'expected_primary' => 'fixture://poster-d',
+            'landscape_primary' => false,
             'roles' => ['poster', 'logo'],
         ],
         'Trusted provider landscape retained' => [
@@ -200,6 +208,8 @@ namespace Tests {
                     artwork('fixture://logo-e', 'logo', 'provider', 'programme'),
                 ],
             ],
+            'expected_primary' => 'fixture://provider-landscape',
+            'landscape_primary' => true,
             'roles' => ['fanart', 'backdrop', 'poster', 'logo'],
         ],
     ];
@@ -213,10 +223,19 @@ namespace Tests {
         $finalize->invokeArgs($plugin, [&$programme, true, false]);
         $primary = $programme['icon'] ?? null;
         crossClientAssert(is_string($primary) && $primary !== '', $label.' must select a legacy primary.');
+        crossClientAssert($primary === $case['expected_primary'], $label.' must select the exact expected primary.');
         crossClientAssert(($programme['images'][0]['url'] ?? null) === $primary, $label.' must place the primary at the producer image-list start.');
         crossClientAssert(($programme['images'][array_key_last($programme['images'])]['url'] ?? null) === $primary, $label.' must place the primary at the producer image-list end.');
         $icons = parseProgrammeIcons(serializeProgrammeIcons($programme));
         crossClientAssert(legacyBoundaryIsSafe($icons, $primary), $label.' must expose the identical primary to first-only and last-wins clients.');
+        $firstBoundaryType = strtolower($icons[0]['type'] ?? '');
+        $lastBoundaryType = strtolower($icons[array_key_last($icons)]['type'] ?? '');
+        if ($case['landscape_primary']) {
+            crossClientAssert(! in_array($firstBoundaryType, ['logo', 'poster'], true), $label.' must not expose logo or poster at the first landscape boundary.');
+            crossClientAssert(! in_array($lastBoundaryType, ['logo', 'poster'], true), $label.' must not expose logo or poster at the final landscape boundary.');
+        } else {
+            crossClientAssert($firstBoundaryType === 'poster' && $lastBoundaryType === 'poster', $label.' must expose poster at both boundaries only when no landscape primary exists.');
+        }
         $roleAware = roleAwareImages($icons);
         foreach ($case['roles'] as $role) {
             crossClientAssert(isset($roleAware[$role]), $label.' must preserve the typed '.$role.' role.');
