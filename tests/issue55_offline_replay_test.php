@@ -32,14 +32,34 @@ namespace App\Services {
     {
         public int $tvCandidateSearches = 0;
         public int $movieCandidateSearches = 0;
+        public int $tvDetailsRequests = 0;
+        public int $movieDetailsRequests = 0;
+        public int $tvAlternativeRequests = 0;
+        public int $movieAlternativeRequests = 0;
+        public int $tvTranslationRequests = 0;
+        public int $movieTranslationRequests = 0;
         public int $seasonRequests = 0;
 
-        public function __construct(private array $tvCandidates, private array $movieCandidates, private array $tvDetails, private array $movieDetails, private array $seasons = []) {}
+        public function __construct(
+            private array $tvCandidates,
+            private array $movieCandidates,
+            private array $tvDetails,
+            private array $movieDetails,
+            private array $seasons = [],
+            private array $tvAlternativeTitles = [],
+            private array $movieAlternativeTitles = [],
+            private array $tvTranslations = [],
+            private array $movieTranslations = [],
+        ) {}
 
         public function searchTvSeriesCandidates(string $name, ?int $year = null, int $limit = 5): array { $this->tvCandidateSearches++; return $this->tvCandidates; }
         public function searchMovieCandidates(string $name, ?int $year = null, int $limit = 5): array { $this->movieCandidateSearches++; return $this->movieCandidates; }
-        public function getTvSeriesDetails(int $tmdbId): ?array { return $this->tvDetails[$tmdbId] ?? null; }
-        public function getMovieDetails(int $tmdbId): ?array { return $this->movieDetails[$tmdbId] ?? null; }
+        public function getTvSeriesDetails(int $tmdbId): ?array { $this->tvDetailsRequests++; return $this->tvDetails[$tmdbId] ?? null; }
+        public function getMovieDetails(int $tmdbId): ?array { $this->movieDetailsRequests++; return $this->movieDetails[$tmdbId] ?? null; }
+        public function getTvAlternativeTitles(int $tmdbId): array { $this->tvAlternativeRequests++; return $this->tvAlternativeTitles[$tmdbId] ?? []; }
+        public function getMovieAlternativeTitles(int $tmdbId): array { $this->movieAlternativeRequests++; return $this->movieAlternativeTitles[$tmdbId] ?? []; }
+        public function getTvTranslations(int $tmdbId): array { $this->tvTranslationRequests++; return $this->tvTranslations[$tmdbId] ?? []; }
+        public function getMovieTranslations(int $tmdbId): array { $this->movieTranslationRequests++; return $this->movieTranslations[$tmdbId] ?? []; }
         public function getSeasonDetails(int $tmdbId, int $season): ?array { $this->seasonRequests++; return $this->seasons[$tmdbId.':'.$season] ?? null; }
     }
 }
@@ -219,8 +239,8 @@ namespace Tests {
 
         return [$programme, $tmdb];
     };
-    $candidate = ['tmdb_id' => 901, 'name' => 'Cafe Racer Night Shift', 'original_name' => 'Cafe Racer Night Shift', 'first_air_date' => '2024-01-01', 'overview' => ''];
-    [$catalogue, $catalogueTmdb] = $run(['title' => "Caf\u{00e9}-Racer: Night Shift"], new ReplayTmdbService([$candidate], [], [901 => tvDetails(901, 'Cafe Racer Night Shift', 'https://image.tmdb.org/t/p/original/replay.jpg')], []));
+    $candidate = ['tmdb_id' => 901, 'name' => "Cafe\u{0301}-Racer: Night Shift", 'original_name' => "Cafe\u{0301}-Racer: Night Shift", 'original_language' => 'fr', 'first_air_date' => '2024-01-01', 'overview' => ''];
+    [$catalogue, $catalogueTmdb] = $run(['title' => "Caf\u{00e9}-Racer: Night Shift", 'title_language' => 'fr-FR'], new ReplayTmdbService([$candidate], [], [901 => tvDetails(901, 'Café Racer Night Shift', 'https://image.tmdb.org/t/p/original/replay.jpg')], []));
     [$ambiguous, $ambiguousTmdb] = $run(['title' => 'Shared Signal'], new ReplayTmdbService([
         ['tmdb_id' => 902, 'name' => 'Shared Signal', 'original_name' => 'Shared Signal', 'first_air_date' => '2024-01-01', 'overview' => ''],
     ], [
@@ -238,6 +258,14 @@ namespace Tests {
         '904:1' => ['episodes' => [['episode_number' => 1, 'overview' => '', 'still_path' => '/serial-s01e01.jpg']],],
     ]), true);
     [$episodeWrong, $episodeWrongTmdb] = $run(['title' => 'Serial Beacon', 'episode_num' => 'not-an-episode'], new ReplayTmdbService([$episodeCandidate], [], [904 => tvDetails(904, 'Serial Beacon', 'https://image.tmdb.org/t/p/original/serial.jpg')], []), true);
+    $confusableCandidate = ['tmdb_id' => 905, 'name' => 'Cosmos Signal', 'original_name' => 'Cosmos Signal', 'original_language' => 'en', 'first_air_date' => '2024-01-01', 'overview' => ''];
+    [$confusable, $confusableTmdb] = $run(['title' => 'Сosmos Signal (2024)', 'title_language' => 'en-US', 'episode_num' => '0.0'], new ReplayTmdbService([$confusableCandidate], [], [905 => tvDetails(905, 'Cosmos Signal', 'https://image.tmdb.org/t/p/original/cosmos.jpg')], []));
+    [$unsupportedLocale, $unsupportedLocaleTmdb] = $run(['title' => 'Locale Guard', 'title_language' => 'zz-ZZ'], new ReplayTmdbService([], [], [], []));
+    [$malformedLocale, $malformedLocaleTmdb] = $run(['title' => 'Locale Guard', 'title_language' => 'en-US-extra'], new ReplayTmdbService([], [], [], []));
+    $missingTranslationCandidate = ['tmdb_id' => 906, 'name' => 'Silent City', 'original_name' => 'Silent City', 'original_language' => 'en', 'first_air_date' => '2024-01-01', 'overview' => ''];
+    [$missingTranslation, $missingTranslationTmdb] = $run(['title' => '静かな街 (2024)', 'title_language' => 'ja-JP', 'episode_num' => '0.0'], new ReplayTmdbService([$missingTranslationCandidate], [], [], []));
+    $descriptionCandidate = ['tmdb_id' => 907, 'name' => 'Signal Harborxyz', 'original_name' => 'Signal Harborxyz', 'original_language' => 'en', 'first_air_date' => '', 'overview' => 'shared lighthouse harbour mystery', 'cast' => ['Ada Person', 'Ben Person']];
+    [$incompatibleDescription, $incompatibleDescriptionTmdb] = $run(['title' => 'Signal Harbor', 'title_language' => 'en-US', 'desc' => 'Ada Person and Ben Person share a lighthouse harbour mystery', 'desc_language' => 'es-ES'], new ReplayTmdbService([$descriptionCandidate], [], [907 => tvDetails(907, 'Signal Harborxyz', 'https://image.tmdb.org/t/p/original/harbour.jpg')], []));
 
     replayAssert(($catalogue['tmdb_decision']['result'] ?? null) === 'selected' && $catalogueTmdb->tvCandidateSearches === 1, 'Catalogue normalization replay mismatch.');
     replayAssert(($ambiguous['tmdb_decision']['class'] ?? null) === 'ambiguous_identity' && $ambiguousTmdb->tvCandidateSearches === 1 && $ambiguousTmdb->movieCandidateSearches === 1, 'Global ambiguity replay mismatch.');
@@ -246,9 +274,27 @@ namespace Tests {
     replayAssert(($escaped['tmdb_decision']['class'] ?? null) === 'sports_or_live_fallback' && $escapedTmdb->tvCandidateSearches + $escapedTmdb->movieCandidateSearches === 0, 'Escaped preview fixture replay mismatch.');
     replayAssert(($episodeValid['images'][1]['type'] ?? null) === 'screenshot' && $episodeValidTmdb->seasonRequests === 1, 'Valid episode replay mismatch.');
     replayAssert(! in_array('screenshot', array_column($episodeWrong['images'] ?? [], 'type'), true) && $episodeWrongTmdb->seasonRequests === 0, 'Wrong episode replay mismatch.');
+    replayAssert(($confusable['tmdb_decision']['reason'] ?? null) === 'mixed_script_identity_rejected' && $confusableTmdb->tvDetailsRequests === 0, 'Confusable-script rejection replay mismatch.');
+    replayAssert(($unsupportedLocale['tmdb_decision']['reason'] ?? null) === 'unsupported_language_tag' && $unsupportedLocaleTmdb->tvCandidateSearches + $unsupportedLocaleTmdb->movieCandidateSearches === 0, 'Unsupported locale replay mismatch.');
+    replayAssert(($malformedLocale['tmdb_decision']['reason'] ?? null) === 'malformed_language_tag' && $malformedLocaleTmdb->tvCandidateSearches + $malformedLocaleTmdb->movieCandidateSearches === 0, 'Malformed locale replay mismatch.');
+    replayAssert(($missingTranslation['tmdb_decision']['reason'] ?? null) === 'explicit_alias_unavailable' && $missingTranslationTmdb->tvAlternativeRequests === 1 && $missingTranslationTmdb->tvTranslationRequests === 1 && $missingTranslationTmdb->tvDetailsRequests === 0, 'Missing translation replay mismatch: '.json_encode([$missingTranslation['tmdb_decision'] ?? null, $missingTranslationTmdb->tvAlternativeRequests, $missingTranslationTmdb->tvTranslationRequests, $missingTranslationTmdb->tvDetailsRequests], JSON_UNESCAPED_UNICODE));
+    replayAssert(($incompatibleDescription['tmdb_decision']['reason'] ?? null) === 'language_incompatible_description' && $incompatibleDescriptionTmdb->tvDetailsRequests === 0, 'Description-language rejection replay mismatch.');
 
     $output = [];
-    $replayProgrammes = ['catalogue' => $catalogue, 'ambiguous' => $ambiguous, 'provider' => $provider, 'live_fallback' => $dazn, 'episode_valid' => $episodeValid, 'episode_wrong' => $episodeWrong, 'escaped_news' => $escaped];
+    $replayProgrammes = [
+        'catalogue' => $catalogue,
+        'ambiguous' => $ambiguous,
+        'provider' => $provider,
+        'live_fallback' => $dazn,
+        'episode_valid' => $episodeValid,
+        'episode_wrong' => $episodeWrong,
+        'escaped_news' => $escaped,
+        'confusable' => $confusable,
+        'unsupported_locale' => $unsupportedLocale,
+        'malformed_locale' => $malformedLocale,
+        'missing_translation' => $missingTranslation,
+        'incompatible_description' => $incompatibleDescription,
+    ];
     foreach ($replayProgrammes as $name => $programme) {
         $decision = $programme['tmdb_decision'];
         $output[$name] = array_filter([

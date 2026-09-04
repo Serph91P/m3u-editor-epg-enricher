@@ -318,6 +318,12 @@ namespace App\Services {
                     'original_title' => 'Backdrop Quality',
                     'release_date' => '2026-01-01',
                 ],
+                'translation-only' => [
+                    'tmdb_id' => 211,
+                    'title' => 'Silent City',
+                    'original_title' => 'Silent City',
+                    'release_date' => '2024-01-01',
+                ],
                 default => null,
             };
         }
@@ -379,6 +385,10 @@ namespace App\Services {
                     'overview' => 'A programme used to verify backdrop quality selection.',
                     'backdrop_url' => 'https://image.tmdb.org/t/p/original/details-backdrop.jpg',
                 ],
+                'translation-only' => [
+                    'overview' => 'A translated catalogue fixture.',
+                    'backdrop_url' => 'https://image.tmdb.org/t/p/original/translation-only.jpg',
+                ],
                 default => null,
             };
         }
@@ -429,6 +439,8 @@ namespace App\Services {
     {
         public int $tvCandidateSearches = 0;
         public int $movieCandidateSearches = 0;
+        public int $tvTranslationRequests = 0;
+        public int $movieTranslationRequests = 0;
         public array $tvLimits = [];
         public array $movieLimits = [];
         public array $tvQueries = [];
@@ -443,6 +455,12 @@ namespace App\Services {
             private bool $throwOnMovieCandidates = false,
             private array $tvCandidatesByQuery = [],
             private array $movieCandidatesByQuery = [],
+            private array $tvAlternativeTitles = [],
+            private array $movieAlternativeTitles = [],
+            private array $tvTranslations = [],
+            private array $movieTranslations = [],
+            private bool $throwOnTvAlternativeTitles = false,
+            private bool $throwOnTvTranslations = false,
         ) {
             parent::__construct('candidate-api');
         }
@@ -492,15 +510,35 @@ namespace App\Services {
         public function getTvAlternativeTitles(int $tmdbId): array
         {
             $this->tvAlternativeRequests++;
+            if ($this->throwOnTvAlternativeTitles) {
+                throw new \RuntimeException('synthetic alternative-title failure');
+            }
 
-            return [];
+            return $this->tvAlternativeTitles[$tmdbId] ?? [];
         }
 
         public function getMovieAlternativeTitles(int $tmdbId): array
         {
             $this->movieAlternativeRequests++;
 
-            return [];
+            return $this->movieAlternativeTitles[$tmdbId] ?? [];
+        }
+
+        public function getTvTranslations(int $tmdbId): array
+        {
+            $this->tvTranslationRequests++;
+            if ($this->throwOnTvTranslations) {
+                throw new \RuntimeException('synthetic translation failure');
+            }
+
+            return $this->tvTranslations[$tmdbId] ?? [];
+        }
+
+        public function getMovieTranslations(int $tmdbId): array
+        {
+            $this->movieTranslationRequests++;
+
+            return $this->movieTranslations[$tmdbId] ?? [];
         }
     }
 
@@ -552,7 +590,7 @@ namespace Tests {
         $seasonCache ??= [];
         $imagesCache ??= [];
 
-        return $method->invokeArgs($plugin, [
+        $result = $method->invokeArgs($plugin, [
             &$programme,
             $tmdb,
             &$cache,
@@ -569,6 +607,8 @@ namespace Tests {
             &$imagesCache,
             $lookupContext,
         ]);
+
+        return $result;
     }
 
     function validatedSearch(
@@ -579,8 +619,25 @@ namespace Tests {
         ?string $mediaType = null,
         ?int $year = null,
         string $description = '',
+        array $localeEvidence = [],
     ): ?array {
-        return $method->invoke($plugin, $tmdb, $title, $mediaType, $year, $description);
+        $provisionalIdentity = null;
+        $matchEvidence = null;
+        $lookupBudget = null;
+
+        $result = $method->invokeArgs($plugin, [
+            $tmdb,
+            $title,
+            $mediaType,
+            $year,
+            $description,
+            &$provisionalIdentity,
+            null,
+            &$matchEvidence,
+            $localeEvidence,
+            &$lookupBudget,
+        ]);
+        return $result;
     }
 
     function normalizedTvDetailsFixture(
@@ -650,6 +707,436 @@ namespace Tests {
     $sanitizeTmdbCacheMethod->setAccessible(true);
     $detectSeriesSignalsMethod = $reflection->getMethod('detectSeriesSignals');
     $detectSeriesSignalsMethod->setAccessible(true);
+
+    $locale = static fn (string $requested, ?string $title = null, ?string $description = null): array => [
+        'valid' => true,
+        'requested_locale' => $requested,
+        'title_locale' => $title ?? $requested,
+        'description_locale' => $description,
+    ];
+    $titleComparisonMethod = $reflection->getMethod('titleComparisonResult');
+    $titleComparisonMethod->setAccessible(true);
+    assertSameValue(
+        ['score' => 1.0, 'compatibility_only' => false, 'script_relation' => 'same'],
+        $titleComparisonMethod->invoke($plugin, "I\u{0307}stanbul Hatırası", 'İstanbul Hatırası'),
+        'Turkish dotted-I composed and decomposed forms must have one canonical comparison identity.'
+    );
+
+    $compatibilityOnlyTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 900,
+            'name' => 'Wide Signal',
+            'original_name' => 'Wide Signal',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [900 => normalizedTvDetailsFixture(900, 'Wide Signal')],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $compatibilityOnlyTmdb, 'Ｗｉｄｅ Ｓｉｇｎａｌ', null, null, '', $locale('en-US')),
+        'A compatibility-folded full-width identity must not be accepted without independent evidence.'
+    );
+    assertSameValue(
+        900,
+        validatedSearch($plugin, $searchMethod, $compatibilityOnlyTmdb, 'Ｗｉｄｅ Ｓｉｇｎａｌ', 'tv', 2024, '', $locale('en-US'))['tmdb_id'] ?? null,
+        'A full-width compatibility key may contribute only when exact year and media-type evidence independently corroborate it.'
+    );
+
+    $unicodeCases = [
+        ['canonical NFC/NFD', "Cafe\u{0301} du Port", 'Café du Port', 'fr-FR'],
+        ['Turkish dotted I canonical form', "I\u{0307}stanbul Hatırası", 'İstanbul Hatırası', 'tr-TR'],
+        ['Greek final sigma case fold', 'Οδυσσεύς στο Νησί', 'ΟΔΥΣΣΕΎΣ ΣΤΟ ΝΗΣΊ', 'el-GR'],
+        ['French diacritics', 'L’été à Noël', 'L’ÉTÉ À NOËL', 'fr-FR'],
+        ['Spanish diacritics', 'El corazón perdido', 'EL CORAZÓN PERDIDO', 'es-ES'],
+        ['Polish diacritics', 'Zażółć gęślą jaźń', 'ZAŻÓŁĆ GĘŚLĄ JAŹŃ', 'pl-PL'],
+        ['German diacritics', 'Straße über Köln', 'STRASSE ÜBER KÖLN', 'de-DE'],
+        ['Cyrillic identity', 'Тихий город', 'ТИХИЙ ГОРОД', 'ru-RU'],
+        ['Greek identity', 'Σιωπηλή πόλη', 'ΣΙΩΠΗΛΉ ΠΌΛΗ', 'el-GR'],
+        ['Arabic RTL identity', 'مدينة هادئة', 'مدينة هادئة', 'ar-SA'],
+        ['CJK identity', '静かな街', '静かな街', 'ja-JP'],
+    ];
+    foreach ($unicodeCases as $index => [$label, $programmeTitle, $candidateTitle, $requestedLocale]) {
+        $tmdbId = 910 + $index;
+        $unicodeTmdb = new CandidateTmdbService(
+            tvCandidates: [[
+                'tmdb_id' => $tmdbId,
+                'name' => $candidateTitle,
+                'original_name' => $candidateTitle,
+                'original_language' => substr($requestedLocale, 0, 2),
+                'first_air_date' => '2024-01-01',
+                'overview' => '',
+            ]],
+            tvDetails: [$tmdbId => normalizedTvDetailsFixture($tmdbId, $candidateTitle)],
+        );
+        $unicodeResult = validatedSearch($plugin, $searchMethod, $unicodeTmdb, $programmeTitle, 'tv', 2024, '', $locale($requestedLocale));
+        assertSameValue(
+            [$tmdbId, 'selected'],
+            [$unicodeResult['tmdb_id'] ?? null, $unicodeResult['_match_evidence']['reason'] ?? null],
+            ucfirst($label).' must match through guarded Unicode identity comparison.'
+        );
+    }
+
+    $dotlessMismatchTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 930,
+            'name' => 'Isiklar Gecesi',
+            'original_name' => 'Isiklar Gecesi',
+            'original_language' => 'tr',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [930 => normalizedTvDetailsFixture(930, 'Isiklar Gecesi')],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $dotlessMismatchTmdb, 'Işıklar Gecesi', 'tv', 2024, '', $locale('tr-TR')),
+        'Turkish dotless-I and diacritic differences must not collapse into ASCII identity.'
+    );
+
+    $confusableTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 931,
+            'name' => 'Cosmos Signal',
+            'original_name' => 'Cosmos Signal',
+            'original_language' => 'en',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [931 => normalizedTvDetailsFixture(931, 'Cosmos Signal')],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $confusableTmdb, 'Сosmos Signal', 'tv', 2024, '', $locale('en-US')),
+        'Latin/Cyrillic confusable similarity must fail closed even with year and media-type evidence.'
+    );
+
+    $unlistedScriptTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 938,
+            'name' => 'AA Signal',
+            'original_name' => 'AA Signal',
+            'original_language' => 'en',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [938 => normalizedTvDetailsFixture(938, 'AA Signal')],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $unlistedScriptTmdb, 'AᎪ Signal', 'tv', 2024, '', $locale('en-US')),
+        'Mixed-script rejection must discover scripts through Unicode properties rather than a script allowlist.'
+    );
+
+    $scriptDigitTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 943,
+            'name' => '1234 Signal',
+            'original_name' => '1234 Signal',
+            'original_language' => 'en',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [943 => normalizedTvDetailsFixture(943, '1234 Signal')],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $scriptDigitTmdb, '123٤ Signal', 'tv', 2024, '', $locale('en-US')),
+        'Script-specific number characters must participate in mixed-script rejection.'
+    );
+
+    $punctuationOnlyTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 939,
+            'name' => 'Signal Guard',
+            'original_name' => 'Signal Guard',
+            'first_air_date' => '',
+            'overview' => '',
+        ]],
+        tvDetails: [939 => normalizedTvDetailsFixture(939, 'Signal Guard')],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $punctuationOnlyTmdb, 'Signal: Guard', null, null, '', $locale('en-US')),
+        'Punctuation-erased equality is an additional compatibility key and cannot prove identity by itself.'
+    );
+
+    $originalTitleTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 940,
+            'name' => 'The House',
+            'original_name' => 'La casa',
+            'original_language' => 'es',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [940 => normalizedTvDetailsFixture(940, 'The House')],
+    );
+    assertSameValue(
+        940,
+        validatedSearch($plugin, $searchMethod, $originalTitleTmdb, 'La casa', 'tv', 2024, '', $locale('en-US', 'es-ES'))['tmdb_id'] ?? null,
+        'Original-title evidence must be evaluated only with its compatible original_language tag.'
+    );
+
+    $aliasCandidate = [[
+        'tmdb_id' => 932,
+        'name' => 'The Bureau',
+        'original_name' => 'Le Bureau',
+        'original_language' => 'fr',
+        'first_air_date' => '2015-01-01',
+        'overview' => '',
+    ]];
+    $aliasDetails = [932 => normalizedTvDetailsFixture(932, 'The Bureau')];
+    $lateSameScriptAlias = array_merge(
+        array_map(static fn (int $index): array => ['title' => 'Alias Fixture '.$index, 'iso_3166_1' => 'FR'], range(1, 14)),
+        [['title' => 'Le Bureau des légendes', 'iso_3166_1' => 'FR']],
+    );
+    $sameScriptAliasTmdb = new CandidateTmdbService(
+        tvCandidates: $aliasCandidate,
+        tvDetails: $aliasDetails,
+        tvAlternativeTitles: [932 => $lateSameScriptAlias],
+        tvTranslations: [932 => []],
+    );
+    assertSameValue(
+        932,
+        validatedSearch($plugin, $searchMethod, $sameScriptAliasTmdb, 'Le Bureau des légendes', 'tv', 2015, '', $locale('fr-FR'))['tmdb_id'] ?? null,
+        'A region-tagged same-script TMDB alternative title plus year/type evidence should match.'
+    );
+    assertSameValue([1, 1], [$sameScriptAliasTmdb->tvAlternativeRequests, $sameScriptAliasTmdb->tvTranslationRequests], 'A plausible alias candidate must make exactly one bounded alternative-title and translation request.');
+
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
+    Http::$calls = [];
+    Http::$responses = [new FakeHttpResponse(true, ['translations' => [[
+        'iso_639_1' => 'ja',
+        'iso_3166_1' => 'JP',
+        'data' => ['title' => '静かな街'],
+    ]]])];
+    $serviceFallbackWinner = validatedSearch(
+        $plugin,
+        $searchMethod,
+        new TmdbService('translation-only'),
+        '静かな街',
+        'movie',
+        2024,
+        '',
+        $locale('en-US', 'ja-JP'),
+    );
+    assertSameValue(211, $serviceFallbackWinner['tmdb_id'] ?? null, 'The production HTTP fallback must expose tagged translations when the host service lacks that method.');
+    assertSameValue(1, count(Http::$calls), 'A host without translation support must make exactly one bounded fallback request for the plausible candidate.');
+    assertTrueValue(str_ends_with(Http::$calls[0]['url'] ?? '', '/movie/211/translations'), 'The fallback request must use the existing TMDB translations endpoint only.');
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
+
+    $irrelevantRegionalAlternatives = array_map(
+        static fn (int $index): array => ['title' => 'Irrelevant Alias '.$index, 'iso_3166_1' => 'JP'],
+        range(1, 15),
+    );
+    $mixedScriptAliasTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 933,
+            'name' => 'Tokyo Vice',
+            'original_name' => 'Tokyo Vice',
+            'original_language' => 'en',
+            'first_air_date' => '2022-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [933 => normalizedTvDetailsFixture(933, 'Tokyo Vice')],
+        tvAlternativeTitles: [933 => $irrelevantRegionalAlternatives],
+        tvTranslations: [933 => [[
+            'iso_639_1' => 'ja',
+            'iso_3166_1' => 'JP',
+            'data' => ['name' => 'Tokyo Vice 東京'],
+        ]]],
+    );
+    assertSameValue(
+        933,
+        validatedSearch($plugin, $searchMethod, $mixedScriptAliasTmdb, 'Tokyo Vice 東京', 'tv', 2022, '', $locale('ja-JP'))['tmdb_id'] ?? null,
+        'A legitimate mixed-script title requires an explicit tagged TMDB alias and independent evidence.'
+    );
+    validatedSearch($plugin, $searchMethod, $mixedScriptAliasTmdb, 'Tokyo Vice 東京', 'tv', 2022, '', $locale('ja-JP'));
+    assertSameValue([1, 1], [$mixedScriptAliasTmdb->tvAlternativeRequests, $mixedScriptAliasTmdb->tvTranslationRequests], 'Tagged title evidence must be cached and must not fan out on repeat validation.');
+
+    $exactMixedScriptAliasTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 941,
+            'name' => 'Tokyo Vice 東京',
+            'original_name' => 'Tokyo Vice',
+            'original_language' => 'en',
+            'first_air_date' => '2022-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [941 => normalizedTvDetailsFixture(941, 'Tokyo Vice 東京')],
+        tvAlternativeTitles: [941 => []],
+        tvTranslations: [941 => [[
+            'iso_639_1' => 'ja',
+            'iso_3166_1' => 'JP',
+            'data' => ['name' => 'Tokyo Vice 東京'],
+        ]]],
+    );
+    assertSameValue(
+        941,
+        validatedSearch($plugin, $searchMethod, $exactMixedScriptAliasTmdb, 'Tokyo Vice 東京', 'tv', 2022, '', $locale('ja-JP'))['tmdb_id'] ?? null,
+        'An exact mixed-script localized title must still require and accept equal tagged alias evidence.'
+    );
+
+    $missingAliasTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 934,
+            'name' => 'Silent City',
+            'original_name' => 'Silent City',
+            'original_language' => 'en',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvAlternativeTitles: [934 => []],
+        tvTranslations: [934 => []],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $missingAliasTmdb, '静かな街', 'tv', 2024, '', $locale('ja-JP')),
+        'Missing TMDB translation coverage must remain an explicit neutral gap, not a fuzzy match.'
+    );
+    assertSameValue([1, 1, 0], [$missingAliasTmdb->tvAlternativeRequests, $missingAliasTmdb->tvTranslationRequests, $missingAliasTmdb->tvDetailsRequests], 'Missing aliases must use one bounded evidence expansion and no winner-details request.');
+
+    $failingAliasTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 942,
+            'name' => 'Failure City',
+            'original_name' => 'Failure City',
+            'original_language' => 'en',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        throwOnTvAlternativeTitles: true,
+    );
+    validatedSearch($plugin, $searchMethod, $failingAliasTmdb, '失敗の街', 'tv', 2024, '', $locale('ja-JP'));
+    validatedSearch($plugin, $searchMethod, $failingAliasTmdb, '失敗の街', 'tv', 2024, '', $locale('ja-JP'));
+    assertSameValue([1, 1], [$failingAliasTmdb->tvAlternativeRequests, $failingAliasTmdb->tvTranslationRequests], 'A failed title-evidence channel must not block the other channel and must be negatively cached without repeated fan-out.');
+
+    $translationFailureTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 944,
+            'name' => 'The Bureau',
+            'original_name' => 'Le Bureau',
+            'original_language' => 'fr',
+            'first_air_date' => '2015-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [944 => normalizedTvDetailsFixture(944, 'The Bureau')],
+        tvAlternativeTitles: [944 => [['title' => 'Le Bureau des légendes', 'iso_3166_1' => 'FR']]],
+        throwOnTvTranslations: true,
+    );
+    assertSameValue(944, validatedSearch($plugin, $searchMethod, $translationFailureTmdb, 'Le Bureau des légendes', 'tv', 2015, '', $locale('fr-FR'))['tmdb_id'] ?? null, 'A translation failure must retain independently valid alternative-title evidence.');
+    assertSameValue([1, 1], [$translationFailureTmdb->tvAlternativeRequests, $translationFailureTmdb->tvTranslationRequests], 'Independent title-evidence channels must each make at most one request.');
+
+    $boundedAlternatives = array_map(
+        static fn (int $index): array => ['title' => 'Bounded Alias '.$index, 'iso_3166_1' => 'FR'],
+        range(1, 50),
+    );
+    $boundedAlternatives[] = ['title' => 'Alias Beyond Bound', 'iso_3166_1' => 'FR'];
+    $boundedEvidenceTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 945,
+            'name' => 'Bounded Evidence',
+            'original_name' => 'Bounded Evidence',
+            'original_language' => 'en',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvAlternativeTitles: [945 => $boundedAlternatives],
+        tvTranslations: [945 => []],
+    );
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $boundedEvidenceTmdb, 'Alias Beyond Bound', 'tv', 2024, '', $locale('fr-FR')), 'Title evidence beyond the per-channel 50-record bound must remain unavailable.');
+    assertSameValue([1, 1, 0], [$boundedEvidenceTmdb->tvAlternativeRequests, $boundedEvidenceTmdb->tvTranslationRequests, $boundedEvidenceTmdb->tvDetailsRequests], 'The title-record bound must not increase endpoint or winner-details request counts.');
+
+    $descriptionLanguageTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 935,
+            'name' => 'Signal Harborxyz',
+            'original_name' => 'Signal Harborxyz',
+            'original_language' => 'en',
+            'first_air_date' => '',
+            'overview' => 'shared lighthouse harbour mystery',
+            'cast' => ['Ada Person', 'Ben Person'],
+        ]],
+        tvDetails: [935 => normalizedTvDetailsFixture(935, 'Signal Harborxyz')],
+    );
+    assertSameValue(
+        null,
+        validatedSearch($plugin, $searchMethod, $descriptionLanguageTmdb, 'Signal Harbor', null, null, 'Ada Person and Ben Person share a lighthouse harbour mystery', $locale('en-US', 'en-US', 'es-ES')),
+        'A language-incompatible description must be neutral and cannot rescue a weak title match.'
+    );
+
+    foreach (['zz-ZZ' => 'unsupported_language_tag', 'en-UK' => 'unsupported_language_tag', 'iw-US' => 'unsupported_language_tag', 'en-US-extra' => 'malformed_language_tag'] as $badLocale => $expectedReason) {
+        $badLocaleTmdb = new CandidateTmdbService(tvCandidates: [[
+            'tmdb_id' => 936,
+            'name' => 'Locale Guard',
+            'original_name' => 'Locale Guard',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]]);
+        $badLocaleProgramme = ['title' => 'Locale Guard', 'title_language' => $badLocale];
+        $badLocaleCache = [];
+        enrich($plugin, $method, $badLocaleProgramme, $badLocaleTmdb, $badLocaleCache, ['tmdb_language' => 'en-US']);
+        assertSameValue([0, 0], [$badLocaleTmdb->tvCandidateSearches, $badLocaleTmdb->movieCandidateSearches], ucfirst($badLocale).' must fail before TMDB lookup.');
+        assertSameValue($expectedReason, $badLocaleProgramme['tmdb_decision']['reason'] ?? null, ucfirst($badLocale).' must retain a deterministic rejection reason.');
+    }
+
+    $unsafeConfiguredLocaleTmdb = new CandidateTmdbService();
+    $unsafeConfiguredLocaleProgramme = ['title' => 'Locale Guard'];
+    $unsafeConfiguredLocaleCache = [];
+    enrich($plugin, $method, $unsafeConfiguredLocaleProgramme, $unsafeConfiguredLocaleTmdb, $unsafeConfiguredLocaleCache, ['tmdb_language' => 'https://secret.invalid/token']);
+    assertSameValue('__invalid', $unsafeConfiguredLocaleProgramme['tmdb_decision']['scope']['language'] ?? null, 'Malformed configured locale diagnostics must use a constant redacted scope value.');
+    assertTrueValue(! str_contains(json_encode($unsafeConfiguredLocaleProgramme['tmdb_decision'], JSON_UNESCAPED_SLASHES), 'secret.invalid'), 'Malformed configured locale diagnostics must not leak the raw setting.');
+
+    $unsafeLegacyLocaleTmdb = new TmdbService('long-walk');
+    $unsafeLegacyLocaleProgramme = ['title' => 'The Long Walk'];
+    $unsafeLegacyLocaleCache = [];
+    enrich($plugin, $method, $unsafeLegacyLocaleProgramme, $unsafeLegacyLocaleTmdb, $unsafeLegacyLocaleCache, ['tmdb_language' => 'https://secret.invalid/token']);
+    assertSameValue([0, 0], [$unsafeLegacyLocaleTmdb->tvSearches, $unsafeLegacyLocaleTmdb->movieSearches], 'Malformed configured locales must not enter the legacy lookup path.');
+
+    $localeChainMethod = $reflection->getMethod('buildTmdbLocaleContext');
+    $localeChainMethod->setAccessible(true);
+    assertSameValue(
+        [
+            'valid' => true,
+            'reason' => 'validated_locale_chain',
+            'requested_locale' => 'fr-CA',
+            'title_locale' => 'fr-CA',
+            'description_locale' => 'fr-CA',
+        ],
+        $localeChainMethod->invoke($plugin, ['title_language' => 'fr', 'desc_language' => 'fr'], ['tmdb_language' => 'fr-CA']),
+        'A language-only XMLTV tag must inherit a compatible configured TMDB region deterministically.'
+    );
+    foreach (['aa-US', 'en-AQ'] as $validSparseLocale) {
+        assertSameValue(true, $localeChainMethod->invoke($plugin, ['title_language' => $validSparseLocale], ['tmdb_language' => $validSparseLocale])['valid'] ?? null, $validSparseLocale.' must remain valid even when ICU has no tailored locale bundle.');
+    }
+
+    $missedTitleLogPath = sys_get_temp_dir().'/epg-enricher-legacy-missed-title.jsonl';
+    $safeMissedFingerprint = str_repeat('a', 64);
+    file_put_contents($missedTitleLogPath, json_encode(['ts' => '2026-09-04T00:00:00+00:00', 'title' => 'Legacy Raw Title', 'base' => 'Legacy Raw'])."\n".json_encode(['ts' => '2026-09-04T00:00:00+00:00', 'identity_fingerprint' => $safeMissedFingerprint, 'year' => 2024, 'forced_type' => 'tv'])."\n");
+    $scrubMissedTitleLogMethod = $reflection->getMethod('scrubLegacyMissedTitleLog');
+    $scrubMissedTitleLogMethod->setAccessible(true);
+    $scrubMissedTitleLogMethod->invoke($plugin, $missedTitleLogPath);
+    $scrubbedMissedTitleLog = (string) file_get_contents($missedTitleLogPath);
+    assertTrueValue(! str_contains($scrubbedMissedTitleLog, 'Legacy Raw') && str_contains($scrubbedMissedTitleLog, $safeMissedFingerprint), 'Legacy raw missed-title rows must be removed while privacy-safe fingerprint rows survive migration.');
+    unlink($missedTitleLogPath);
+
+    $rawUnicodeTitle = "Cafe\u{0301} du Port";
+    $rawUnicodeTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 937,
+            'name' => 'Café du Port',
+            'original_name' => 'Café du Port',
+            'original_language' => 'fr',
+            'first_air_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        tvDetails: [937 => normalizedTvDetailsFixture(937, 'Café du Port')],
+    );
+    $rawUnicodeProgramme = ['title' => $rawUnicodeTitle, 'title_language' => 'fr-FR', 'episode_num' => '0.0'];
+    $rawUnicodeCache = [];
+    enrich($plugin, $method, $rawUnicodeProgramme, $rawUnicodeTmdb, $rawUnicodeCache, ['tmdb_language' => 'fr-FR']);
+    assertSameValue($rawUnicodeTitle, $rawUnicodeProgramme['title'], 'Unicode comparison keys must never replace the raw UTF-8 programme title.');
 
     assertSameValue(
         [
@@ -761,12 +1248,12 @@ namespace Tests {
             'BEACON-VALE,' => [],
         ],
     );
-    $normalizedEditionProgramme = ['title' => '  BEACON-VALE,   CLASSICS Folge 9  '];
+    $normalizedEditionProgramme = ['title' => '  BEACON-VALE,   CLASSICS Folge 9  ', 'episode_num' => '0.8'];
     $normalizedEditionCache = [];
     enrich($plugin, $method, $normalizedEditionProgramme, $normalizedEditionTmdb, $normalizedEditionCache);
     assertSameValue('https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg', $normalizedEditionProgramme['icon'] ?? null, 'Case, whitespace, and punctuation variants should use generic normalized candidate matching.');
     assertSameValue(['  BEACON-VALE,   CLASSICS Folge 9  ', 'BEACON-VALE,'], $normalizedEditionTmdb->tvQueries, 'Normalized title variants must preserve the full-then-base TV query order.');
-    assertSameValue(['  BEACON-VALE,   CLASSICS Folge 9  ', 'BEACON-VALE,'], $normalizedEditionTmdb->movieQueries, 'Normalized title variants must preserve the full-then-base movie query order.');
+    assertSameValue([], $normalizedEditionTmdb->movieQueries, 'Exact episode evidence must keep punctuation-compatible matching on TV.');
 
     $globalMovieDetails = normalizedMovieDetailsFixture(
         702,
@@ -1172,7 +1659,7 @@ namespace Tests {
 
     $marginTmdb = new CandidateTmdbService(tvCandidates: [
         ['tmdb_id' => 641, 'name' => 'Margin Target', 'original_name' => 'Margin Target', 'first_air_date' => '2024-01-01', 'overview' => 'No overlap.'],
-        ['tmdb_id' => 642, 'name' => 'Margin Target', 'original_name' => 'Margin Target', 'first_air_date' => '2023-01-01', 'overview' => 'Shared alpha evidence.'],
+        ['tmdb_id' => 642, 'name' => 'Margin Target', 'original_name' => 'Margin Target', 'first_air_date' => '2024-01-01', 'overview' => 'Shared alpha evidence.'],
     ]);
     assertSameValue(null, validatedSearch($plugin, $searchMethod, $marginTmdb, 'Margin Target', 'tv', 2024, 'Shared alpha description.'), 'An insufficient winner margin should abstain.');
     assertSameValue(0, $marginTmdb->tvDetailsRequests, 'Margin abstention must not load candidate details.');
@@ -1387,13 +1874,10 @@ namespace Tests {
         'category' => 'Movie',
         'icon' => 'https://provider.invalid/weak-unknown.jpg',
     ];
-    $weakBefore = $weakIlluminati;
     enrich($plugin, $method, $weakIlluminati, $illuminatiTmdb, $illuminatiCache);
-    $weakIlluminatiComparable = $weakIlluminati;
-    unset($weakIlluminatiComparable['tmdb_decision']);
-    assertSameValue($weakBefore, $weakIlluminatiComparable, 'Alternative-title matches without description corroboration should fail closed.');
-    assertSameValue('unmatched', $weakIlluminati['tmdb_decision']['result'] ?? null, 'Alternative-title rejection must retain unmatched evidence.');
-    assertSameValue(1, count($illuminatiCache), 'Identity abstention should not persist a cache entry.');
+    assertSameValue('https://fixture.invalid/illuminati-backdrop.jpg', $weakIlluminati['icon'], 'A tagged alternative title may use exact release year as independent evidence without description overlap.');
+    assertSameValue('selected', $weakIlluminati['tmdb_decision']['result'] ?? null, 'Year-corroborated alternative-title selection must retain selected evidence.');
+    assertSameValue(2, count($illuminatiCache), 'Distinct successful description-sensitive identities should remain isolated in cache.');
 
     $sourceCache = [];
     $sourceA = ['title' => 'Global Identity'];

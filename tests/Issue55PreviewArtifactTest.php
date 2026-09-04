@@ -56,7 +56,22 @@ namespace Tests {
     previewAssert(file_get_contents($firstGallery) === file_get_contents($secondGallery), 'The preview gallery must be reproducible.');
 
     $manifest = json_decode((string) file_get_contents($firstManifest), true, 512, JSON_THROW_ON_ERROR);
-    previewAssert(is_array($manifest['cases'] ?? null) && count($manifest['cases']) > 0 && count($manifest['cases']) <= 12, 'The preview manifest must contain a bounded case set.');
+    previewAssert(is_array($manifest['cases'] ?? null) && count($manifest['cases']) === 12, 'The preview manifest must contain the exact bounded replay case set.');
+    $casesById = array_column($manifest['cases'], null, 'id');
+    foreach ([
+        'ambiguous' => 'ambiguous_identity',
+        'confusable' => 'mixed_script_identity_rejected',
+        'unsupported_locale' => 'unsupported_language_tag',
+        'malformed_locale' => 'malformed_language_tag',
+        'missing_translation' => 'explicit_alias_unavailable',
+        'incompatible_description' => 'language_incompatible_description',
+    ] as $caseId => $reason) {
+        previewAssert(($casesById[$caseId]['applicability']['reason'] ?? null) === $reason, $caseId.' must expose its deterministic safe rejection reason.');
+    }
+    foreach ($manifest['cases'] as $case) {
+        previewAssert(mb_strlen((string) ($case['evidence']['title'] ?? '')) <= 160, 'Raw fixture display titles must remain bounded.');
+        previewAssert(! array_key_exists('description', $case['evidence'] ?? []), 'Replay evidence must never include raw descriptions.');
+    }
     previewAssert(str_contains((string) file_get_contents($firstGallery), '&lt;script&gt;'), 'The gallery must HTML-escape fixture evidence.');
     $serialized = (string) file_get_contents($firstManifest).(string) file_get_contents($firstGallery);
     previewAssert(! str_contains($serialized, 'provider.invalid') && ! str_contains($serialized, 'https://') && ! str_contains($serialized, 'private fixture description'), 'The preview artifact must redact provider hosts, URLs, and descriptions.');

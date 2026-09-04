@@ -48,7 +48,7 @@ Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because n
 3. Reads each day's cached programme JSONL files, but only processes targeted channels
 4. For each programme missing artwork/genres/descriptions:
    - Checks the local TMDB title cache
-   - If not cached, searches TMDB (movie first, then TV series)
+   - If not cached, searches bounded TV and movie candidate sets and ranks them together
    - Fetches full details (poster, backdrop, genres, overview)
    - Writes enriched data back to the JSONL cache
 5. Programmes that already have metadata (e.g. from Schedules Direct / Gracenote) are skipped unless "Overwrite existing" is enabled
@@ -62,7 +62,15 @@ The enriched JSONL cache and generated XMLTV can be correct while Emby still dis
 
 ## Matching Diagnostics
 
-Before TMDB lookup, each programme receives a bounded applicability decision. Generic live sports, news, and provider-brand rows without stable catalogue identity skip candidate searches; trusted programme artwork is preserved, otherwise a fallback is recorded. Candidate decisions contain only normalized input and candidate fingerprints, score/margin, typed episode evidence, and safe reason codes. Raw descriptions, provider URLs, hosts, and credentials are not stored in these diagnostics.
+Before TMDB lookup, each programme receives a bounded applicability decision. Generic live sports, news, and provider-brand rows without stable catalogue identity skip candidate searches; trusted programme artwork is preserved, otherwise a fallback is recorded. Candidate decisions and missed-identity aggregates contain only fingerprints, score/margin, typed episode evidence, and safe reason codes. Raw titles, descriptions, provider URLs, hosts, and credentials are not stored in production diagnostics; legacy raw missed-title rows are scrubbed on the next miss or health-check read.
+
+## Multilingual Identity Matching
+
+Programme titles remain raw UTF-8 for display and output. Identity comparison uses canonical Unicode normalization and full Unicode case folding when PHP `intl`/`Normalizer` and multibyte case conversion are available; otherwise that comparison fails closed. A compatibility-normalized key can corroborate punctuation or width variants only with independent type, year/date, episode, or compatible-language evidence. The matcher does not transliterate scripts for acceptance and treats mixed-script/confusable similarity as a rejection unless an explicitly tagged TMDB translation or regional alternative title supplies the title plus independent evidence. See [Unicode normalization UAX #15](https://www.unicode.org/reports/tr15/), [Unicode security UTS #39](https://www.unicode.org/reports/tr39/), [PHP Normalizer](https://www.php.net/manual/en/normalizer.normalize.php), and [PHP Unicode case conversion](https://www.php.net/manual/en/function.mb-convert-case.php).
+
+The locale chain validates an XMLTV title/description language when present, combines a language-only tag with a compatible configured region, and then evaluates TMDB evidence in separate channels: localized search title in the requested locale, original title with `original_language`, and language/country-tagged translation or region-tagged alternative title. Malformed or unsupported tags fail closed; missing translations and unknown or incompatible description languages are neutral. Alternative-title/translation expansion is cached and limited to one independently plausible candidate across full/base retries. TMDB distinguishes localized title, original title/language, media type, and release/air date, and commonly combines ISO-639-1 with ISO-3166-1; coverage remains incomplete. See [TMDB languages](https://developer.themoviedb.org/docs/languages), [TV search](https://developer.themoviedb.org/reference/search-tv), [multi search](https://developer.themoviedb.org/reference/search-multi), [TV alternative titles](https://developer.themoviedb.org/reference/tv-series-alternative-titles), and [TV translations](https://developer.themoviedb.org/reference/tv-series-translations).
+
+This safely supports multilingual Unicode inputs but cannot guarantee TMDB catalogue, image, localized-title, alternative-title, or translation coverage for every language. A safe rejection/provider fallback is intentional when evidence is absent or ambiguous.
 
 Run the deterministic offline replay gate with `php tests/issue55_offline_replay_test.php`. It uses mock candidate sets only, returns nonzero on a golden mismatch, and does not validate Emby integration.
 
