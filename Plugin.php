@@ -13,6 +13,7 @@ use App\Plugins\Support\PluginActionResult;
 use App\Plugins\Support\PluginExecutionContext;
 use App\Plugins\Support\PluginSelectOptionsContext;
 use App\Services\EpgCacheService;
+use App\Services\EpgProgrammeStore;
 use App\Services\TmdbService;
 use App\Settings\GeneralSettings;
 use Carbon\Carbon;
@@ -1354,10 +1355,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                             continue;
                         }
 
-                        // These fields are owned by the host's indexed columns, not data.
-                        $programme['channel'] = $row['channel_id'];
-                        $programme['start'] = (int) $row['start_ts'];
-                        $programme['stop'] = $row['stop_ts'] === null ? null : (int) $row['stop_ts'];
+                        $programme = EpgProgrammeStore::hydrate(
+                            $programme,
+                            $row['channel_id'],
+                            $row['start_ts'] === null ? null : (int) $row['start_ts'],
+                            $row['stop_ts'] === null ? null : (int) $row['stop_ts'],
+                        );
                         $result['processed']++;
                         $enrichResult = $this->enrichProgrammeFromTmdb(
                             $programme,
@@ -1387,7 +1390,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         $pendingUpdates[] = [
                             'row' => $row,
                             'data' => json_encode(
-                                array_diff_key($programme, array_flip(['channel', 'start', 'stop'])),
+                                EpgProgrammeStore::dehydrate($programme),
                                 JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
                             ),
                             'poster' => $enrichResult['poster'],

@@ -1,6 +1,12 @@
 <?php
 
 namespace {
+    $hostStoreFixture = '/opt/data/tmp/issue55-upstream-EpgProgrammeStore.php';
+    if (! is_file($hostStoreFixture)) {
+        throw new \RuntimeException("Required frozen host EpgProgrammeStore fixture is unavailable at {$hostStoreFixture}.");
+    }
+    require_once $hostStoreFixture;
+
     function app(string $class): object
     {
         return match ($class) {
@@ -136,14 +142,23 @@ namespace App\Services {
             $this->sawTransactionDuringLookup = $this->database?->inTransaction() ?? false;
             if ($id === 102 && $this->database !== null && $this->staleData !== null) {
                 $this->database->prepare('UPDATE programmes SET data = ? WHERE channel_id = ? AND date = ? AND start_ts = ? AND stop_ts = ?')
-                    ->execute([$this->staleData, 'target', '2026-09-05', 1725530400, 1725534000]);
+                    ->execute([$this->staleData, 'target', '2026-09-05', 1725534000, 1725537600]);
             }
+
+            $title = match ($id) {
+                101 => 'Fixture Feature',
+                102 => 'Stale Feature',
+                103 => 'Refreshed Feature',
+                104 => 'Replacement Feature',
+                105 => 'Rollback Feature',
+                default => 'Refreshed Feature',
+            };
 
             return [
                 'tmdb_id' => $id,
                 'imdb_id' => null,
-                'title' => $id === 101 ? 'Fixture Feature' : 'Refreshed Feature',
-                'original_title' => $id === 101 ? 'Fixture Feature' : 'Refreshed Feature',
+                'title' => $title,
+                'original_title' => $title,
                 'overview' => 'Local fake TMDB overview',
                 'poster_url' => null,
                 'backdrop_url' => null,
@@ -215,6 +230,7 @@ namespace Tests {
     require_once __DIR__.'/../Plugin.php';
 
     use App\Plugins\Support\PluginExecutionContext;
+    use App\Services\EpgProgrammeStore;
     use App\Services\LocalSqliteTmdbService;
     use AppLocalPlugins\EpgEnricher\Plugin;
     use Illuminate\Support\Facades\Storage;
@@ -247,17 +263,24 @@ namespace Tests {
         'programme_date_range' => ['min_date' => '2026-09-05', 'max_date' => '2026-09-05'],
     ], JSON_THROW_ON_ERROR));
 
-    $database = new PDO('sqlite:'.$cacheDir.'/programmes.sqlite');
-    $database->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $database->exec('CREATE TABLE programmes (channel_id TEXT NOT NULL, date TEXT NOT NULL, start_ts INTEGER NOT NULL, stop_ts INTEGER NULL, data TEXT NOT NULL, UNIQUE (channel_id, date, start_ts, stop_ts))');
     $normalData = programmeData(101, 'Fixture Feature', ['unknown_scalar' => 'preserve-me']);
-    $nullableStopData = programmeData(103, 'Open-ended Feature');
+    $nullableStopData = programmeData(103, 'Refreshed Feature');
     $refreshedData = json_encode(['title' => 'Cache refresh won', 'refresh_marker' => true], JSON_THROW_ON_ERROR);
     $unmappedData = json_encode(['title' => 'Unmapped', 'unknown_unmapped' => ['keep' => 'bytes']], JSON_THROW_ON_ERROR);
+    $store = new EpgProgrammeStore();
+    $store->beginWrite($cacheDir.'/programmes.sqlite');
+    $store->insert('target', '2026-09-05', 1725526800, 1725530400, json_decode($normalData, true, 512, JSON_THROW_ON_ERROR));
+    $store->insert('target', '2026-09-05', 1725530400, null, json_decode($nullableStopData, true, 512, JSON_THROW_ON_ERROR));
+    $store->insert('unmapped', '2026-09-05', 1725526800, 1725530400, json_decode($unmappedData, true, 512, JSON_THROW_ON_ERROR));
+    $store->finish();
+    $store = EpgProgrammeStore::openRead($cacheDir.'/programmes.sqlite');
+    $hostHydratedFixture = $store->read('2026-09-05', ['target']);
+    $store->close();
+    assertSameValue('2024-09-05T09:00:00.000000Z', $hostHydratedFixture['target'][0]['start'] ?? null, 'The SQLite fixture must be reopened through host hydration.');
+
+    $database = new PDO('sqlite:'.$cacheDir.'/programmes.sqlite');
+    $database->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $insert = $database->prepare('INSERT INTO programmes (channel_id, date, start_ts, stop_ts, data) VALUES (?, ?, ?, ?, ?)');
-    $insert->execute(['target', '2026-09-05', 1725526800, 1725530400, $normalData]);
-    $insert->execute(['target', '2026-09-05', 1725530400, null, $nullableStopData]);
-    $insert->execute(['unmapped', '2026-09-05', 1725526800, 1725530400, $unmappedData]);
     $GLOBALS['sqliteTmdb'] = new LocalSqliteTmdbService($database);
 
     $plugin = new Plugin();
@@ -276,14 +299,15 @@ namespace Tests {
     assertSameValue(false, array_key_exists('channel', $normal), 'Column-owned channel data must not be serialized into SQLite JSON.');
     assertSameValue(false, array_key_exists('start', $normal), 'Column-owned start data must not be serialized into SQLite JSON.');
     assertSameValue(false, array_key_exists('stop', $normal), 'Column-owned stop data must not be serialized into SQLite JSON.');
-    $hostHydratedNormal = $normal + [
-        'channel' => $normalRow['channel_id'],
-        'start' => (int) $normalRow['start_ts'],
-        'stop' => (int) $normalRow['stop_ts'],
-    ];
+    $hostHydratedNormal = EpgProgrammeStore::hydrate(
+        $normal,
+        $normalRow['channel_id'],
+        (int) $normalRow['start_ts'],
+        (int) $normalRow['stop_ts'],
+    );
     assertSameValue('target', $hostHydratedNormal['channel'], 'Host-style hydration must restore the column-owned channel.');
-    assertSameValue(1725526800, $hostHydratedNormal['start'], 'Host-style hydration must restore the column-owned start.');
-    assertSameValue(1725530400, $hostHydratedNormal['stop'], 'Host-style hydration must restore the column-owned stop.');
+    assertSameValue('2024-09-05T09:00:00.000000Z', $hostHydratedNormal['start'], 'Host-style hydration must restore the column-owned start.');
+    assertSameValue('2024-09-05T10:00:00.000000Z', $hostHydratedNormal['stop'], 'Host-style hydration must restore the column-owned stop.');
     $nullableStop = json_decode($database->query("SELECT data FROM programmes WHERE channel_id = 'target' AND start_ts = 1725530400")->fetchColumn(), true, 512, JSON_THROW_ON_ERROR);
     assertSameValue('Local fake TMDB overview', $nullableStop['desc'] ?? null, 'A NULL stop_ts row must be conditionally updated.');
     assertSameValue($unmappedData, $database->query("SELECT data FROM programmes WHERE channel_id = 'unmapped'")->fetchColumn(), 'Unmapped SQLite rows must remain byte-for-byte unchanged.');
