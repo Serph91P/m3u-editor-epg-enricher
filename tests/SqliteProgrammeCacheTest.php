@@ -353,6 +353,15 @@ namespace Tests {
     $database = null;
     $database = new PDO('sqlite:'.$cacheDir.'/programmes.sqlite');
     $database->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $database->exec('DELETE FROM programmes');
+    $malformedData = '{malformed SQLite programme data';
+    $database->prepare('INSERT INTO programmes (channel_id, date, start_ts, stop_ts, data) VALUES (?, ?, ?, ?, ?)')
+        ->execute(['target', '2026-09-05', 1725523200, 1725526800, $malformedData]);
+    $malformedResult = $method->invoke($plugin, 1, [1], new PluginExecutionContext());
+    assertSameValue(false, $malformedResult->success, 'Malformed targeted SQLite programme data must fail enrichment.');
+    assertSameValue(0, $malformedResult->data['programmes_processed'] ?? null, 'Malformed-only targeted SQLite data must not report processed programmes.');
+    assertSameValue(0, $malformedResult->data['programmes_updated'] ?? null, 'Malformed targeted SQLite data must not report persisted updates.');
+    assertSameValue($malformedData, $database->query("SELECT data FROM programmes WHERE channel_id = 'target'")->fetchColumn(), 'Malformed targeted SQLite data must remain byte-for-byte unchanged.');
     $database->exec('DROP TABLE programmes');
     $database->exec('CREATE TABLE unexpected_cache_shape (data TEXT NOT NULL)');
     $errorResult = $method->invoke($plugin, 1, [1], new PluginExecutionContext());

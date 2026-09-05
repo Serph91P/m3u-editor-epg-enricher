@@ -1342,17 +1342,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
                             return $result;
                         }
+                        $data = (string) $row['data'];
                         try {
-                            $programme = json_decode((string) $row['data'], true, 512, JSON_THROW_ON_ERROR);
+                            if (! is_object(json_decode($data, false, 512, JSON_THROW_ON_ERROR))) {
+                                throw new \RuntimeException("SQLite programme data for {$row['channel_id']} on {$date} is not an object.");
+                            }
+                            $programme = json_decode($data, true, 512, JSON_THROW_ON_ERROR);
                         } catch (\JsonException) {
-                            $context->warning("Skipping invalid SQLite programme data for {$row['channel_id']} on {$date}.");
-
-                            continue;
-                        }
-                        if (! is_array($programme)) {
-                            $context->warning("Skipping non-object SQLite programme data for {$row['channel_id']} on {$date}.");
-
-                            continue;
+                            throw new \RuntimeException("SQLite programme data for {$row['channel_id']} on {$date} is invalid JSON.");
                         }
 
                         $programme = EpgProgrammeStore::hydrate(
