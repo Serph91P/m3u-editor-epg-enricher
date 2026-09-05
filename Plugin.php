@@ -24,6 +24,8 @@ use ReflectionProperty;
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, PluginSelectOptionsProviderInterface
 {
     private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 60;
+    private const SQLITE_PROGRAMME_PAGE_SIZE = 250;
+    private const SQLITE_CHANNELS_PER_QUERY = 250;
 
     /**
      * Bumped whenever the enrichment output for the SAME inputs changes.
@@ -919,6 +921,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($cacheDir === null) {
             return PluginActionResult::failure('Could not resolve EPG cache directory.');
         }
+        $sqliteProgrammeCache = $this->getProgrammeSqliteCachePath($cacheDir);
         $currentDate = Carbon::parse($minDate);
         $endDate = Carbon::parse($maxDate);
         $totalDays = $currentDate->diffInDays($endDate) + 1;
@@ -960,6 +963,72 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $this->deleteEnrichmentCheckpoint($stateKey);
 
                 return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
+            }
+
+            // Current host caches use SQLite. Prefer it whenever present so a stale
+            // legacy JSONL sibling can never replace newer programme data.
+            if ($sqliteProgrammeCache !== null) {
+                $context->info("Processing {$dateStr} ({$dayIndex}/{$totalDays}) from SQLite...");
+                $context->heartbeat(
+                    "Processing {$dateStr} ({$dayIndex}/{$totalDays}) from SQLite...",
+                    progress: (int) ((($dayIndex - 1) / $totalDays) * 100)
+                );
+                $result = $this->processSqliteProgrammeDate(
+                    $sqliteProgrammeCache,
+                    $dateStr,
+                    $targetChannelIds,
+                    $tmdb,
+                    $tmdbCache,
+                    $overwrite,
+                    $enrichCategories,
+                    $enrichDescriptions,
+                    $enrichPosters,
+                    $enrichBackdrops,
+                    $mapGenresToEpgCategories,
+                    $mapGenresToKodiGuideGenres,
+                    $keywordDetection,
+                    $enrichEpisodeDetails,
+                    $tmdbSeasonCache,
+                    $imagesCache,
+                    [
+                        'epg_source_id' => (string) $epgId,
+                        'tmdb_language' => $currentLanguage,
+                        'tmdb_language_reason' => $tmdbLanguageReason,
+                    ],
+                    $context,
+                );
+
+                $stats['programmes_processed'] += $result['processed'];
+                $stats['programmes_updated'] += $result['updated'];
+                $stats['programmes_already_enriched'] += $result['already_enriched'];
+                $stats['posters_added'] += $result['posters'];
+                $stats['categories_added'] += $result['categories'];
+                $stats['descriptions_added'] += $result['descriptions'];
+                $stats['tmdb_lookups'] += $result['lookups'];
+                $stats['tmdb_cache_hits'] += $result['cache_hits'];
+                if ($result['error']) {
+                    return PluginActionResult::failure('Could not safely persist SQLite programme cache enrichment.', $stats);
+                }
+                if ($result['cancelled']) {
+                    $this->saveTmdbCache($tmdbCache);
+                    $this->saveTmdbSeasonCache($tmdbSeasonCache);
+                    $this->saveTmdbImagesCache($imagesCache);
+                    $this->saveEpgEnrichmentState($stateKey, [
+                        'settings_hash' => $settingsHash,
+                        'channels_hash' => $channelsHash,
+                        'files' => array_merge($fileStates, $newFileStates),
+                    ]);
+                    $this->deleteEnrichmentCheckpoint($stateKey);
+
+                    return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
+                }
+                if (! $result['modified']) {
+                    $stats['days_unchanged']++;
+                }
+                $stats['days_processed']++;
+                $currentDate->addDay();
+
+                continue;
             }
 
             if (! Storage::disk('local')->exists($jsonlFile)) {
@@ -1158,6 +1227,233 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ->whereNotNull('epg_channel_id')
             ->whereHas('epgChannel', fn ($q) => $q->whereIn('epg_id', $epgIds))
             ->count();
+    }
+
+    /**
+     * Return the host-managed SQLite programme cache when it exists.
+     */
+    private function getProgrammeSqliteCachePath(string $cacheDir): ?string
+    {
+        $path = Storage::disk('local')->path($cacheDir.'/programmes.sqlite');
+
+        return is_file($path) ? $path : null;
+    }
+
+    /**
+     * Identify the host cache file so a cache replacement cannot be written through.
+     *
+     * @return array{device: int, inode: int}|null
+     */
+    private function sqliteFileIdentity(string $path): ?array
+    {
+        clearstatcache(true, $path);
+        $stat = @stat($path);
+        if ($stat === false || ! isset($stat['dev'], $stat['ino'])) {
+            return null;
+        }
+
+        return ['device' => $stat['dev'], 'inode' => $stat['ino']];
+    }
+
+    /**
+     * @param  array{device: int, inode: int}  $identity
+     */
+    private function sqliteFileMatchesIdentity(string $path, array $identity): bool
+    {
+        return $this->sqliteFileIdentity($path) === $identity;
+    }
+
+    /**
+     * Hydrate mapped host programme rows, enrich them outside a transaction, then
+     * conditionally dehydrate each changed row in place. The original data predicate
+     * prevents an EPG refresh from being overwritten after it was read.
+     *
+     * @param  array<string>  $targetChannelIds
+     * @return array{processed: int, updated: int, already_enriched: int, posters: int, categories: int, descriptions: int, lookups: int, cache_hits: int, modified: bool, cancelled: bool, error: bool}
+     */
+    private function processSqliteProgrammeDate(
+        string $sqlitePath,
+        string $date,
+        array $targetChannelIds,
+        TmdbService $tmdb,
+        array &$tmdbCache,
+        bool $overwrite,
+        bool $enrichCategories,
+        bool $enrichDescriptions,
+        bool $enrichPosters,
+        bool $enrichBackdrops,
+        bool $mapGenresToEpgCategories,
+        bool $mapGenresToKodiGuideGenres,
+        bool $keywordDetection,
+        bool $enrichEpisodeDetails,
+        array &$tmdbSeasonCache,
+        array &$imagesCache,
+        array $lookupContext,
+        PluginExecutionContext $context,
+    ): array {
+        $result = [
+            'processed' => 0,
+            'updated' => 0,
+            'already_enriched' => 0,
+            'posters' => 0,
+            'categories' => 0,
+            'descriptions' => 0,
+            'lookups' => 0,
+            'cache_hits' => 0,
+            'modified' => false,
+            'cancelled' => false,
+            'error' => false,
+        ];
+        $pendingUpdates = [];
+
+        try {
+            $fileIdentity = $this->sqliteFileIdentity($sqlitePath);
+            if ($fileIdentity === null) {
+                throw new \RuntimeException('SQLite programme cache file is not available.');
+            }
+            $database = new \PDO('sqlite:'.$sqlitePath, null, null, [
+                \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+                \PDO::ATTR_TIMEOUT => 1,
+            ]);
+            $columns = $database->query('PRAGMA table_info(programmes)')->fetchAll(\PDO::FETCH_ASSOC);
+            $columnNames = array_column($columns, 'name');
+            $requiredColumns = ['channel_id', 'date', 'start_ts', 'stop_ts', 'data'];
+            if (array_diff($requiredColumns, $columnNames) !== []) {
+                throw new \RuntimeException('SQLite programmes table does not match the host cache schema.');
+            }
+
+            foreach (array_chunk($targetChannelIds, self::SQLITE_CHANNELS_PER_QUERY) as $channelIds) {
+                $placeholders = implode(', ', array_fill(0, count($channelIds), '?'));
+                $offset = 0;
+                do {
+                    $statement = $database->prepare(
+                        "SELECT channel_id, date, start_ts, stop_ts, data FROM programmes "
+                        ."WHERE date = ? AND channel_id IN ({$placeholders}) "
+                        .'ORDER BY channel_id, start_ts, stop_ts LIMIT '.self::SQLITE_PROGRAMME_PAGE_SIZE.' OFFSET '.$offset
+                    );
+                    $statement->execute(array_merge([$date], $channelIds));
+                    $rows = $statement->fetchAll(\PDO::FETCH_ASSOC);
+                    $offset += count($rows);
+
+                    foreach ($rows as $row) {
+                        if ($context->cancellationRequested()) {
+                            $result['cancelled'] = true;
+
+                            return $result;
+                        }
+                        try {
+                            $programme = json_decode((string) $row['data'], true, 512, JSON_THROW_ON_ERROR);
+                        } catch (\JsonException) {
+                            $context->warning("Skipping invalid SQLite programme data for {$row['channel_id']} on {$date}.");
+
+                            continue;
+                        }
+                        if (! is_array($programme)) {
+                            $context->warning("Skipping non-object SQLite programme data for {$row['channel_id']} on {$date}.");
+
+                            continue;
+                        }
+
+                        // These fields are owned by the host's indexed columns, not data.
+                        $programme['channel'] = $row['channel_id'];
+                        $programme['start'] = (int) $row['start_ts'];
+                        $programme['stop'] = $row['stop_ts'] === null ? null : (int) $row['stop_ts'];
+                        $result['processed']++;
+                        $enrichResult = $this->enrichProgrammeFromTmdb(
+                            $programme,
+                            $tmdb,
+                            $tmdbCache,
+                            $overwrite,
+                            $enrichCategories,
+                            $enrichDescriptions,
+                            $enrichPosters,
+                            $enrichBackdrops,
+                            $mapGenresToEpgCategories,
+                            $mapGenresToKodiGuideGenres,
+                            $keywordDetection,
+                            $enrichEpisodeDetails,
+                            $tmdbSeasonCache,
+                            $imagesCache,
+                            $lookupContext,
+                        );
+                        $result['lookups'] += $enrichResult['lookup'] ? 1 : 0;
+                        $result['cache_hits'] += $enrichResult['cache_hit'] ? 1 : 0;
+                        if (! $enrichResult['changed']) {
+                            $result['already_enriched']++;
+
+                            continue;
+                        }
+
+                        $pendingUpdates[] = [
+                            'row' => $row,
+                            'data' => json_encode(
+                                array_diff_key($programme, array_flip(['channel', 'start', 'stop'])),
+                                JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
+                            ),
+                            'poster' => $enrichResult['poster'],
+                            'category' => $enrichResult['category'],
+                            'description' => $enrichResult['description'],
+                        ];
+                    }
+                } while (count($rows) === self::SQLITE_PROGRAMME_PAGE_SIZE);
+            }
+
+            if ($pendingUpdates === []) {
+                return $result;
+            }
+
+            // TMDB work above is deliberately complete before the transaction starts.
+            if (! $this->sqliteFileMatchesIdentity($sqlitePath, $fileIdentity)) {
+                throw new \RuntimeException('SQLite programme cache was replaced during enrichment.');
+            }
+            $database->beginTransaction();
+            $update = $database->prepare(
+                'UPDATE programmes SET data = ? '
+                .'WHERE channel_id = ? AND date = ? AND start_ts = ? AND stop_ts IS ? AND data = ?'
+            );
+            foreach ($pendingUpdates as $pending) {
+                if ($context->cancellationRequested()) {
+                    $database->rollBack();
+                    $result['cancelled'] = true;
+
+                    return $result;
+                }
+                $row = $pending['row'];
+                $update->execute([
+                    $pending['data'],
+                    $row['channel_id'],
+                    $row['date'],
+                    $row['start_ts'],
+                    $row['stop_ts'],
+                    $row['data'],
+                ]);
+                if ($update->rowCount() !== 1) {
+                    throw new \RuntimeException('SQLite programme cache changed during enrichment.');
+                }
+                $result['updated']++;
+                $result['posters'] += $pending['poster'] ? 1 : 0;
+                $result['categories'] += $pending['category'] ? 1 : 0;
+                $result['descriptions'] += $pending['description'] ? 1 : 0;
+            }
+            if (! $this->sqliteFileMatchesIdentity($sqlitePath, $fileIdentity)) {
+                throw new \RuntimeException('SQLite programme cache was replaced during enrichment.');
+            }
+            $database->commit();
+            $result['modified'] = $result['updated'] > 0;
+        } catch (\Throwable $exception) {
+            if (isset($database) && $database->inTransaction()) {
+                $database->rollBack();
+            }
+            $result['updated'] = 0;
+            $result['posters'] = 0;
+            $result['categories'] = 0;
+            $result['descriptions'] = 0;
+            $result['modified'] = false;
+            $result['error'] = true;
+            $context->warning('SQLite programme cache enrichment failed safely: '.$exception->getMessage());
+        }
+
+        return $result;
     }
 
     /**
