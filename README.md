@@ -48,17 +48,37 @@ Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because n
 3. Reads each day's cached programme JSONL files, but only processes targeted channels
 4. For each programme missing artwork/genres/descriptions:
    - Checks the local TMDB title cache
-   - If not cached, searches TMDB (movie first, then TV series)
+   - If not cached, searches bounded TV and movie candidate sets and ranks them together
    - Fetches full details (poster, backdrop, genres, overview)
    - Writes enriched data back to the JSONL cache
 5. Programmes that already have metadata (e.g. from Schedules Direct / Gracenote) are skipped unless "Overwrite existing" is enabled
 6. The enriched data is used the next time EPG output is generated
 
-## Artwork Ordering and Emby
+## Artwork Ordering
 
-When a validated TMDB landscape backdrop is added, it is written as the programme icon and both the first and final `images` entries. This is standards-compatible with XMLTV consumers that use either the first or final icon. Useful source portraits remain between those primary boundaries for clients that support multiple artwork variants, and an existing verified source landscape is preserved unless overwrite is enabled.
+When a validated TMDB landscape backdrop is available, it is written as the programme icon and both the first and final `images` entries. Exact episode stills remain typed secondary artwork. If no usable backdrop or fanart exists, an exact episode still is the landscape fallback, followed by a validated poster. Logos are never placed at the primary boundaries. This is compatible with XMLTV consumers that use either the first or final icon. With overwrite disabled, an existing verified provider landscape remains primary and TMDB artwork is retained only as typed alternatives.
 
-The enriched JSONL cache and generated XMLTV can be correct while Emby still displays older guide artwork. Emby imports and persists programme images separately and may continue serving its stored image after the XMLTV source changes. Refreshing or clearing stale guide data in Emby is a downstream maintenance action; this plugin does not use Emby-specific overwrites or change programme identities to force an artwork refresh.
+The enriched JSONL cache and generated XMLTV can be correct while Emby still displays older guide artwork. Attribute-aware consumers can use the typed poster, backdrop, screenshot, and logo alternatives, while first-only or last-wins consumers receive the same selected primary at both boundaries. Emby also persists imported programme images separately and may continue serving an older image after the XMLTV source changes. Refreshing or clearing stale guide data in Emby is a downstream maintenance action; this plugin does not use Emby-specific overwrites or change programme identities to force an artwork refresh.
+
+## Matching Diagnostics
+
+Before TMDB lookup, each programme receives a bounded applicability decision based only on validated structured evidence such as an exact programme year, an exact episode-number structure, an explicitly trusted provider media type, or a canonical type-bound identifier. Free-form titles, categories, language-specific words, and provider brands do not classify content or force a media type. Title-only and otherwise unknown rows keep provider artwork and do not trigger guessed TMDB mutations. Sports documentaries remain eligible when they carry the same independent catalogue evidence. Candidate decisions and missed-identity aggregates contain only fingerprints, score/margin, typed episode evidence, selected title-channel provenance, and safe reason codes. Raw titles, descriptions, provider URLs, hosts, and credentials are not stored in production diagnostics; legacy raw missed-title rows are scrubbed on the next miss or health-check read.
+
+## Multilingual Identity Matching
+
+Programme titles remain raw UTF-8 for display and output. Identity comparison uses canonical Unicode normalization and full Unicode case folding when PHP `intl`/`Normalizer` and multibyte case conversion are available; otherwise that comparison fails closed. A compatibility-normalized key can corroborate punctuation or width variants only with independent type, year/date, episode, or compatible-language evidence. The matcher does not transliterate scripts for acceptance and treats mixed-script/confusable similarity as a rejection unless an explicitly tagged TMDB translation or regional alternative title supplies the title plus independent evidence. See [Unicode normalization UAX #15](https://www.unicode.org/reports/tr15/), [Unicode security UTS #39](https://www.unicode.org/reports/tr39/), [PHP Normalizer](https://www.php.net/manual/en/normalizer.normalize.php), and [PHP Unicode case conversion](https://www.php.net/manual/en/function.mb-convert-case.php).
+
+The locale chain parses and preserves valid BCP-47 source language, script, and region subtags separately. TMDB queries use only a representable ISO-639-1 language with an optional ISO-3166-1 region, so a script is never reinterpreted as a country. A valid source tag without a representable TMDB query locale is a neutral fail-closed condition rather than malformed source data. Matching evaluates separate channels: localized search title in the requested locale, original title with `original_language`, language/country-tagged translation, and region/type-tagged alternative title. The selected decision records only privacy-safe provenance as `localized`, `original`, `alternative(region,type)`, or `translation(language,region)`. Missing translations and unknown or incompatible description languages are neutral. Alternative-title/translation expansion is cached and limited to one independently plausible candidate across full/base retries. TMDB distinguishes localized title, original title/language, media type, and release/air date, and coverage remains incomplete. See [BCP 47](https://www.rfc-editor.org/rfc/rfc5646), [TMDB languages](https://developer.themoviedb.org/docs/languages), [TV search](https://developer.themoviedb.org/reference/search-tv), [multi search](https://developer.themoviedb.org/reference/search-multi), [TV alternative titles](https://developer.themoviedb.org/reference/tv-series-alternative-titles), and [TV translations](https://developer.themoviedb.org/reference/tv-series-translations).
+
+External identifiers are untrusted input. Only canonical allowlisted TMDB, IMDb, and TVDB syntax with an explicit media type is parsed; numeric identifiers must be positive bounded integers and IMDb identifiers must use canonical `tt` syntax. A type-bound TMDB identifier is resolved through the expected TMDB details endpoint before it can select a programme. Invalid, untyped, conflicting, unavailable, or unbound identifiers are neutral, never authorize a feed URL request, and never create a durable negative identity cache entry. Search-only winners require a measurable runner-up margin even when the provider returns only one result.
+
+This safely supports multilingual Unicode inputs but cannot guarantee TMDB catalogue, image, localized-title, alternative-title, or translation coverage for every language. A safe rejection/provider fallback is intentional when evidence is absent or ambiguous.
+
+Run the deterministic offline replay gate with `php tests/issue55_offline_replay_test.php`. It uses mock candidate sets only, returns nonzero on a golden mismatch, and does not validate Emby integration.
+
+Run `php tests/CrossClientArtworkContractTest.php` for the producer-side client-neutral ordering contract. It serializes the plugin programme structure once and checks first-only, last-wins, and role-aware interpretations, but it does not prove the separate m3u-editor repository's XMLTV serializer.
+
+Generate the deterministic, self-contained pre-Canary review preview with `php tests/issue55_offline_replay_test.php --preview-dir=/tmp/issue55-preview`. The output directory contains a privacy-safe `manifest.json` and escaped static `gallery.html`; it uses fixture-controlled data only and performs no network, database, cache, or production writes.
 
 ## Version History
 

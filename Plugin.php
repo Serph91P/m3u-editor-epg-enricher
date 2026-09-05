@@ -13,6 +13,7 @@ use App\Plugins\Support\PluginActionResult;
 use App\Plugins\Support\PluginExecutionContext;
 use App\Plugins\Support\PluginSelectOptionsContext;
 use App\Services\EpgCacheService;
+use App\Services\EpgProgrammeStore;
 use App\Services\TmdbService;
 use App\Settings\GeneralSettings;
 use Carbon\Carbon;
@@ -24,6 +25,8 @@ use ReflectionProperty;
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, PluginSelectOptionsProviderInterface
 {
     private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 60;
+    private const SQLITE_PROGRAMME_PAGE_SIZE = 250;
+    private const SQLITE_CHANNELS_PER_QUERY = 250;
 
     /**
      * Bumped whenever the enrichment output for the SAME inputs changes.
@@ -43,7 +46,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.02-series-movie-primary';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.04-structured-bound-identity';
+
+    private const TMDB_IDENTITY_DETAIL_CANDIDATE_LIMIT = 1;
+    private const TMDB_IDENTITY_TITLE_RECORD_LIMIT_PER_CHANNEL = 50;
+
+    /** @var array<string, array<int, array{title: string, source: string, language: string|null, region: string|null}>> */
+    private array $tmdbIdentityTitleEvidenceCache = [];
+    private bool $missedTitleLogPrivacyChecked = false;
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -466,28 +476,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     ];
 
     /**
-     * Additional title keywords that strongly indicate episodic TV content.
-     *
-     * These are used as a tiebreaker to force TV-only TMDB lookup for
-     * commonly misclassified programme titles.
-     *
-     * @var list<string>
-     */
-    private const array EPISODIC_TITLE_KEYWORDS = [
-        'soko ',
-        'tatort',
-        'polizeiruf',
-        'watzmann ermittelt',
-        'in aller freundschaft',
-        'sturm der liebe',
-        'großstadtrevier',
-        'grossstadtrevier',
-        'rote rosen',
-        'gute zeiten schlechte zeiten',
-        'gzsz',
-    ];
-
-    /**
      * Provide owned playlists that contain channels eligible for enrichment.
      *
      * @return array<string, string>
@@ -840,9 +828,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Override TMDB search language if configured in plugin settings
         $tmdbLanguage = trim($settings['tmdb_language'] ?? '');
+        $tmdbLanguageReason = null;
         if ($tmdb && $tmdbLanguage !== '') {
-            $this->setTmdbLanguage($tmdb, $tmdbLanguage);
-            $context->heartbeat("Using TMDB search language: {$tmdbLanguage}");
+            $configuredLocale = $this->parseTmdbLocale($tmdbLanguage);
+            if ($configuredLocale['valid'] && $configuredLocale['tmdb_locale'] !== null) {
+                $tmdbLanguage = $configuredLocale['tmdb_locale'];
+                $context->heartbeat("Using validated TMDB search language: {$tmdbLanguage}");
+            } else {
+                $tmdbLanguageReason = $configuredLocale['valid']
+                    ? 'tmdb_locale_unrepresentable'
+                    : $configuredLocale['reason'];
+                $tmdbLanguage = '__invalid';
+                $context->heartbeat('Configured TMDB language is invalid; catalogue matching will fail closed.');
+            }
         }
 
         if (! $enrichTmdb) {
@@ -852,6 +850,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $effectiveTmdbLanguage = $tmdbLanguage !== ''
             ? $tmdbLanguage
             : trim((string) (app(GeneralSettings::class)->tmdb_language ?? ''));
+        $effectiveLocale = $this->parseTmdbLocale($effectiveTmdbLanguage);
+        if (! $effectiveLocale['valid'] || $effectiveLocale['tmdb_locale'] === null) {
+            $tmdbLanguageReason ??= $effectiveLocale['valid']
+                ? 'tmdb_locale_unrepresentable'
+                : $effectiveLocale['reason'];
+            $effectiveTmdbLanguage = '__invalid';
+        } else {
+            $effectiveTmdbLanguage = $effectiveLocale['tmdb_locale'];
+            $this->setTmdbLanguage($tmdb, $effectiveTmdbLanguage);
+        }
 
         // Load TMDB lookup cache from disk
         $tmdbCache = $this->loadTmdbCache();
@@ -914,6 +922,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($cacheDir === null) {
             return PluginActionResult::failure('Could not resolve EPG cache directory.');
         }
+        $sqliteProgrammeCache = $this->getProgrammeSqliteCachePath($cacheDir);
         $currentDate = Carbon::parse($minDate);
         $endDate = Carbon::parse($maxDate);
         $totalDays = $currentDate->diffInDays($endDate) + 1;
@@ -955,6 +964,72 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $this->deleteEnrichmentCheckpoint($stateKey);
 
                 return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
+            }
+
+            // Current host caches use SQLite. Prefer it whenever present so a stale
+            // legacy JSONL sibling can never replace newer programme data.
+            if ($sqliteProgrammeCache !== null) {
+                $context->info("Processing {$dateStr} ({$dayIndex}/{$totalDays}) from SQLite...");
+                $context->heartbeat(
+                    "Processing {$dateStr} ({$dayIndex}/{$totalDays}) from SQLite...",
+                    progress: (int) ((($dayIndex - 1) / $totalDays) * 100)
+                );
+                $result = $this->processSqliteProgrammeDate(
+                    $sqliteProgrammeCache,
+                    $dateStr,
+                    $targetChannelIds,
+                    $tmdb,
+                    $tmdbCache,
+                    $overwrite,
+                    $enrichCategories,
+                    $enrichDescriptions,
+                    $enrichPosters,
+                    $enrichBackdrops,
+                    $mapGenresToEpgCategories,
+                    $mapGenresToKodiGuideGenres,
+                    $keywordDetection,
+                    $enrichEpisodeDetails,
+                    $tmdbSeasonCache,
+                    $imagesCache,
+                    [
+                        'epg_source_id' => (string) $epgId,
+                        'tmdb_language' => $currentLanguage,
+                        'tmdb_language_reason' => $tmdbLanguageReason,
+                    ],
+                    $context,
+                );
+
+                $stats['programmes_processed'] += $result['processed'];
+                $stats['programmes_updated'] += $result['updated'];
+                $stats['programmes_already_enriched'] += $result['already_enriched'];
+                $stats['posters_added'] += $result['posters'];
+                $stats['categories_added'] += $result['categories'];
+                $stats['descriptions_added'] += $result['descriptions'];
+                $stats['tmdb_lookups'] += $result['lookups'];
+                $stats['tmdb_cache_hits'] += $result['cache_hits'];
+                if ($result['error']) {
+                    return PluginActionResult::failure('Could not safely persist SQLite programme cache enrichment.', $stats);
+                }
+                if ($result['cancelled']) {
+                    $this->saveTmdbCache($tmdbCache);
+                    $this->saveTmdbSeasonCache($tmdbSeasonCache);
+                    $this->saveTmdbImagesCache($imagesCache);
+                    $this->saveEpgEnrichmentState($stateKey, [
+                        'settings_hash' => $settingsHash,
+                        'channels_hash' => $channelsHash,
+                        'files' => array_merge($fileStates, $newFileStates),
+                    ]);
+                    $this->deleteEnrichmentCheckpoint($stateKey);
+
+                    return PluginActionResult::cancelled('Enrichment cancelled.', $stats);
+                }
+                if (! $result['modified']) {
+                    $stats['days_unchanged']++;
+                }
+                $stats['days_processed']++;
+                $currentDate->addDay();
+
+                continue;
             }
 
             if (! Storage::disk('local')->exists($jsonlFile)) {
@@ -1016,6 +1091,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 [
                     'epg_source_id' => (string) $epgId,
                     'tmdb_language' => $currentLanguage,
+                    'tmdb_language_reason' => $tmdbLanguageReason,
                 ],
                 $context,
                 $dayIndex,
@@ -1152,6 +1228,232 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ->whereNotNull('epg_channel_id')
             ->whereHas('epgChannel', fn ($q) => $q->whereIn('epg_id', $epgIds))
             ->count();
+    }
+
+    /**
+     * Return the host-managed SQLite programme cache when it exists.
+     */
+    private function getProgrammeSqliteCachePath(string $cacheDir): ?string
+    {
+        $path = Storage::disk('local')->path($cacheDir.'/programmes.sqlite');
+
+        return is_file($path) ? $path : null;
+    }
+
+    /**
+     * Identify the host cache file so a cache replacement cannot be written through.
+     *
+     * @return array{device: int, inode: int}|null
+     */
+    private function sqliteFileIdentity(string $path): ?array
+    {
+        clearstatcache(true, $path);
+        $stat = @stat($path);
+        if ($stat === false || ! isset($stat['dev'], $stat['ino'])) {
+            return null;
+        }
+
+        return ['device' => $stat['dev'], 'inode' => $stat['ino']];
+    }
+
+    /**
+     * @param  array{device: int, inode: int}  $identity
+     */
+    private function sqliteFileMatchesIdentity(string $path, array $identity): bool
+    {
+        return $this->sqliteFileIdentity($path) === $identity;
+    }
+
+    /**
+     * Hydrate mapped host programme rows, enrich them outside a transaction, then
+     * conditionally dehydrate each changed row in place. The original data predicate
+     * prevents an EPG refresh from being overwritten after it was read.
+     *
+     * @param  array<string>  $targetChannelIds
+     * @return array{processed: int, updated: int, already_enriched: int, posters: int, categories: int, descriptions: int, lookups: int, cache_hits: int, modified: bool, cancelled: bool, error: bool}
+     */
+    private function processSqliteProgrammeDate(
+        string $sqlitePath,
+        string $date,
+        array $targetChannelIds,
+        TmdbService $tmdb,
+        array &$tmdbCache,
+        bool $overwrite,
+        bool $enrichCategories,
+        bool $enrichDescriptions,
+        bool $enrichPosters,
+        bool $enrichBackdrops,
+        bool $mapGenresToEpgCategories,
+        bool $mapGenresToKodiGuideGenres,
+        bool $keywordDetection,
+        bool $enrichEpisodeDetails,
+        array &$tmdbSeasonCache,
+        array &$imagesCache,
+        array $lookupContext,
+        PluginExecutionContext $context,
+    ): array {
+        $result = [
+            'processed' => 0,
+            'updated' => 0,
+            'already_enriched' => 0,
+            'posters' => 0,
+            'categories' => 0,
+            'descriptions' => 0,
+            'lookups' => 0,
+            'cache_hits' => 0,
+            'modified' => false,
+            'cancelled' => false,
+            'error' => false,
+        ];
+        $pendingUpdates = [];
+
+        try {
+            $fileIdentity = $this->sqliteFileIdentity($sqlitePath);
+            if ($fileIdentity === null) {
+                throw new \RuntimeException('SQLite programme cache file is not available.');
+            }
+            $database = new \PDO('sqlite:'.$sqlitePath, null, null, [
+                \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+                \PDO::ATTR_TIMEOUT => 1,
+            ]);
+            $columns = $database->query('PRAGMA table_info(programmes)')->fetchAll(\PDO::FETCH_ASSOC);
+            $columnNames = array_column($columns, 'name');
+            $requiredColumns = ['channel_id', 'date', 'start_ts', 'stop_ts', 'data'];
+            if (array_diff($requiredColumns, $columnNames) !== []) {
+                throw new \RuntimeException('SQLite programmes table does not match the host cache schema.');
+            }
+
+            foreach (array_chunk($targetChannelIds, self::SQLITE_CHANNELS_PER_QUERY) as $channelIds) {
+                $placeholders = implode(', ', array_fill(0, count($channelIds), '?'));
+                $offset = 0;
+                do {
+                    $statement = $database->prepare(
+                        "SELECT channel_id, date, start_ts, stop_ts, data FROM programmes "
+                        ."WHERE date = ? AND channel_id IN ({$placeholders}) "
+                        .'ORDER BY channel_id, start_ts, stop_ts LIMIT '.self::SQLITE_PROGRAMME_PAGE_SIZE.' OFFSET '.$offset
+                    );
+                    $statement->execute(array_merge([$date], $channelIds));
+                    $rows = $statement->fetchAll(\PDO::FETCH_ASSOC);
+                    $offset += count($rows);
+
+                    foreach ($rows as $row) {
+                        if ($context->cancellationRequested()) {
+                            $result['cancelled'] = true;
+
+                            return $result;
+                        }
+                        $data = (string) $row['data'];
+                        try {
+                            if (! is_object(json_decode($data, false, 512, JSON_THROW_ON_ERROR))) {
+                                throw new \RuntimeException("SQLite programme data for {$row['channel_id']} on {$date} is not an object.");
+                            }
+                            $programme = json_decode($data, true, 512, JSON_THROW_ON_ERROR);
+                        } catch (\JsonException) {
+                            throw new \RuntimeException("SQLite programme data for {$row['channel_id']} on {$date} is invalid JSON.");
+                        }
+
+                        $programme = EpgProgrammeStore::hydrate(
+                            $programme,
+                            $row['channel_id'],
+                            $row['start_ts'] === null ? null : (int) $row['start_ts'],
+                            $row['stop_ts'] === null ? null : (int) $row['stop_ts'],
+                        );
+                        $result['processed']++;
+                        $enrichResult = $this->enrichProgrammeFromTmdb(
+                            $programme,
+                            $tmdb,
+                            $tmdbCache,
+                            $overwrite,
+                            $enrichCategories,
+                            $enrichDescriptions,
+                            $enrichPosters,
+                            $enrichBackdrops,
+                            $mapGenresToEpgCategories,
+                            $mapGenresToKodiGuideGenres,
+                            $keywordDetection,
+                            $enrichEpisodeDetails,
+                            $tmdbSeasonCache,
+                            $imagesCache,
+                            $lookupContext,
+                        );
+                        $result['lookups'] += $enrichResult['lookup'] ? 1 : 0;
+                        $result['cache_hits'] += $enrichResult['cache_hit'] ? 1 : 0;
+                        if (! $enrichResult['changed']) {
+                            $result['already_enriched']++;
+
+                            continue;
+                        }
+
+                        $pendingUpdates[] = [
+                            'row' => $row,
+                            'data' => json_encode(
+                                EpgProgrammeStore::dehydrate($programme),
+                                JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
+                            ),
+                            'poster' => $enrichResult['poster'],
+                            'category' => $enrichResult['category'],
+                            'description' => $enrichResult['description'],
+                        ];
+                    }
+                } while (count($rows) === self::SQLITE_PROGRAMME_PAGE_SIZE);
+            }
+
+            if ($pendingUpdates === []) {
+                return $result;
+            }
+
+            // TMDB work above is deliberately complete before the transaction starts.
+            if (! $this->sqliteFileMatchesIdentity($sqlitePath, $fileIdentity)) {
+                throw new \RuntimeException('SQLite programme cache was replaced during enrichment.');
+            }
+            $database->beginTransaction();
+            $update = $database->prepare(
+                'UPDATE programmes SET data = ? '
+                .'WHERE channel_id = ? AND date = ? AND start_ts = ? AND stop_ts IS ? AND data = ?'
+            );
+            foreach ($pendingUpdates as $pending) {
+                if ($context->cancellationRequested()) {
+                    $database->rollBack();
+                    $result['cancelled'] = true;
+
+                    return $result;
+                }
+                $row = $pending['row'];
+                $update->execute([
+                    $pending['data'],
+                    $row['channel_id'],
+                    $row['date'],
+                    $row['start_ts'],
+                    $row['stop_ts'],
+                    $row['data'],
+                ]);
+                if ($update->rowCount() !== 1) {
+                    throw new \RuntimeException('SQLite programme cache changed during enrichment.');
+                }
+                $result['updated']++;
+                $result['posters'] += $pending['poster'] ? 1 : 0;
+                $result['categories'] += $pending['category'] ? 1 : 0;
+                $result['descriptions'] += $pending['description'] ? 1 : 0;
+            }
+            if (! $this->sqliteFileMatchesIdentity($sqlitePath, $fileIdentity)) {
+                throw new \RuntimeException('SQLite programme cache was replaced during enrichment.');
+            }
+            $database->commit();
+            $result['modified'] = $result['updated'] > 0;
+        } catch (\Throwable $exception) {
+            if (isset($database) && $database->inTransaction()) {
+                $database->rollBack();
+            }
+            $result['updated'] = 0;
+            $result['posters'] = 0;
+            $result['categories'] = 0;
+            $result['descriptions'] = 0;
+            $result['modified'] = false;
+            $result['error'] = true;
+            $context->warning('SQLite programme cache enrichment failed safely: '.$exception->getMessage());
+        }
+
+        return $result;
     }
 
     /**
@@ -1353,8 +1655,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'cache_hit' => false,
         ];
 
-        $title = $programme['title'] ?? '';
-        if ($title === '') {
+        $title = is_scalar($programme['title'] ?? null) ? (string) $programme['title'] : '';
+        if (trim($title) === '') {
             return $result;
         }
 
@@ -1377,12 +1679,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $wantsArtwork = $enrichPosters || $enrichBackdrops;
 
         $seriesSignals = $this->detectSeriesSignals($programme);
-        $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
-        $isSeriesEpisode = $seriesSignals['is_series_episode'] || $hasEpisodicTitleKeyword;
-        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH)\d+/i', trim((string) ($programme['episode_num'] ?? '')));
-        $hasStrongSeriesSignals = $hasEpisodicTitleKeyword
-            || $hasEpisodicProviderId
-            || $seriesSignals['season'] !== null
+        $isSeriesEpisode = $seriesSignals['is_series_episode'];
+        $hasStrongSeriesSignals = $seriesSignals['season'] !== null
             || $seriesSignals['episode'] !== null
             || $seriesSignals['confidence'] === 'high';
         $isSeriesLikeCategory = in_array(mb_strtolower($existingCategory), ['series', 'kids'], true);
@@ -1393,6 +1691,85 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && $hasCategory
             && $isSeriesEpisode
             && ! $isSeriesLikeCategory;
+
+        // Applicability is independent of free-form title/category text and writing toggles.
+        $baseExtracted = $this->extractBaseTitle($title);
+        $baseTitle = $baseExtracted['title'];
+        $structuredYear = $this->structuredProgrammeYear($programme);
+        $year = $structuredYear ?? $baseExtracted['year'];
+        $description = trim((string) ($programme['desc'] ?? ''));
+        $externalIdentity = $this->validatedTypeBoundExternalIdentity($programme);
+        $trustedMediaType = $this->trustedProgrammeMediaType($programme);
+        $forcedMediaType = $externalIdentity['media_type'] ?? ($hasStrongSeriesSignals ? 'tv' : $trustedMediaType);
+        $localeContext = $this->buildTmdbLocaleContext($programme, $lookupContext);
+        if (! $localeContext['valid']
+            && ($localeContext['reason'] ?? null) === 'malformed_language_tag'
+            && in_array(trim((string) ($lookupContext['tmdb_language'] ?? '')), ['', '__global'], true)
+            && $this->firstScalarLocaleField($programme, ['title_language', 'title_lang']) === null
+            && ! method_exists($tmdb, 'searchTvSeriesCandidates')) {
+            $localeContext = [
+                'valid' => true,
+                'reason' => 'legacy_default_locale',
+                'requested_locale' => 'en-US',
+                'title_locale' => 'en-US',
+                'description_locale' => null,
+            ];
+        }
+        $safeLookupContext = $lookupContext;
+        $safeLookupContext['tmdb_language'] = $localeContext['valid']
+            ? $localeContext['requested_locale']
+            : '__invalid';
+        $safeLookupContext['title_language'] = $localeContext['valid'] ? $localeContext['title_locale'] : null;
+        $safeLookupContext['description_language'] = $localeContext['valid'] ? $localeContext['description_locale'] : null;
+        $applicability = $this->decideTmdbApplicability(
+            $title,
+            $hasStrongSeriesSignals,
+            $trustedNonTmdbLandscapeIcon,
+            $structuredYear !== null,
+            $externalIdentity,
+            $trustedMediaType,
+        );
+        if ($applicability['class'] === 'catalogue_candidate' && ! $localeContext['valid']) {
+            $applicability = [
+                'class' => 'ambiguous_identity',
+                'reason' => $localeContext['reason'],
+                'result' => 'unmatched',
+            ];
+        }
+
+        if ($this->recordTmdbDecision(
+            $programme,
+            $applicability,
+            $title,
+            $baseTitle,
+            $year,
+            $forcedMediaType,
+            $seriesSignals,
+            $safeLookupContext,
+        )) {
+            $result['changed'] = true;
+        }
+
+        // Keep category mapping behavior separate from matching applicability.
+        $keywordCategory = null;
+        if ($keywordDetection && $categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
+            $keywordCategory = $this->detectCategoryFromTitle($title);
+            if ($keywordCategory !== null) {
+                $programme['category'] = $mapGenresToKodiGuideGenres
+                    ? $this->mapToKodiGuideGenre($keywordCategory, null)
+                    : $keywordCategory;
+                $result['category'] = true;
+                $result['changed'] = true;
+            }
+        }
+
+        if ($applicability['class'] !== 'catalogue_candidate') {
+            if ($trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwrite)) {
+                $result['changed'] = true;
+            }
+
+            return $result;
+        }
 
         if (! $overwrite
             && (! $wantsArtwork || ($trustedLandscapeIcon && ! $trustedEpisodeStillIcon))
@@ -1408,59 +1785,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return $result;
         }
 
-        // ── Keyword detection BEFORE TMDB ──────────────────────────────
-        // Detect category from title keywords first (Sports, News, Kids, Documentary).
-        // This prevents unnecessary TMDB lookups for live sports, news, etc. and avoids
-        // wrong matches like "ALL IN - Die Bundesliga Highlight Show" → film "All In".
-        $keywordCategory = null;
-        if ($keywordDetection && $categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
-            $keywordCategory = $this->detectCategoryFromTitle($title);
-            if ($keywordCategory !== null) {
-                $programme['category'] = $mapGenresToKodiGuideGenres
-                    ? $this->mapToKodiGuideGenre($keywordCategory, null)
-                    : $keywordCategory;
-                $result['category'] = true;
-                $result['changed'] = true;
-            }
-        }
-
-        // If keyword detection identified a non-media category (Sports, News),
-        // skip TMDB lookup entirely; these are live broadcasts, not TMDB content.
-        if ($keywordCategory !== null && in_array($keywordCategory, ['Sports', 'News'], true)) {
-            return $result;
-        }
-
-        // ── Extract base title ─────────────────────────────────────────
-        // EPG titles are often "Series Name - Episode Title" or "Show: Subtitle".
-        // Extract the base show name for fallback TMDB search.
-        $baseExtracted = $this->extractBaseTitle($title);
-        $baseTitle = $baseExtracted['title'];
-        $year = $baseExtracted['year'];
-        if ($year === null) {
-            $desc = trim((string) ($programme['desc'] ?? ''));
-            if ($desc !== '') {
-                // Look for a 4-digit year token anywhere in desc.
-                // Use the FIRST occurrence (production year typically appears early
-                // in EPG descriptions: "USA 2010, Action mit ..." / "Spielfilm, 2010").
-                if (preg_match('/\b(19\d{2}|20\d{2})\b/', $desc, $ym)) {
-                    $candidate = (int) $ym[1];
-                    $currentYear = (int) date('Y');
-                    // Sanity bound: do not accept future years beyond current+2.
-                    if ($candidate >= 1900 && $candidate <= $currentYear + 2) {
-                        $year = $candidate;
-                    }
-                }
-            }
-        }
-        $forcedMediaType = $hasStrongSeriesSignals ? 'tv' : null;
-        $description = trim((string) ($programme['desc'] ?? ''));
         $existingTmdbId = $programme['tmdb_id'] ?? null;
         $existingTmdbId = is_scalar($existingTmdbId) ? trim((string) $existingTmdbId) : null;
         $cacheScope = [
             'epg_source_id' => trim((string) ($lookupContext['epg_source_id'] ?? '')),
-            'tmdb_language' => mb_strtolower(trim((string) ($lookupContext['tmdb_language'] ?? ''))),
+            'tmdb_language' => $localeContext['requested_locale'] ?? '',
+            'title_language' => $localeContext['title_locale'] ?? null,
+            'description_language' => $localeContext['description_locale'] ?? null,
             'media_type' => $forcedMediaType,
             'tmdb_id' => $existingTmdbId !== '' ? $existingTmdbId : null,
+            'external_identity' => $externalIdentity === null
+                ? null
+                : hash('sha256', json_encode($externalIdentity, JSON_UNESCAPED_SLASHES)),
         ];
         $lookupEvidence = [
             'logic' => self::ENRICHMENT_LOGIC_VERSION,
@@ -1472,7 +1808,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'description' => $this->normalizeIdentityText($description),
             'episodic' => $isSeriesEpisode,
             'strong_series_signals' => $hasStrongSeriesSignals,
-            'episodic_keyword' => $hasEpisodicTitleKeyword,
             'series_confidence' => $seriesSignals['confidence'],
             'season' => $seriesSignals['season'],
             'episode' => $seriesSignals['episode'],
@@ -1496,6 +1831,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $baseCacheKey,
             $seriesBaseCacheKey,
         ]);
+        $matchEvidence = [];
         if (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
@@ -1511,6 +1847,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $cache[$fullCacheKey] = $tmdbData;
         } else {
             $result['lookup'] = true;
+            $identityDetailLookupBudget = ['remaining' => self::TMDB_IDENTITY_DETAIL_CANDIDATE_LIMIT];
 
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
@@ -1522,6 +1859,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $year,
                 $description,
                 $compoundIdentity,
+                null,
+                $matchEvidence,
+                $localeContext,
+                $identityDetailLookupBudget,
+                $externalIdentity,
             );
             $matchedViaBase = false;
 
@@ -1535,11 +1877,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $description,
                     $unusedCompoundIdentity,
                     $compoundIdentity,
+                    $matchEvidence,
+                    $localeContext,
+                    $identityDetailLookupBudget,
+                    $externalIdentity,
                 );
                 $matchedViaBase = $tmdbData !== null;
             }
 
             if ($tmdbData !== null) {
+                $tmdbData['_match_evidence'] = $matchEvidence;
                 // Preserve successful evidence-specific identities. Abstentions are retried
                 // because a transient candidate error must not become a durable cache miss.
                 $cache[$fullCacheKey] = $tmdbData;
@@ -1554,7 +1901,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
+        if ($result['cache_hit']) {
+            $matchEvidence = is_array($tmdbData['_match_evidence'] ?? null)
+                ? $tmdbData['_match_evidence']
+                : ['reason' => 'selected_cached_identity'];
+        }
+
         if (! $tmdbData) {
+            $unmatchedApplicability = $applicability;
+            if (($matchEvidence['reason'] ?? null) === 'ambiguous_identity') {
+                $unmatchedApplicability['class'] = 'ambiguous_identity';
+            }
+            $unmatchedApplicability['result'] = 'unmatched';
+            $unmatchedApplicability['reason'] = $matchEvidence['reason'] ?? 'no_valid_candidate';
+            if ($this->recordTmdbDecision($programme, $unmatchedApplicability, $title, $baseTitle, $year, $forcedMediaType, $seriesSignals, $safeLookupContext, $matchEvidence)) {
+                $result['changed'] = true;
+            }
             if (! $result['cache_hit']) {
                 $this->logMissedTitle($title, $baseTitle, $year, $forcedMediaType);
             }
@@ -1572,6 +1934,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             return $result;
+        }
+
+        $selectedApplicability = $applicability;
+        $selectedApplicability['result'] = 'selected';
+        $selectedApplicability['reason'] = $matchEvidence['reason'] ?? 'selected';
+        if ($this->recordTmdbDecision($programme, $selectedApplicability, $title, $baseTitle, $year, $forcedMediaType, $seriesSignals, $safeLookupContext, $matchEvidence)) {
+            $result['changed'] = true;
         }
 
         // Enrich poster/icon
@@ -1716,10 +2085,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $backdropUrl = $tmdbData['backdrop_url'] ?? null;
         }
 
-        // Primary <icon> in XMLTV: prefer the correctly matched series or movie backdrop.
-        // Exact episode stills remain typed secondary artwork for capable clients.
+        // The correctly matched series or movie backdrop remains the XMLTV primary.
+        // Exact episode stills are retained as typed secondary artwork.
         if ($enrichBackdrops && $backdropUrl
-            && ($overwrite || ! $trustedLandscapeIcon || $trustedEpisodeStillIcon)
+            && ($overwrite || ! $trustedNonTmdbLandscapeIcon)
             && ($programme['icon'] ?? null) !== $backdropUrl) {
             $programme['icon'] = $backdropUrl;
             $result['poster'] = true;
@@ -1729,11 +2098,21 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Add a details fallback backdrop only when no images metadata was available.
         if ($enrichBackdrops && $backdropUrl) {
             $hasTmdbBackdrop = false;
-            foreach (($programme['images'] ?? []) as $image) {
+            foreach (($programme['images'] ?? []) as $index => $image) {
                 if (($image['url'] ?? null) === $backdropUrl
                     && ($image['type'] ?? null) === 'backdrop'
                     && ($image['source'] ?? null) === 'tmdb') {
                     $hasTmdbBackdrop = true;
+                    if (! $this->isTrustedLandscapeImage($image)) {
+                        $image['orient'] = 'L';
+                        $image['width'] = 1920;
+                        $image['height'] = 1080;
+                        $image['size'] = 1;
+                        $image['scope'] = 'programme';
+                        $image['artwork_quality'] = 'details_fallback';
+                        $programme['images'][$index] = $image;
+                        $result['changed'] = true;
+                    }
                     break;
                 }
             }
@@ -1806,14 +2185,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     } else {
                         Log::info('[EpgEnricher] Rejected TMDB episode overview: language mismatch', [
                             'expected' => $userIso,
-                            'sample' => mb_substr($episodeOverview, 0, 80),
                         ]);
                     }
                 }
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
-                    // Exact episode art outranks series-level art for programme clients.
+                    // Keep exact episode art available without replacing the trusted
+                    // series or movie backdrop at the XMLTV primary boundaries.
                     $hasTmdbEpisodeStill = false;
                     foreach (($programme['images'] ?? []) as $image) {
                         if (($image['url'] ?? null) === $stillUrl
@@ -1838,6 +2217,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                             'source' => 'tmdb',
                             'scope' => 'episode',
                         ];
+                        $result['changed'] = true;
+                    }
+                    if ($backdropUrl
+                        && ($overwrite || ! $trustedNonTmdbLandscapeIcon)
+                        && ($programme['icon'] ?? null) !== $backdropUrl) {
+                        $programme['icon'] = $backdropUrl;
+                        $result['poster'] = true;
                         $result['changed'] = true;
                     }
                 }
@@ -2036,7 +2422,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Append a missed (no-TMDB-match) title to the JSONL log for later tuning.
+     * Append a privacy-safe missed-identity fingerprint for later aggregate tuning.
      */
     private function logMissedTitle(string $title, string $baseTitle, ?int $year, ?string $forcedMediaType): void
     {
@@ -2044,20 +2430,65 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (! is_dir($dir)) {
             @mkdir($dir, 0775, true);
         }
+        $path = $dir.'/missed-titles.jsonl';
+        $this->scrubLegacyMissedTitleLog($path);
         $line = json_encode([
             'ts' => date('c'),
-            'title' => $title,
-            'base' => $baseTitle,
+            'identity_fingerprint' => hash('sha256', json_encode([
+                'title' => $this->normalizeIdentityText($title),
+                'base' => $this->normalizeIdentityText($baseTitle),
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
             'year' => $year,
             'forced_type' => $forcedMediaType,
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        @file_put_contents($dir.'/missed-titles.jsonl', $line."\n", FILE_APPEND | LOCK_EX);
+        @file_put_contents($path, $line."\n", FILE_APPEND | LOCK_EX);
+    }
+
+    private function scrubLegacyMissedTitleLog(string $path): void
+    {
+        if ($this->missedTitleLogPrivacyChecked || ! is_file($path)) {
+            return;
+        }
+        $this->missedTitleLogPrivacyChecked = true;
+        $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if (! is_array($lines)) {
+            return;
+        }
+
+        $safeLines = [];
+        $legacyFound = false;
+        foreach ($lines as $line) {
+            $entry = json_decode($line, true);
+            if (! is_array($entry)
+                || preg_match('/^[a-f0-9]{64}$/D', (string) ($entry['identity_fingerprint'] ?? '')) !== 1) {
+                $legacyFound = true;
+                continue;
+            }
+            $safeLines[] = json_encode([
+                'ts' => is_scalar($entry['ts'] ?? null) ? (string) $entry['ts'] : '',
+                'identity_fingerprint' => $entry['identity_fingerprint'],
+                'year' => is_int($entry['year'] ?? null) ? $entry['year'] : null,
+                'forced_type' => in_array($entry['forced_type'] ?? null, ['tv', 'movie'], true)
+                    ? $entry['forced_type']
+                    : null,
+            ], JSON_UNESCAPED_SLASHES);
+        }
+        if (! $legacyFound) {
+            return;
+        }
+
+        $replacement = $safeLines === [] ? '' : implode("\n", $safeLines)."\n";
+        $temporaryPath = $path.'.privacy';
+        if (@file_put_contents($temporaryPath, $replacement, LOCK_EX) !== false) {
+            @rename($temporaryPath, $path);
+        }
+        @unlink($temporaryPath);
     }
 
     /**
      * Aggregate the missed-titles log into a top-N count list.
      *
-     * @return array<int, array{title: string, count: int, last_seen: string}>
+     * @return array<int, array{identity_fingerprint: string, count: int, last_seen: string}>
      */
     private function topMissedTitles(int $limit = 20): array
     {
@@ -2065,6 +2496,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (! file_exists($path)) {
             return [];
         }
+        $this->scrubLegacyMissedTitleLog($path);
         $counts = [];
         $lastSeen = [];
         $handle = @fopen($path, 'r');
@@ -2073,21 +2505,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         while (($line = fgets($handle)) !== false) {
             $entry = json_decode(trim($line), true);
-            if (! is_array($entry) || empty($entry['title'])) {
+            if (! is_array($entry)
+                || preg_match('/^[a-f0-9]{64}$/D', (string) ($entry['identity_fingerprint'] ?? '')) !== 1) {
                 continue;
             }
-            $key = (string) $entry['title'];
+            $key = (string) $entry['identity_fingerprint'];
             $counts[$key] = ($counts[$key] ?? 0) + 1;
             $lastSeen[$key] = $entry['ts'] ?? '';
         }
         fclose($handle);
         arsort($counts);
         $out = [];
-        foreach (array_slice($counts, 0, $limit, true) as $title => $count) {
+        foreach (array_slice($counts, 0, $limit, true) as $identityFingerprint => $count) {
             $out[] = [
-                'title' => $title,
+                'identity_fingerprint' => $identityFingerprint,
                 'count' => $count,
-                'last_seen' => $lastSeen[$title] ?? '',
+                'last_seen' => $lastSeen[$identityFingerprint] ?? '',
             ];
         }
 
@@ -2141,7 +2574,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             Log::warning('[EpgEnricher] TMDB images fetch failed', [
                 'tmdb_id' => $tmdbId,
                 'media_type' => $mediaType,
-                'error' => $e->getMessage(),
+                'reason' => 'request_failed',
             ]);
             return null;
         }
@@ -2606,7 +3039,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Keep a selected trusted landscape primary at both XMLTV image boundaries.
+     * Keep the selected programme thumbnail at both XMLTV image boundaries.
+     *
+     * Bracketing gives first-only and last-wins legacy consumers the same safe
+     * primary while role-aware consumers retain every typed alternative.
      */
     private function finalizeImageSerialization(array &$programme, bool $trustedLandscapeIcon, bool $overwrite): bool
     {
@@ -2619,30 +3055,48 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $programme['images'] = $this->prioritizeImages($programme['images']);
         $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
 
-        if ($trustedLandscapeIcon && ! $overwrite) {
-            $trustedUrl = (string) ($programme['icon'] ?? '');
+        $primaryIndex = null;
+        $currentPrimaryUrl = trim((string) ($programme['icon'] ?? ''));
+        foreach ($programme['images'] as $index => $image) {
+            if (($image['url'] ?? null) !== $currentPrimaryUrl) {
+                continue;
+            }
+            if ($this->isTrustedLandscapeImage($image)) {
+                $primaryIndex = $index;
+            }
+            break;
+        }
+
+        if ($primaryIndex === null) {
             foreach ($programme['images'] as $index => $image) {
-                if (($image['url'] ?? null) !== $trustedUrl) {
+                if (! $this->isTrustedLandscapeImage($image)) {
                     continue;
                 }
-                if ($index > 0) {
-                    array_unshift($programme['images'], array_splice($programme['images'], $index, 1)[0]);
-                }
+                $programme['icon'] = $image['url'];
+                $primaryIndex = $index;
                 break;
             }
-        } else {
-            foreach ($programme['images'] as $image) {
-                if ($this->isTrustedLandscapeImage($image)) {
-                    $programme['icon'] = $image['url'];
-                    break;
+        }
+
+        if ($primaryIndex === null) {
+            foreach ($programme['images'] as $index => $image) {
+                if (($image['type'] ?? null) !== 'poster') {
+                    continue;
                 }
+                $programme['icon'] = $image['url'];
+                $primaryIndex = $index;
+                break;
             }
+        }
+
+        if ($primaryIndex !== null && $primaryIndex > 0) {
+            array_unshift($programme['images'], array_splice($programme['images'], $primaryIndex, 1)[0]);
         }
 
         $primaryUrl = trim((string) ($programme['icon'] ?? ''));
         if ($primaryUrl !== '') {
             foreach ($programme['images'] as $image) {
-                if (($image['url'] ?? null) === $primaryUrl && $this->isTrustedLandscapeImage($image)) {
+                if (($image['url'] ?? null) === $primaryUrl && $this->isProgrammeThumbnailImage($image)) {
                     $programme['images'][] = $image;
                     break;
                 }
@@ -2654,21 +3108,31 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
+     * A programme thumbnail may be landscape artwork or a portrait poster fallback,
+     * but never a logo. Exact episode stills qualify through the landscape checks.
+     */
+    private function isProgrammeThumbnailImage(array $image): bool
+    {
+        return $this->isTrustedLandscapeImage($image)
+            || (($image['type'] ?? null) === 'poster' && ! empty($image['url']));
+    }
+
+    /**
      * Normalize a programme title into a stable cache key.
      */
     private function normalizeCacheKey(string $title): string
     {
-        $key = mb_strtolower(trim($title));
+        $key = $this->canonicalCaseFold($title);
+        if ($key === null) {
+            return '';
+        }
         // Strip common suffixes like "(2024)", year patterns
         $key = preg_replace('/\s*\(\d{4}\)\s*$/', '', $key);
         // Strip episode numbers like "S01E03", "(12)", "Folge 5"
-        $key = preg_replace('/\s*s\d{1,2}e\d{1,2}\s*/i', '', $key);
+        $key = preg_replace('/\s*s\d{1,2}e\d{1,2}\s*/iu', '', $key);
         $key = preg_replace('/\s*\(\d{1,4}\)\s*/', '', $key);
-        $key = preg_replace('/\s*(?:folge|episode|ep\.?)\s*\d+\s*/i', '', $key);
-        // Collapse whitespace
-        $key = preg_replace('/\s+/', ' ', $key);
-
-        return trim($key);
+        $key = preg_replace('/\s*(?:folge|episode|ep\.?)\s*\d+\s*/iu', '', $key);
+        return $this->normalizeIdentityText($key);
     }
 
     /**
@@ -2848,6 +3312,370 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
+     * Build the comparison locale chain without modifying source title/description fields.
+     * XMLTV language-only tags inherit a configured region only for the same language.
+     *
+     * @return array{valid: bool, reason: string, requested_locale: string|null, title_locale: string|null, description_locale: string|null}
+     */
+    private function buildTmdbLocaleContext(array $programme, array $lookupContext): array
+    {
+        $configured = trim((string) ($lookupContext['tmdb_language'] ?? ''));
+        if ($configured === '' || $configured === '__global') {
+            try {
+                $configured = trim((string) (app(GeneralSettings::class)->tmdb_language ?? ''));
+            } catch (\Throwable) {
+                $configured = '';
+            }
+        }
+        $requested = $this->parseTmdbLocale($configured);
+        if (! $requested['valid']) {
+            return [
+                'valid' => false,
+                'reason' => is_string($lookupContext['tmdb_language_reason'] ?? null)
+                    ? $lookupContext['tmdb_language_reason']
+                    : $requested['reason'],
+                'requested_locale' => null,
+                'title_locale' => null,
+                'description_locale' => null,
+            ];
+        }
+        if ($requested['tmdb_locale'] === null) {
+            return [
+                'valid' => false,
+                'reason' => 'tmdb_locale_unrepresentable',
+                'requested_locale' => null,
+                'title_locale' => null,
+                'description_locale' => null,
+            ];
+        }
+
+        $titleTag = $this->firstScalarLocaleField($programme, ['title_language', 'title_lang']);
+        $descriptionTag = $this->firstScalarLocaleField($programme, ['desc_language', 'desc_lang']);
+        $title = $titleTag === null ? $requested : $this->parseTmdbLocale($titleTag);
+        $description = $descriptionTag === null ? null : $this->parseTmdbLocale($descriptionTag);
+        foreach ([$title, $description] as $locale) {
+            if (is_array($locale) && ! $locale['valid']) {
+                return [
+                    'valid' => false,
+                    'reason' => $locale['reason'],
+                    'requested_locale' => $requested['locale'],
+                    'title_locale' => null,
+                    'description_locale' => null,
+                ];
+            }
+        }
+
+        $titleLocale = $this->inheritCompatibleLocaleRegion($title, $requested);
+        $descriptionLocale = $description === null
+            ? null
+            : $this->inheritCompatibleLocaleRegion($description, $requested);
+
+        return [
+            'valid' => true,
+            'reason' => 'validated_locale_chain',
+            'requested_locale' => $requested['tmdb_locale'],
+            'title_locale' => $titleLocale,
+            'description_locale' => $descriptionLocale,
+        ];
+    }
+
+    private function firstScalarLocaleField(array $programme, array $fields): ?string
+    {
+        foreach ($fields as $field) {
+            if (! array_key_exists($field, $programme)) {
+                continue;
+            }
+
+            return is_scalar($programme[$field]) ? trim((string) $programme[$field]) : '__malformed__';
+        }
+
+        return null;
+    }
+
+    /** @return array{valid: bool, reason: string, locale: string|null, tmdb_locale: string|null, language: string|null, script: string|null, region: string|null} */
+    private function parseTmdbLocale(string $tag): array
+    {
+        if (! class_exists(\Locale::class) || ! class_exists(\ResourceBundle::class)) {
+            return ['valid' => false, 'reason' => 'unicode_support_unavailable', 'locale' => null, 'tmdb_locale' => null, 'language' => null, 'script' => null, 'region' => null];
+        }
+
+        $tag = trim($tag);
+        $pattern = '/^(?<language>[A-Za-z]{2,3})(?:-(?<script>[A-Za-z]{4}))?(?:-(?<region>[A-Za-z]{2}|\d{3}))?(?:(?:-[A-Za-z0-9]{5,8}|-\d[A-Za-z0-9]{3}))*(?:-[0-9A-WY-Za-wy-z](?:-[A-Za-z0-9]{2,8})+)*(?:-x(?:-[A-Za-z0-9]{1,8})+)?$/D';
+        if (preg_match($pattern, $tag) !== 1) {
+            return ['valid' => false, 'reason' => 'malformed_language_tag', 'locale' => null, 'tmdb_locale' => null, 'language' => null, 'script' => null, 'region' => null];
+        }
+
+        $canonical = str_replace('_', '-', (string) \Locale::canonicalize(str_replace('-', '_', $tag)));
+        $language = strtolower((string) \Locale::getPrimaryLanguage($canonical));
+        $script = \Locale::getScript($canonical);
+        $script = $script === '' ? null : ucfirst(strtolower($script));
+        $region = \Locale::getRegion($canonical);
+        $region = $region === '' ? null : strtoupper($region);
+        static $languageNames = null;
+        static $regionNames = null;
+        $languageNames ??= \ResourceBundle::create('en', 'ICUDATA-lang')?->get('Languages');
+        $regionNames ??= \ResourceBundle::create('en', 'ICUDATA-region')?->get('Countries');
+        if (! $languageNames instanceof \ResourceBundle || ! $regionNames instanceof \ResourceBundle) {
+            return ['valid' => false, 'reason' => 'unicode_support_unavailable', 'locale' => null, 'tmdb_locale' => null, 'language' => null, 'script' => null, 'region' => null];
+        }
+        if (! is_string($languageNames->get($language))) {
+            return ['valid' => false, 'reason' => 'unsupported_language_tag', 'locale' => null, 'tmdb_locale' => null, 'language' => null, 'script' => null, 'region' => null];
+        }
+        if ($region !== null && preg_match('/^[A-Z]{2}$/D', $region) === 1 && ! is_string($regionNames->get($region))) {
+            return ['valid' => false, 'reason' => 'unsupported_language_tag', 'locale' => null, 'tmdb_locale' => null, 'language' => null, 'script' => null, 'region' => null];
+        }
+
+        $locale = $language
+            .($script === null ? '' : '-'.$script)
+            .($region === null ? '' : '-'.$region);
+        $tmdbLocale = preg_match('/^[a-z]{2}$/D', $language) === 1
+            ? $language.($region !== null && preg_match('/^[A-Z]{2}$/D', $region) === 1 ? '-'.$region : '')
+            : null;
+
+        return [
+            'valid' => true,
+            'reason' => 'validated_locale',
+            'locale' => $locale,
+            'tmdb_locale' => $tmdbLocale,
+            'language' => $language,
+            'script' => $script,
+            'region' => $region,
+        ];
+    }
+
+    private function inheritCompatibleLocaleRegion(array $locale, array $requested): string
+    {
+        if ($locale['region'] === null && $locale['language'] === $requested['language']) {
+            return $locale['locale'].($requested['region'] === null ? '' : '-'.$requested['region']);
+        }
+
+        return $locale['locale'];
+    }
+
+    private function localeLanguage(string $locale): ?string
+    {
+        $parsed = $this->parseTmdbLocale($locale);
+
+        return $parsed['valid'] ? $parsed['language'] : null;
+    }
+
+    private function localesHaveCompatibleLanguage(?string $left, ?string $right): bool
+    {
+        if ($left === null || $right === null) {
+            return false;
+        }
+
+        $leftLanguage = $this->localeLanguage($left);
+        $rightLanguage = $this->localeLanguage($right);
+
+        return $leftLanguage !== null && $leftLanguage === $rightLanguage;
+    }
+
+    /**
+     * Classify whether a programme has enough stable identity for catalogue matching.
+     * This only controls lookups; category writes remain governed by their own settings.
+     *
+     * @return array{class: string, reason: string, result: string}
+     */
+    private function decideTmdbApplicability(
+        string $title,
+        bool $hasStrongSeriesSignals,
+        bool $trustedProviderArt,
+        bool $hasStructuredYear = false,
+        ?array $externalIdentity = null,
+        ?string $trustedMediaType = null,
+    ): array {
+        $identity = $this->normalizeIdentityText($title);
+        if ($identity === '') {
+            return ['class' => 'missing_title_or_identity', 'reason' => 'missing_title', 'result' => 'unmatched'];
+        }
+        if (! function_exists('grapheme_strlen')) {
+            return ['class' => 'unknown', 'reason' => 'unicode_support_unavailable', 'result' => 'skipped'];
+        }
+        $graphemes = grapheme_strlen($identity);
+        if (! is_int($graphemes) || $graphemes === 0) {
+            return ['class' => 'missing_title_or_identity', 'reason' => 'missing_title', 'result' => 'unmatched'];
+        }
+
+        $hasResolvedIdentifierPath = ($externalIdentity['system'] ?? null) === 'tmdb';
+        $hasStructuredIdentity = $hasStructuredYear
+            || $hasStrongSeriesSignals
+            || $hasResolvedIdentifierPath
+            || $trustedMediaType !== null;
+        if (! $hasStructuredIdentity) {
+            return [
+                'class' => 'unknown',
+                'reason' => $trustedProviderArt ? 'trusted_provider_art' : 'insufficient_structured_identity',
+                'result' => 'skipped',
+            ];
+        }
+        if ($graphemes < 4 && $externalIdentity === null) {
+            return ['class' => 'unknown', 'reason' => 'insufficient_identity_graphemes', 'result' => 'skipped'];
+        }
+
+        return ['class' => 'catalogue_candidate', 'reason' => 'stable_catalogue_identity', 'result' => 'not_attempted'];
+    }
+
+    private function structuredProgrammeYear(array $programme): ?int
+    {
+        foreach (['year', 'date', 'production_year'] as $field) {
+            $value = $programme[$field] ?? null;
+            if (! is_int($value) && ! is_string($value)) {
+                continue;
+            }
+            $value = trim((string) $value);
+            if (preg_match('/^(19\d{2}|20\d{2})(?:-\d{2}-\d{2})?$/D', $value, $matches) !== 1) {
+                continue;
+            }
+            $year = (int) $matches[1];
+            if ($year <= (int) date('Y') + 2) {
+                return $year;
+            }
+        }
+
+        return null;
+    }
+
+    private function trustedProgrammeMediaType(array $programme): ?string
+    {
+        if (($programme['provider_media_type_trusted'] ?? null) !== true) {
+            return null;
+        }
+        $mediaType = is_string($programme['provider_media_type'] ?? null)
+            ? strtolower(trim($programme['provider_media_type']))
+            : null;
+
+        return in_array($mediaType, ['tv', 'movie'], true) ? $mediaType : null;
+    }
+
+    /** @return array{system: string, id: int|string, media_type: string}|null */
+    private function validatedTypeBoundExternalIdentity(array $programme): ?array
+    {
+        $identities = [];
+        foreach (['tmdb', 'imdb', 'tvdb'] as $system) {
+            $field = $system.'_id';
+            $typeField = $system.'_media_type';
+            if (! array_key_exists($field, $programme) || ! array_key_exists($typeField, $programme)) {
+                continue;
+            }
+            $mediaType = is_string($programme[$typeField]) ? strtolower(trim($programme[$typeField])) : '';
+            if (! in_array($mediaType, ['tv', 'movie'], true)) {
+                continue;
+            }
+            $id = $this->canonicalExternalIdentifier($system, $programme[$field]);
+            if ($id === null || ($system === 'tvdb' && $mediaType !== 'tv')) {
+                continue;
+            }
+            $identities[] = ['system' => $system, 'id' => $id, 'media_type' => $mediaType];
+        }
+        foreach (is_array($programme['external_ids'] ?? null) ? $programme['external_ids'] : [] as $entry) {
+            if (! is_array($entry)) {
+                continue;
+            }
+            $system = is_string($entry['system'] ?? null) ? strtolower(trim($entry['system'])) : '';
+            $mediaType = is_string($entry['media_type'] ?? null) ? strtolower(trim($entry['media_type'])) : '';
+            if (! in_array($system, ['tmdb', 'imdb', 'tvdb'], true)
+                || ! in_array($mediaType, ['tv', 'movie'], true)) {
+                continue;
+            }
+            $id = $this->canonicalExternalIdentifier($system, $entry['id'] ?? null);
+            if ($id !== null && ($system !== 'tvdb' || $mediaType === 'tv')) {
+                $identities[] = ['system' => $system, 'id' => $id, 'media_type' => $mediaType];
+            }
+        }
+        $identities = array_values(array_unique($identities, SORT_REGULAR));
+
+        return count($identities) === 1 ? $identities[0] : null;
+    }
+
+    private function canonicalExternalIdentifier(string $system, mixed $value): int|string|null
+    {
+        if ($system === 'imdb') {
+            if (! is_string($value) || preg_match('/^tt\d{7,9}$/D', $value) !== 1) {
+                return null;
+            }
+
+            return (int) substr($value, 2) > 0 ? $value : null;
+        }
+        if (! is_int($value) || $value <= 0 || $value > 2147483647) {
+            return null;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Persist only bounded, hashed per-airing matching diagnostics.
+     */
+    private function recordTmdbDecision(
+        array &$programme,
+        array $applicability,
+        string $title,
+        string $baseTitle,
+        ?int $year,
+        ?string $forcedMediaType,
+        array $seriesSignals,
+        array $lookupContext,
+        array $matchEvidence = [],
+    ): bool {
+        $scope = [
+            'media_type' => $matchEvidence['media_type'] ?? $forcedMediaType,
+            'language' => mb_strtolower(trim((string) ($lookupContext['tmdb_language'] ?? ''))),
+            'title_language' => is_string($lookupContext['title_language'] ?? null)
+                ? $lookupContext['title_language']
+                : null,
+            'description_language' => is_string($lookupContext['description_language'] ?? null)
+                ? $lookupContext['description_language']
+                : null,
+        ];
+        $sourceId = trim((string) ($lookupContext['epg_source_id'] ?? ''));
+        if ($sourceId !== '') {
+            $scope['source_fingerprint'] = hash('sha256', $sourceId);
+        }
+        $decision = [
+            'class' => $applicability['class'] ?? 'ambiguous_identity',
+            'result' => $applicability['result'] ?? 'unmatched',
+            'reason' => $applicability['reason'] ?? 'no_valid_candidate',
+            'logic' => self::ENRICHMENT_LOGIC_VERSION,
+            'scope' => $scope,
+            'input_fingerprint' => hash('sha256', json_encode([
+                'title' => $this->normalizeIdentityText($title),
+                'base_title' => $this->normalizeIdentityText($baseTitle),
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
+            'year' => $year,
+            'episode_evidence' => [
+                'season' => $seriesSignals['season'] ?? null,
+                'episode' => $seriesSignals['episode'] ?? null,
+                'confidence' => $seriesSignals['confidence'] ?? 'none',
+            ],
+            'score' => $matchEvidence['score'] ?? null,
+            'margin' => $matchEvidence['margin'] ?? null,
+        ];
+        foreach (['selected_candidate_fingerprint', 'runner_up_candidate_fingerprint'] as $field) {
+            if (is_string($matchEvidence[$field] ?? null)) {
+                $decision[$field] = $matchEvidence[$field];
+            }
+        }
+        if (is_array($matchEvidence['selected_title_provenance'] ?? null)) {
+            $decision['selected_title_provenance'] = $matchEvidence['selected_title_provenance'];
+        }
+        $existingDecision = $programme['tmdb_decision'] ?? null;
+        if (($decision['result'] === 'not_attempted')
+            && is_array($existingDecision)
+            && ($existingDecision['logic'] ?? null) === self::ENRICHMENT_LOGIC_VERSION
+            && ($existingDecision['input_fingerprint'] ?? null) === $decision['input_fingerprint']) {
+            return false;
+        }
+        if ($existingDecision === $decision) {
+            return false;
+        }
+
+        $programme['tmdb_decision'] = $decision;
+
+        return true;
+    }
+
+    /**
      * Search TMDB for a title with result validation.
      *
      * Scores TV and movie candidates globally unless explicit episode evidence
@@ -2863,11 +3691,67 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         string $description = '',
         ?array &$provisionalCompoundIdentity = null,
         ?array $requiredCompoundIdentity = null,
+        ?array &$matchEvidence = null,
+        array $localeContext = [],
+        ?array &$identityDetailLookupBudget = null,
+        ?array $externalIdentity = null,
     ): ?array
     {
         $provisionalCompoundIdentity = null;
-        $searchNorm = mb_strtolower(trim($searchTitle));
+        $matchEvidence = [];
+        if ($localeContext === []) {
+            $localeContext = $this->buildTmdbLocaleContext([], []);
+        }
+        if (! ($localeContext['valid'] ?? false)) {
+            $matchEvidence = [
+                'reason' => $localeContext['reason'] ?? 'malformed_language_tag',
+                'score' => null,
+                'margin' => null,
+                'media_type' => null,
+            ];
+
+            return null;
+        }
+        $identityDetailLookupBudget ??= ['remaining' => self::TMDB_IDENTITY_DETAIL_CANDIDATE_LIMIT];
         $candidates = [];
+
+        if (($externalIdentity['system'] ?? null) === 'tmdb') {
+            $mediaType = $externalIdentity['media_type'];
+            $tmdbId = $externalIdentity['id'];
+            try {
+                $details = $mediaType === 'tv'
+                    ? $tmdb->getTvSeriesDetails($tmdbId)
+                    : $tmdb->getMovieDetails($tmdbId);
+            } catch (\Throwable) {
+                $matchEvidence = ['reason' => 'external_identity_unavailable', 'score' => null, 'margin' => null, 'media_type' => $mediaType];
+
+                return null;
+            }
+            if (! is_array($details)
+                || ! $this->tmdbDetailsMatchExternalIdentity($details, $mediaType, $externalIdentity)
+                || ! $this->hasValidTmdbDetailsShape(array_merge($details, ['_media_type' => $mediaType]), $mediaType)) {
+                $matchEvidence = ['reason' => 'external_identity_unbound', 'score' => null, 'margin' => null, 'media_type' => $mediaType];
+
+                return null;
+            }
+            $bound = $this->scoreTmdbCandidate($details, $mediaType, $searchTitle, $year, $description, [], $localeContext, true);
+            if (! ($bound['_identity_valid'] ?? false) && ($identityDetailLookupBudget['remaining'] ?? 0) > 0) {
+                $titleEvidence = $this->loadTmdbIdentityTitleEvidence($tmdb, $mediaType, $tmdbId, (string) $localeContext['requested_locale']);
+                $identityDetailLookupBudget['remaining']--;
+                $bound = $this->scoreTmdbCandidate($details, $mediaType, $searchTitle, $year, $description, $titleEvidence, $localeContext, true);
+            }
+            $candidates = [$bound];
+            $best = $this->selectTmdbIdentityWinner($candidates, $externalIdentity);
+            $matchEvidence = $this->summarizeTmdbMatchEvidence($candidates, $externalIdentity);
+            if ($best === null) {
+                return null;
+            }
+            $this->removeTmdbCandidateComparisonFields($best);
+            $matchEvidence['reason'] = 'selected_type_bound_identifier';
+            $best['_match_evidence'] = $matchEvidence;
+
+            return $best;
+        }
 
         if (method_exists($tmdb, 'searchTvSeriesCandidates')
             && method_exists($tmdb, 'searchMovieCandidates')) {
@@ -2878,7 +3762,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         if (! $this->isValidRawTmdbCandidate($candidate, 'tv')) {
                             return null;
                         }
-                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'tv', $searchNorm, $year, $description, []);
+                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'tv', $searchTitle, $year, $description, [], $localeContext, $forceMediaType === 'tv');
                     }
                 }
 
@@ -2888,14 +3772,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         if (! $this->isValidRawTmdbCandidate($candidate, 'movie')) {
                             return null;
                         }
-                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'movie', $searchNorm, $year, $description, []);
+                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'movie', $searchTitle, $year, $description, [], $localeContext, $forceMediaType === 'movie');
                     }
                 }
             } catch (\Throwable) {
                 return null;
             }
 
-            $best = $this->selectTmdbIdentityWinner($candidates);
+            $candidates = $this->dedupeTmdbIdentityCandidates($candidates);
+            $best = $this->selectTmdbIdentityWinner($candidates, $externalIdentity);
             if ($requiredCompoundIdentity !== null) {
                 $best = $this->confirmedCompoundIdentityCandidate(
                     $candidates,
@@ -2904,6 +3789,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 );
             }
             if ($best === null) {
+                $candidates = $this->expandPlausibleTmdbTitleEvidence(
+                    $tmdb,
+                    $candidates,
+                    $searchTitle,
+                    $year,
+                    $description,
+                    $localeContext,
+                    $forceMediaType,
+                    $identityDetailLookupBudget,
+                );
+                $best = $requiredCompoundIdentity === null
+                    ? $this->selectTmdbIdentityWinner($candidates, $externalIdentity)
+                    : $this->confirmedCompoundIdentityCandidate($candidates, $searchTitle, $requiredCompoundIdentity);
+            }
+            $matchEvidence = $this->summarizeTmdbMatchEvidence($candidates, $externalIdentity);
+            if ($best === null) {
+                if ($requiredCompoundIdentity !== null) {
+                    $matchEvidence['reason'] = 'compound_identity_unconfirmed';
+                }
                 $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
 
                 return null;
@@ -2914,6 +3818,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     ? $tmdb->getTvSeriesDetails((int) $best['tmdb_id'])
                     : $tmdb->getMovieDetails((int) $best['tmdb_id']);
             } catch (\Throwable) {
+                $matchEvidence['reason'] = 'winner_details_unavailable';
                 return null;
             }
             $selectedTmdbId = $best['tmdb_id'];
@@ -2923,10 +3828,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 || $details['tmdb_id'] !== $selectedTmdbId
                 || (array_key_exists('_media_type', $details)
                     && $details['_media_type'] !== $selectedMediaType)) {
+                $matchEvidence['reason'] = 'winner_details_invalid';
+                return null;
+            }
+            if ($externalIdentity !== null
+                && ! $this->tmdbDetailsMatchExternalIdentity($details, $selectedMediaType, $externalIdentity)) {
+                $matchEvidence['reason'] = 'external_identity_unbound';
                 return null;
             }
             $details = array_merge($details, ['_media_type' => $selectedMediaType]);
             if (! $this->hasValidTmdbDetailsShape($details, $selectedMediaType)) {
+                $matchEvidence['reason'] = 'winner_details_invalid';
                 return null;
             }
             $best = array_merge($best, $details, [
@@ -2934,40 +3846,47 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 '_media_type' => $selectedMediaType,
             ]);
 
-            unset($best['_identity_valid'], $best['_identity_score']);
+            $this->removeTmdbCandidateComparisonFields($best);
 
             if (! $this->hasValidTmdbDetailsShape($best, $selectedMediaType)) {
+                $matchEvidence['reason'] = 'winner_details_invalid';
                 return null;
             }
+
+            $matchEvidence['reason'] = $externalIdentity === null ? 'selected' : 'selected_type_bound_identifier';
+            $best['_match_evidence'] = $matchEvidence;
 
             return $best;
         }
 
-        if ($forceMediaType !== 'movie') {
-            $tvResult = $tmdb->searchTvSeries($searchTitle, $year);
-            if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
-                $details = $tmdb->getTvSeriesDetails((int) $tvResult['tmdb_id']);
-                if ($details) {
-                    $tvResult = array_merge($tvResult, $details);
+        try {
+            if ($forceMediaType !== 'movie') {
+                $tvResult = $tmdb->searchTvSeries($searchTitle, $year);
+                if ($tvResult && ($tvResult['tmdb_id'] ?? null)) {
+                    $details = $tmdb->getTvSeriesDetails((int) $tvResult['tmdb_id']);
+                    if ($details) {
+                        $tvResult = array_merge($tvResult, $details);
+                    }
+                    $candidates[] = $this->scoreTmdbCandidate($tvResult, 'tv', $searchTitle, $year, $description, [], $localeContext, $forceMediaType === 'tv');
                 }
-                $alternatives = $tmdb->getTvAlternativeTitles((int) $tvResult['tmdb_id']);
-                $candidates[] = $this->scoreTmdbCandidate($tvResult, 'tv', $searchNorm, $year, $description, $alternatives);
             }
+
+            if ($forceMediaType !== 'tv') {
+                $movieResult = $tmdb->searchMovie($searchTitle, $year, tryFallback: true);
+                if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
+                    $details = $tmdb->getMovieDetails((int) $movieResult['tmdb_id']);
+                    if ($details) {
+                        $movieResult = array_merge($movieResult, $details);
+                    }
+                    $candidates[] = $this->scoreTmdbCandidate($movieResult, 'movie', $searchTitle, $year, $description, [], $localeContext, $forceMediaType === 'movie');
+                }
+            }
+        } catch (\Throwable) {
+            return null;
         }
 
-        if ($forceMediaType !== 'tv') {
-            $movieResult = $tmdb->searchMovie($searchTitle, $year, tryFallback: true);
-            if ($movieResult && ($movieResult['tmdb_id'] ?? null)) {
-                $details = $tmdb->getMovieDetails((int) $movieResult['tmdb_id']);
-                if ($details) {
-                    $movieResult = array_merge($movieResult, $details);
-                }
-                $alternatives = $tmdb->getMovieAlternativeTitles((int) $movieResult['tmdb_id']);
-                $candidates[] = $this->scoreTmdbCandidate($movieResult, 'movie', $searchNorm, $year, $description, $alternatives);
-            }
-        }
-
-        $best = $this->selectTmdbIdentityWinner($candidates);
+        $candidates = $this->dedupeTmdbIdentityCandidates($candidates);
+        $best = $this->selectTmdbIdentityWinner($candidates, $externalIdentity);
         if ($requiredCompoundIdentity !== null) {
             $best = $this->confirmedCompoundIdentityCandidate(
                 $candidates,
@@ -2976,34 +3895,155 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             );
         }
         if ($best === null) {
+            $candidates = $this->expandPlausibleTmdbTitleEvidence(
+                $tmdb,
+                $candidates,
+                $searchTitle,
+                $year,
+                $description,
+                $localeContext,
+                $forceMediaType,
+                $identityDetailLookupBudget,
+            );
+            $best = $requiredCompoundIdentity === null
+                ? $this->selectTmdbIdentityWinner($candidates, $externalIdentity)
+                : $this->confirmedCompoundIdentityCandidate($candidates, $searchTitle, $requiredCompoundIdentity);
+        }
+        $matchEvidence = $this->summarizeTmdbMatchEvidence($candidates, $externalIdentity);
+        if ($best === null) {
+            if ($requiredCompoundIdentity !== null) {
+                $matchEvidence['reason'] = 'compound_identity_unconfirmed';
+            }
             $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
 
             return null;
         }
 
-        unset($best['_identity_valid'], $best['_identity_score']);
+        $this->removeTmdbCandidateComparisonFields($best);
 
         if (! is_int($best['tmdb_id'] ?? null)
             || $best['tmdb_id'] <= 0
+            || $best['tmdb_id'] > 2147483647
             || ! in_array($best['_media_type'] ?? null, ['tv', 'movie'], true)) {
             return null;
         }
+        if ($externalIdentity !== null
+            && ! $this->tmdbDetailsMatchExternalIdentity($best, $best['_media_type'], $externalIdentity)) {
+            $matchEvidence['reason'] = 'external_identity_unbound';
+            return null;
+        }
         $best['_runtime_trusted_legacy'] = true;
+        $matchEvidence['reason'] = $externalIdentity === null ? 'selected_legacy' : 'selected_type_bound_identifier';
+        $best['_match_evidence'] = $matchEvidence;
 
         return $best;
     }
 
-    private function provisionalCompoundIdentity(array $candidates, string $searchTitle): ?array
+    /**
+     * @param  array<int, array<string, mixed>>  $candidates
+     * @return array<string, float|string|null>
+     */
+    private function summarizeTmdbMatchEvidence(array $candidates, ?array $externalIdentity = null): array
     {
-        if (count($candidates) !== 1) {
-            return null;
+        usort($candidates, $this->tmdbCandidateComparison(...));
+        $best = $candidates[0] ?? null;
+        $runnerUp = $candidates[1] ?? null;
+        $score = is_array($best) ? (float) ($best['_identity_score'] ?? 0) : null;
+        $runnerScore = is_array($runnerUp) ? (float) ($runnerUp['_identity_score'] ?? 0) : null;
+        $validWinner = is_array($best) && ($best['_identity_valid'] ?? false) && $score >= 76.0;
+        $margin = $score !== null && $runnerScore !== null ? round($score - $runnerScore, 3) : null;
+        $boundWinner = is_array($best) && $this->tmdbCandidateMatchesExternalIdentity($best, $externalIdentity);
+        $winnerSelected = $validWinner && ($boundWinner || ($margin !== null && $margin >= 8.0));
+        $reason = ! $validWinner
+            ? (is_string($best['_rejection_reason'] ?? null) ? $best['_rejection_reason'] : 'candidate_score_below_threshold')
+            : ($boundWinner
+                ? 'type_bound_external_identity'
+                : ($margin === null ? 'missing_runner_up_margin' : ($margin < 8.0 ? 'ambiguous_identity' : 'candidate_selected')));
+        $evidence = [
+            'reason' => $reason,
+            'score' => $score,
+            'margin' => $margin,
+            'media_type' => is_array($best) ? ($best['_media_type'] ?? null) : null,
+        ];
+        if (is_array($best)) {
+            $evidence['selected_candidate_fingerprint'] = $this->tmdbCandidateFingerprint($best);
+            if ($winnerSelected && is_array($best['_title_evidence_provenance'] ?? null)) {
+                $evidence['selected_title_provenance'] = $best['_title_evidence_provenance'];
+            }
+        }
+        if (is_array($runnerUp)) {
+            $evidence['runner_up_candidate_fingerprint'] = $this->tmdbCandidateFingerprint($runnerUp);
         }
 
-        $candidate = $candidates[0];
+        return $evidence;
+    }
+
+    private function dedupeTmdbIdentityCandidates(array $candidates): array
+    {
+        $deduped = [];
+        foreach ($candidates as $candidate) {
+            $key = ($candidate['_media_type'] ?? '').':'.($candidate['tmdb_id'] ?? '');
+            if (! array_key_exists($key, $deduped)
+                || $this->tmdbCandidateComparison($candidate, $deduped[$key]) < 0) {
+                $deduped[$key] = $candidate;
+            }
+        }
+
+        return array_values($deduped);
+    }
+
+    private function tmdbCandidateComparison(array $left, array $right): int
+    {
+        $score = ($right['_identity_score'] ?? 0) <=> ($left['_identity_score'] ?? 0);
+        if ($score !== 0) {
+            return $score;
+        }
+        $mediaType = strcmp((string) ($left['_media_type'] ?? ''), (string) ($right['_media_type'] ?? ''));
+        if ($mediaType !== 0) {
+            return $mediaType;
+        }
+
+        return ((int) ($left['tmdb_id'] ?? 0)) <=> ((int) ($right['tmdb_id'] ?? 0));
+    }
+
+    private function removeTmdbCandidateComparisonFields(array &$candidate): void
+    {
+        foreach (array_keys($candidate) as $field) {
+            if (str_starts_with((string) $field, '_identity_')
+                || str_starts_with((string) $field, '_title_')
+                || in_array($field, ['_rejection_reason', 'original_language'], true)) {
+                unset($candidate[$field]);
+            }
+        }
+    }
+
+    private function tmdbCandidateFingerprint(array $candidate): string
+    {
+        $mediaType = $candidate['_media_type'] ?? '';
+        $titleFields = $mediaType === 'tv' ? ['name', 'original_name'] : ['title', 'original_title'];
+
+        return hash('sha256', json_encode([
+            'media_type' => $mediaType,
+            'tmdb_id' => $candidate['tmdb_id'] ?? null,
+            'title' => array_map(fn (string $field): string => $this->normalizeIdentityText((string) ($candidate[$field] ?? '')), $titleFields),
+            'year' => substr((string) ($candidate[$mediaType === 'tv' ? 'first_air_date' : 'release_date'] ?? ''), 0, 4),
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    }
+
+    private function provisionalCompoundIdentity(array $candidates, string $searchTitle): ?array
+    {
         $searchBase = $this->compoundIdentityBase($searchTitle);
-        if ($searchBase === null || ! $this->candidateHasCompoundBase($candidate, $searchBase)) {
+        if ($searchBase === null) {
             return null;
         }
+        $matching = array_values(array_filter(
+            $candidates,
+            fn (array $candidate): bool => $this->candidateHasCompoundBase($candidate, $searchBase),
+        ));
+        if (count($matching) !== 1) {
+            return null;
+        }
+        $candidate = $matching[0];
 
         return [
             'tmdb_id' => $candidate['tmdb_id'],
@@ -3016,21 +4056,32 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         string $searchTitle,
         array $requiredIdentity,
     ): ?array {
-        if (count($candidates) !== 1) {
-            return null;
-        }
-
-        $candidate = $candidates[0];
         $searchBase = $this->normalizeIdentityText($searchTitle);
-        if (! $this->isSubstantialIdentityBase($searchBase)
-            || ($candidate['tmdb_id'] ?? null) !== ($requiredIdentity['tmdb_id'] ?? null)
-            || ($candidate['_media_type'] ?? null) !== ($requiredIdentity['media_type'] ?? null)
-            || ! $this->candidateHasCompoundBase($candidate, $searchBase)) {
+        if (! $this->isSubstantialIdentityBase($searchBase)) {
             return null;
         }
+        $matching = array_values(array_filter(
+            $candidates,
+            fn (array $candidate): bool => ($candidate['tmdb_id'] ?? null) === ($requiredIdentity['tmdb_id'] ?? null)
+                && ($candidate['_media_type'] ?? null) === ($requiredIdentity['media_type'] ?? null)
+                && $this->candidateHasCompoundBase($candidate, $searchBase),
+        ));
+        if (count($matching) !== 1) {
+            return null;
+        }
+        $candidate = $matching[0];
 
         $candidate['_identity_valid'] = true;
         $candidate['_identity_score'] = 76.0;
+        $others = array_values(array_filter(
+            $candidates,
+            fn (array $other): bool => ($other['tmdb_id'] ?? null) !== ($candidate['tmdb_id'] ?? null)
+                || ($other['_media_type'] ?? null) !== ($candidate['_media_type'] ?? null),
+        ));
+        usort($others, $this->tmdbCandidateComparison(...));
+        if ($others === [] || 76.0 - (float) ($others[0]['_identity_score'] ?? 0) < 8.0) {
+            return null;
+        }
 
         return $candidate;
     }
@@ -3073,7 +4124,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     {
         if (! is_array($candidate)
             || ! is_int($candidate['tmdb_id'] ?? null)
-            || $candidate['tmdb_id'] <= 0) {
+            || $candidate['tmdb_id'] <= 0
+            || $candidate['tmdb_id'] > 2147483647) {
             return false;
         }
 
@@ -3093,18 +4145,245 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || trim((string) $candidate[$titleFields[1]]) !== '';
     }
 
-    private function selectTmdbIdentityWinner(array $candidates): ?array
+    private function expandPlausibleTmdbTitleEvidence(
+        TmdbService $tmdb,
+        array $candidates,
+        string $searchTitle,
+        ?int $year,
+        string $description,
+        array $localeContext,
+        ?string $forceMediaType,
+        array &$lookupBudget,
+    ): array {
+        if (($lookupBudget['remaining'] ?? 0) <= 0) {
+            return $candidates;
+        }
+
+        $eligible = [];
+        foreach ($candidates as $index => $candidate) {
+            if (($candidate['_identity_independent'] ?? false)
+                && ! ($candidate['_identity_valid'] ?? false)) {
+                $eligible[] = $index;
+            }
+        }
+        if (count($eligible) > 1) {
+            usort($eligible, fn (int $left, int $right): int => ($candidates[$right]['_identity_score'] ?? 0) <=> ($candidates[$left]['_identity_score'] ?? 0));
+            if ((float) ($candidates[$eligible[0]]['_identity_score'] ?? 0)
+                - (float) ($candidates[$eligible[1]]['_identity_score'] ?? 0) >= 8.0) {
+                $eligible = [$eligible[0]];
+            }
+        }
+        if (count($eligible) !== 1) {
+            return $candidates;
+        }
+
+        $index = $eligible[0];
+        $candidate = $candidates[$index];
+        $mediaType = $candidate['_media_type'];
+        $titleEvidence = $this->loadTmdbIdentityTitleEvidence(
+            $tmdb,
+            $mediaType,
+            (int) $candidate['tmdb_id'],
+            (string) $localeContext['requested_locale'],
+        );
+        $lookupBudget['remaining']--;
+        $rescored = $this->scoreTmdbCandidate(
+            $candidate,
+            $mediaType,
+            $searchTitle,
+            $year,
+            $description,
+            $titleEvidence,
+            $localeContext,
+            $forceMediaType === $mediaType,
+        );
+        if (($rescored['_title_evidence_source'] ?? null) === null
+            || ! in_array($rescored['_title_evidence_source'], ['alternative', 'translation'], true)) {
+            $rescored['_rejection_reason'] = match ($rescored['_title_script_relation'] ?? null) {
+                'mixed' => 'mixed_script_identity_rejected',
+                'unavailable' => 'unicode_support_unavailable',
+                default => 'explicit_alias_unavailable',
+            };
+        }
+        $candidates[$index] = $rescored;
+
+        return $candidates;
+    }
+
+    /** @return array<int, array{title: string, source: string, language: string|null, region: string|null, type: string|null}> */
+    private function loadTmdbIdentityTitleEvidence(TmdbService $tmdb, string $mediaType, int $tmdbId, string $requestedLocale): array
     {
-        usort($candidates, fn (array $a, array $b): int => $b['_identity_score'] <=> $a['_identity_score']);
+        $cacheKey = $mediaType.':'.$tmdbId.':'.strtolower($requestedLocale);
+        if (array_key_exists($cacheKey, $this->tmdbIdentityTitleEvidenceCache)) {
+            return $this->tmdbIdentityTitleEvidenceCache[$cacheKey];
+        }
+
+        $evidence = [];
+        $complete = true;
+        $alternativeMethod = $mediaType === 'tv' ? 'getTvAlternativeTitles' : 'getMovieAlternativeTitles';
+        $translationMethod = $mediaType === 'tv' ? 'getTvTranslations' : 'getMovieTranslations';
+        try {
+            $payload = method_exists($tmdb, $alternativeMethod)
+                ? $tmdb->{$alternativeMethod}($tmdbId)
+                : $this->requestTmdbIdentityTitlePayload($mediaType, $tmdbId, 'alternative_titles');
+        } catch (\Throwable) {
+            $payload = null;
+        }
+        $complete = $complete && is_array($payload);
+        if (is_array($payload)) {
+            $entries = is_array($payload['results'] ?? null)
+                ? $payload['results']
+                : (is_array($payload['titles'] ?? null) ? $payload['titles'] : $payload);
+            foreach (array_slice(is_array($entries) ? $entries : [], 0, self::TMDB_IDENTITY_TITLE_RECORD_LIMIT_PER_CHANNEL) as $entry) {
+                $title = is_array($entry) && is_scalar($entry['title'] ?? $entry['name'] ?? null)
+                    ? trim((string) ($entry['title'] ?? $entry['name']))
+                    : '';
+                $region = is_array($entry) && is_scalar($entry['iso_3166_1'] ?? null)
+                    ? strtoupper(trim((string) $entry['iso_3166_1']))
+                    : '';
+                $type = is_array($entry) && is_scalar($entry['type'] ?? null)
+                    ? trim((string) $entry['type'])
+                    : '';
+                $type = preg_match('/^[\p{L}\p{N} _-]{1,32}$/u', $type) === 1 ? $type : null;
+                if ($title !== '' && $this->isSupportedTmdbRegion($region)) {
+                    $evidence[] = ['title' => $title, 'source' => 'alternative', 'language' => null, 'region' => $region, 'type' => $type];
+                }
+            }
+        }
+        try {
+            $payload = method_exists($tmdb, $translationMethod)
+                ? $tmdb->{$translationMethod}($tmdbId)
+                : $this->requestTmdbIdentityTitlePayload($mediaType, $tmdbId, 'translations');
+        } catch (\Throwable) {
+            $payload = null;
+        }
+        $complete = $complete && is_array($payload);
+        if (is_array($payload)) {
+            $entries = is_array($payload['translations'] ?? null) ? $payload['translations'] : $payload;
+            foreach (array_slice(is_array($entries) ? $entries : [], 0, self::TMDB_IDENTITY_TITLE_RECORD_LIMIT_PER_CHANNEL) as $entry) {
+                $language = is_array($entry) && is_scalar($entry['iso_639_1'] ?? null)
+                    ? strtolower(trim((string) $entry['iso_639_1']))
+                    : '';
+                $region = is_array($entry) && is_scalar($entry['iso_3166_1'] ?? null)
+                    ? strtoupper(trim((string) $entry['iso_3166_1']))
+                    : '';
+                $data = is_array($entry['data'] ?? null) ? $entry['data'] : $entry;
+                $title = is_scalar($data['name'] ?? $data['title'] ?? null)
+                    ? trim((string) ($data['name'] ?? $data['title']))
+                    : '';
+                $locale = $this->parseTmdbLocale($language.($region === '' ? '' : '-'.$region));
+                if ($title !== '' && $locale['valid']) {
+                    $evidence[] = ['title' => $title, 'source' => 'translation', 'language' => $language, 'region' => $region === '' ? null : $region, 'type' => null];
+                }
+            }
+        }
+
+        if ($complete) {
+            $this->tmdbIdentityTitleEvidenceCache[$cacheKey] = $evidence;
+        }
+
+        return $evidence;
+    }
+
+    private function requestTmdbIdentityTitlePayload(string $mediaType, int $tmdbId, string $endpoint): ?array
+    {
+        $credentials = $this->getTmdbCredentials();
+        if ($credentials === null
+            || ! in_array($mediaType, ['tv', 'movie'], true)
+            || ! in_array($endpoint, ['alternative_titles', 'translations'], true)) {
+            return null;
+        }
+
+        $response = Http::timeout(10)->get(
+            "https://api.themoviedb.org/3/{$mediaType}/{$tmdbId}/{$endpoint}",
+            ['api_key' => $credentials['key']],
+        );
+
+        if (! $response->successful()) {
+            return null;
+        }
+        $payload = $response->json();
+
+        return is_array($payload) ? $payload : null;
+    }
+
+    private function isSupportedTmdbRegion(string $region): bool
+    {
+        return $this->parseTmdbLocale('en-'.$region)['valid'];
+    }
+
+    private function isTaggedTitleEvidenceCompatible(array $evidence, array $localeContext): bool
+    {
+        $titleLocale = $this->parseTmdbLocale((string) ($localeContext['title_locale'] ?? ''));
+        if (! $titleLocale['valid']) {
+            return false;
+        }
+
+        $region = is_string($evidence['region'] ?? null) ? strtoupper($evidence['region']) : null;
+        if (($evidence['source'] ?? null) === 'translation') {
+            return is_string($evidence['language'] ?? null)
+                && $evidence['language'] === $titleLocale['language']
+                && ($region === null || $titleLocale['region'] === null || $region === $titleLocale['region']);
+        }
+
+        return ($evidence['source'] ?? null) === 'alternative'
+            && $region !== null
+            && $titleLocale['region'] !== null
+            && $region === $titleLocale['region'];
+    }
+
+    private function selectTmdbIdentityWinner(array $candidates, ?array $externalIdentity = null): ?array
+    {
+        usort($candidates, $this->tmdbCandidateComparison(...));
         $best = $candidates[0] ?? null;
         if ($best === null || $best['_identity_score'] < 76.0 || ! $best['_identity_valid']) {
             return null;
         }
-        if (isset($candidates[1]) && ($best['_identity_score'] - $candidates[1]['_identity_score']) < 8.0) {
+        if ($this->tmdbCandidateMatchesExternalIdentity($best, $externalIdentity)) {
+            return $best;
+        }
+        if (! isset($candidates[1]) || ($best['_identity_score'] - $candidates[1]['_identity_score']) < 8.0) {
             return null;
         }
 
         return $best;
+    }
+
+    private function tmdbCandidateMatchesExternalIdentity(array $candidate, ?array $externalIdentity): bool
+    {
+        if ($externalIdentity === null
+            || ($candidate['_media_type'] ?? null) !== ($externalIdentity['media_type'] ?? null)) {
+            return false;
+        }
+        $field = match ($externalIdentity['system'] ?? null) {
+            'tmdb' => 'tmdb_id',
+            'imdb' => 'imdb_id',
+            'tvdb' => 'tvdb_id',
+            default => null,
+        };
+
+        return $field !== null && ($candidate[$field] ?? null) === ($externalIdentity['id'] ?? null);
+    }
+
+    private function tmdbDetailsMatchExternalIdentity(array $details, string $mediaType, array $externalIdentity): bool
+    {
+        if ($mediaType !== ($externalIdentity['media_type'] ?? null)) {
+            return false;
+        }
+        if (array_key_exists('_media_type', $details) && $details['_media_type'] !== $mediaType) {
+            return false;
+        }
+        $field = match ($externalIdentity['system'] ?? null) {
+            'tmdb' => 'tmdb_id',
+            'imdb' => 'imdb_id',
+            'tvdb' => 'tvdb_id',
+            default => null,
+        };
+        if ($field === null || ($details[$field] ?? null) !== ($externalIdentity['id'] ?? null)) {
+            return false;
+        }
+
+        return $this->canonicalExternalIdentifier((string) $externalIdentity['system'], $details[$field]) !== null;
     }
 
     private function scoreTmdbCandidate(
@@ -3114,21 +4393,76 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?int $year,
         string $description,
         array $alternativeTitles,
+        array $localeContext,
+        bool $mediaTypeIsExplicit,
     ): array {
-        $titleFields = $mediaType === 'tv'
-            ? [$candidate['name'] ?? '', $candidate['original_name'] ?? '']
-            : [$candidate['title'] ?? '', $candidate['original_title'] ?? ''];
-        $bestTitleScore = 0.0;
-        $bestTitleSource = 'primary';
-        foreach ($titleFields as $title) {
-            $bestTitleScore = max($bestTitleScore, $this->titleMatchScore($searchNorm, (string) $title));
+        foreach (array_keys($candidate) as $field) {
+            if (str_starts_with((string) $field, '_identity_')
+                || str_starts_with((string) $field, '_title_')
+                || $field === '_rejection_reason') {
+                unset($candidate[$field]);
+            }
         }
+        $localizedField = $mediaType === 'tv' ? 'name' : 'title';
+        $originalField = $mediaType === 'tv' ? 'original_name' : 'original_title';
+        $bestTitleScore = 0.0;
+        $bestTitleSource = null;
+        $bestTitleProvenance = null;
+        $bestComparison = ['score' => 0.0, 'compatibility_only' => false, 'script_relation' => 'same'];
+        if ($this->localesHaveCompatibleLanguage($localeContext['title_locale'] ?? null, $localeContext['requested_locale'] ?? null)) {
+            $localizedComparison = $this->titleComparisonResult($searchNorm, (string) ($candidate[$localizedField] ?? ''));
+            if ($mediaType === 'tv' && $this->isCompleteTitlePrefix($searchNorm, (string) ($candidate[$localizedField] ?? ''))) {
+                $localizedComparison['score'] = max($localizedComparison['score'], 0.95);
+            }
+            $bestTitleScore = $localizedComparison['score'];
+            $bestTitleSource = 'localized';
+            $bestTitleProvenance = ['source' => 'localized'];
+            $bestComparison = $localizedComparison;
+        }
+
+        $originalLanguage = is_scalar($candidate['original_language'] ?? null)
+            ? strtolower(trim((string) $candidate['original_language']))
+            : '';
+        $originalLocale = preg_match('/^[a-z]{2}$/D', $originalLanguage) === 1
+            ? $this->parseTmdbLocale($originalLanguage)
+            : ['valid' => false];
+        if (($originalLocale['valid'] ?? false)
+            && $this->localesHaveCompatibleLanguage($localeContext['title_locale'] ?? null, $originalLocale['locale'])) {
+            $originalComparison = $this->titleComparisonResult($searchNorm, (string) ($candidate[$originalField] ?? ''));
+            if ($originalComparison['score'] > $bestTitleScore) {
+                $bestTitleScore = $originalComparison['score'];
+                $bestTitleSource = 'original';
+                $bestTitleProvenance = ['source' => 'original'];
+                $bestComparison = $originalComparison;
+            }
+        }
+        if ($bestTitleSource === null) {
+            $bestComparison = $this->titleComparisonResult($searchNorm, (string) ($candidate[$localizedField] ?? ''));
+            $bestComparison['score'] = 0.0;
+        }
+
         foreach ($alternativeTitles as $alternative) {
-            $alternativeTitle = (string) ($alternative['title'] ?? $alternative['name'] ?? '');
-            $alternativeScore = $this->titleMatchScore($searchNorm, $alternativeTitle);
-            if ($alternativeScore > $bestTitleScore) {
-                $bestTitleScore = $alternativeScore;
-                $bestTitleSource = 'alternative';
+            if (! is_array($alternative) || ! $this->isTaggedTitleEvidenceCompatible($alternative, $localeContext)) {
+                continue;
+            }
+            $alternativeComparison = $this->titleComparisonResult($searchNorm, (string) ($alternative['title'] ?? ''));
+            if ($alternativeComparison['score'] > $bestTitleScore
+                || ($alternativeComparison['score'] === $bestTitleScore
+                    && $bestComparison['script_relation'] !== 'same')) {
+                $bestTitleScore = $alternativeComparison['score'];
+                $bestTitleSource = $alternative['source'] ?? 'alternative';
+                $bestTitleProvenance = $bestTitleSource === 'translation'
+                    ? [
+                        'source' => 'translation',
+                        'language' => $alternative['language'] ?? null,
+                        'region' => $alternative['region'] ?? null,
+                    ]
+                    : [
+                        'source' => 'alternative',
+                        'region' => $alternative['region'] ?? null,
+                        'type' => $alternative['type'] ?? null,
+                    ];
+                $bestComparison = $alternativeComparison;
             }
         }
 
@@ -3147,14 +4481,43 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             };
         }
 
-        $descriptionScore = $this->descriptionEvidenceScore($description, $candidate);
+        $descriptionCompatible = $description === ''
+            || $this->localesHaveCompatibleLanguage($localeContext['description_locale'] ?? null, $localeContext['requested_locale'] ?? null);
+        $descriptionScore = $descriptionCompatible ? $this->descriptionEvidenceScore($description, $candidate) : 0;
         $identityScore = ($bestTitleScore * 80) + $yearScore + $descriptionScore;
-        $alternativeIsStrong = $bestTitleSource !== 'alternative'
-            || ($bestTitleScore >= 0.9 && $yearExact && $descriptionScore >= 8);
+        $hasIndependentEvidence = $yearExact || $mediaTypeIsExplicit || $descriptionScore >= 8;
+        $isExplicitAlias = in_array($bestTitleSource, ['alternative', 'translation'], true);
+        $titleIsStrong = $bestTitleScore >= 0.9;
+        $scriptSafe = $bestComparison['script_relation'] === 'same'
+            || ($isExplicitAlias && $bestComparison['script_relation'] !== 'unavailable');
+        $compatibilitySafe = ! $bestComparison['compatibility_only'] || $hasIndependentEvidence;
+        $aliasSafe = ! $isExplicitAlias || ($bestTitleScore >= 0.9 && $hasIndependentEvidence);
+        $rejectionReason = null;
+        if (! $scriptSafe) {
+            $rejectionReason = match ($bestComparison['script_relation']) {
+                'mixed' => 'mixed_script_identity_rejected',
+                'unavailable' => 'unicode_support_unavailable',
+                default => 'explicit_alias_unavailable',
+            };
+        } elseif (! $compatibilitySafe) {
+            $rejectionReason = 'compatibility_only_identity';
+        } elseif (! $aliasSafe) {
+            $rejectionReason = 'explicit_alias_unavailable';
+        } elseif (! $descriptionCompatible && $description !== '' && $identityScore < 76.0) {
+            $rejectionReason = 'language_incompatible_description';
+        }
 
         $candidate['_media_type'] = $mediaType;
         $candidate['_identity_score'] = round($identityScore, 3);
-        $candidate['_identity_valid'] = $alternativeIsStrong;
+        $candidate['_identity_valid'] = $titleIsStrong && $scriptSafe && $compatibilitySafe && $aliasSafe;
+        $candidate['_identity_independent'] = $hasIndependentEvidence;
+        $candidate['_title_script_relation'] = $bestComparison['script_relation'];
+        $candidate['_title_evidence_source'] = $bestTitleSource;
+        $candidate['_title_evidence_provenance'] = $bestTitleProvenance;
+        $candidate['_title_compatibility_only'] = $bestComparison['compatibility_only'];
+        if ($rejectionReason !== null) {
+            $candidate['_rejection_reason'] = $rejectionReason;
+        }
 
         return $candidate;
     }
@@ -3203,10 +4566,86 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
     private function normalizeIdentityText(string $value): string
     {
-        $normalized = mb_strtolower(trim($value));
-        $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
+        $normalized = $this->unicodeComparisonKey($value);
 
-        return trim(preg_replace('/\s+/', ' ', $normalized));
+        return $normalized ?? '';
+    }
+
+    private function unicodeComparisonKey(string $value): ?string
+    {
+        if (! class_exists(\Normalizer::class)
+            || ! function_exists('mb_convert_case')
+            || ! defined('MB_CASE_FOLD')) {
+            return null;
+        }
+
+        $normalized = \Normalizer::normalize(trim($value), \Normalizer::FORM_C);
+        if (! is_string($normalized)) {
+            return null;
+        }
+        $normalized = mb_convert_case($normalized, MB_CASE_FOLD, 'UTF-8');
+        $normalized = \Normalizer::normalize($normalized, \Normalizer::FORM_C);
+        if (! is_string($normalized)) {
+            return null;
+        }
+        $normalized = preg_replace('/[^\p{L}\p{M}\p{N}]+/u', ' ', $normalized);
+        if (! is_string($normalized)) {
+            return null;
+        }
+
+        return trim(preg_replace('/\s+/u', ' ', $normalized) ?? '');
+    }
+
+    private function canonicalCaseFold(string $value): ?string
+    {
+        return $this->unicodeCaseFold($value, false);
+    }
+
+    private function compatibilityCaseFold(string $value): ?string
+    {
+        return $this->unicodeCaseFold($value, true);
+    }
+
+    private function unicodeCaseFold(string $value, bool $compatibility): ?string
+    {
+        if (! class_exists(\Normalizer::class)
+            || ! function_exists('mb_convert_case')
+            || ! defined('MB_CASE_FOLD')) {
+            return null;
+        }
+        $normalized = \Normalizer::normalize(
+            trim($value),
+            $compatibility ? \Normalizer::FORM_KC : \Normalizer::FORM_C,
+        );
+        if (! is_string($normalized)) {
+            return null;
+        }
+        $folded = mb_convert_case($normalized, MB_CASE_FOLD, 'UTF-8');
+        $folded = \Normalizer::normalize($folded, \Normalizer::FORM_C);
+
+        return is_string($folded) ? $folded : null;
+    }
+
+    private function isCompleteTitlePrefix(string $searchTitle, string $candidateTitle): bool
+    {
+        $searchTitle = $this->canonicalCaseFold($searchTitle);
+        $candidateTitle = $this->canonicalCaseFold($candidateTitle);
+        if ($searchTitle === null || $candidateTitle === null) {
+            return false;
+        }
+        $candidateIdentity = $this->normalizeIdentityText($candidateTitle);
+        if (! $this->isSubstantialIdentityBase($candidateIdentity)
+            || ! str_starts_with($searchTitle, $candidateTitle)) {
+            return false;
+        }
+
+        $suffix = mb_substr($searchTitle, mb_strlen($candidateTitle));
+        if ($suffix === '') {
+            return false;
+        }
+
+        return preg_match('/[!?]$/u', $candidateTitle) === 1
+            && preg_match('/^\s+\S/u', $suffix) === 1;
     }
 
     private function hasValidTmdbDetailsShape(array $tmdbData, string $mediaType): bool
@@ -3263,7 +4702,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         foreach ($schema as $field => $type) {
             $value = $tmdbData[$field];
             $valid = match ($type) {
-                'positive-int' => is_int($value) && $value > 0,
+                'positive-int' => is_int($value) && $value > 0 && $value <= 2147483647,
                 'media-type' => $value === $mediaType,
                 'int-null' => is_int($value) || $value === null,
                 'string' => is_string($value),
@@ -3306,6 +4745,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return false;
         }
 
+        $matchEvidence = $tmdbData['_match_evidence'] ?? null;
+        if ($matchEvidence !== null && ! $this->isValidTmdbMatchEvidence($matchEvidence)) {
+            return false;
+        }
+        unset($tmdbData['_match_evidence']);
+
         $mediaType = $tmdbData['_media_type'] ?? null;
         if (is_string($mediaType)
             && $this->hasValidTmdbDetailsShape($tmdbData, $mediaType)) {
@@ -3316,7 +4761,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || ($tmdbData['_runtime_trusted_legacy'] ?? null) !== true
             || ! in_array($mediaType, ['tv', 'movie'], true)
             || ! is_int($tmdbData['tmdb_id'] ?? null)
-            || $tmdbData['tmdb_id'] <= 0) {
+            || $tmdbData['tmdb_id'] <= 0
+            || $tmdbData['tmdb_id'] > 2147483647) {
             return false;
         }
 
@@ -3329,6 +4775,74 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return true;
+    }
+
+    private function isValidTmdbMatchEvidence(mixed $evidence): bool
+    {
+        if (! is_array($evidence)
+            || ! is_string($evidence['reason'] ?? null)
+            || ! array_key_exists('score', $evidence)
+            || ! array_key_exists('margin', $evidence)
+            || ! array_key_exists('media_type', $evidence)) {
+            return false;
+        }
+        if (($evidence['score'] !== null && ! is_numeric($evidence['score']))
+            || ($evidence['margin'] !== null && ! is_numeric($evidence['margin']))
+            || ($evidence['media_type'] !== null && ! in_array($evidence['media_type'], ['tv', 'movie'], true))) {
+            return false;
+        }
+        foreach (['selected_candidate_fingerprint', 'runner_up_candidate_fingerprint'] as $field) {
+            if (isset($evidence[$field])
+                && (! is_string($evidence[$field]) || preg_match('/^[a-f0-9]{64}$/', $evidence[$field]) !== 1)) {
+                return false;
+            }
+        }
+        if (isset($evidence['selected_title_provenance'])
+            && ! $this->isValidSelectedTitleProvenance($evidence['selected_title_provenance'])) {
+            return false;
+        }
+
+        return array_diff(array_keys($evidence), [
+            'reason',
+            'score',
+            'margin',
+            'media_type',
+            'selected_candidate_fingerprint',
+            'runner_up_candidate_fingerprint',
+            'selected_title_provenance',
+        ]) === [];
+    }
+
+    private function isValidSelectedTitleProvenance(mixed $provenance): bool
+    {
+        if (! is_array($provenance)
+            || ! in_array($provenance['source'] ?? null, ['localized', 'original', 'alternative', 'translation'], true)) {
+            return false;
+        }
+        $allowed = match ($provenance['source']) {
+            'localized', 'original' => ['source'],
+            'alternative' => ['source', 'region', 'type'],
+            'translation' => ['source', 'language', 'region'],
+        };
+        if (array_diff(array_keys($provenance), $allowed) !== []
+            || array_diff($allowed, array_keys($provenance)) !== []) {
+            return false;
+        }
+        if (in_array($provenance['source'], ['localized', 'original'], true)) {
+            return true;
+        }
+        $region = $provenance['region'];
+        if ($region !== null && (! is_string($region) || ! $this->isSupportedTmdbRegion($region))) {
+            return false;
+        }
+        if ($provenance['source'] === 'translation') {
+            return is_string($provenance['language'])
+                && preg_match('/^[a-z]{2}$/D', $provenance['language']) === 1;
+        }
+        $type = $provenance['type'];
+
+        return is_string($region)
+            && ($type === null || (is_string($type) && preg_match('/^[\p{L}\p{N} _-]{1,32}$/uD', $type) === 1));
     }
 
     /**
@@ -3397,17 +4911,31 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *   "sturm der liebe"  vs "Fanaa"             → ~0.0 (no match)
      *   "tatort"           vs "Tatort"             → 1.0  (exact)
      */
-    private function titleMatchScore(string $searchNorm, string $tmdbTitle): float
+    /** @return array{score: float, compatibility_only: bool, script_relation: string} */
+    private function titleComparisonResult(string $searchTitle, string $tmdbTitle): array
     {
-        $tmdbNorm = mb_strtolower(trim($tmdbTitle));
+        $searchNorm = $this->normalizeIdentityText($searchTitle);
+        $tmdbNorm = $this->normalizeIdentityText($tmdbTitle);
+        $searchCanonical = $this->canonicalCaseFold($searchTitle);
+        $tmdbCanonical = $this->canonicalCaseFold($tmdbTitle);
 
-        if ($searchNorm === '' || $tmdbNorm === '') {
-            return 0.0;
+        if ($searchNorm === '' || $tmdbNorm === '' || $searchCanonical === null || $tmdbCanonical === null) {
+            return ['score' => 0.0, 'compatibility_only' => false, 'script_relation' => 'unavailable'];
         }
 
-        // Exact match
-        if ($searchNorm === $tmdbNorm) {
-            return 1.0;
+        $scriptRelation = $this->titleScriptRelation($searchNorm, $tmdbNorm);
+        if ($searchCanonical === $tmdbCanonical) {
+            return ['score' => 1.0, 'compatibility_only' => false, 'script_relation' => $scriptRelation];
+        }
+        if ($scriptRelation !== 'same') {
+            return ['score' => 0.0, 'compatibility_only' => false, 'script_relation' => $scriptRelation];
+        }
+
+        $searchCompatibility = $this->compatibilityCaseFold($searchTitle);
+        $tmdbCompatibility = $this->compatibilityCaseFold($tmdbTitle);
+        if (($searchCompatibility !== null && $searchCompatibility === $tmdbCompatibility)
+            || $searchNorm === $tmdbNorm) {
+            return ['score' => 0.95, 'compatibility_only' => true, 'script_relation' => 'same'];
         }
 
         // Containment: one title fully contains the other as a substring.
@@ -3417,7 +4945,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (str_contains($tmdbNorm, $searchNorm) || str_contains($searchNorm, $tmdbNorm)) {
             $ratio = min(mb_strlen($searchNorm), mb_strlen($tmdbNorm)) / max(mb_strlen($searchNorm), mb_strlen($tmdbNorm));
             if ($ratio >= 0.3) {
-                return max(0.6, $ratio);
+                return ['score' => max(0.6, $ratio), 'compatibility_only' => false, 'script_relation' => 'same'];
             }
             // Very short substring in very long title; fall through to token matching
         }
@@ -3430,14 +4958,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $tmdbTokens = preg_split('/[\s\-:.,]+/u', $tmdbNorm, -1, PREG_SPLIT_NO_EMPTY);
 
         if (empty($searchTokens) || empty($tmdbTokens)) {
-            return 0.0;
+            return ['score' => 0.0, 'compatibility_only' => false, 'script_relation' => 'same'];
         }
 
         $significantSearch = array_values(array_filter($searchTokens, fn ($t) => mb_strlen($t) >= 2));
         $significantTmdb = array_values(array_filter($tmdbTokens, fn ($t) => mb_strlen($t) >= 2));
 
         if (empty($significantSearch) || empty($significantTmdb)) {
-            return 0.0;
+            return ['score' => 0.0, 'compatibility_only' => false, 'script_relation' => 'same'];
         }
 
         // Forward: search → TMDB
@@ -3457,13 +4985,89 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // For very short titles (1-2 words), also check overall Levenshtein
         if (count($significantSearch) <= 2 && mb_strlen($searchNorm) <= 20 && mb_strlen($tmdbNorm) <= 30) {
             $maxLen = max(mb_strlen($searchNorm), mb_strlen($tmdbNorm));
-            $dist = levenshtein($searchNorm, $tmdbNorm);
+            $dist = $this->unicodeLevenshtein($searchNorm, $tmdbNorm);
             $levScore = 1.0 - ($dist / $maxLen);
 
-            return max($tokenScore, $levScore);
+            return ['score' => max($tokenScore, $levScore), 'compatibility_only' => false, 'script_relation' => 'same'];
         }
 
-        return $tokenScore;
+        return ['score' => $tokenScore, 'compatibility_only' => false, 'script_relation' => 'same'];
+    }
+
+    private function titleScriptRelation(string $left, string $right): string
+    {
+        $leftScripts = $this->unicodeScripts($left);
+        $rightScripts = $this->unicodeScripts($right);
+        if ($leftScripts === ['Unavailable'] || $rightScripts === ['Unavailable']) {
+            return 'unavailable';
+        }
+        if (count($leftScripts) > 1 || count($rightScripts) > 1) {
+            return 'mixed';
+        }
+
+        return $leftScripts === $rightScripts ? 'same' : 'cross';
+    }
+
+    /** @return array<int, string> */
+    private function unicodeScripts(string $value): array
+    {
+        if (! class_exists(\IntlChar::class)) {
+            return ['Unavailable'];
+        }
+        $scripts = [];
+        $characters = preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY);
+        foreach (is_array($characters) ? $characters : [] as $character) {
+            if (preg_match('/[\p{L}\p{N}]/u', $character) !== 1) {
+                continue;
+            }
+            $scriptValue = \IntlChar::getIntPropertyValue($character, \IntlChar::PROPERTY_SCRIPT);
+            $script = \IntlChar::getPropertyValueName(
+                \IntlChar::PROPERTY_SCRIPT,
+                $scriptValue,
+                \IntlChar::LONG_PROPERTY_NAME,
+            );
+            if (is_string($script) && ! in_array($script, ['Common', 'Inherited', 'Unknown'], true)) {
+                $scripts[$script] = true;
+            }
+        }
+        if (isset($scripts['Hiragana']) || isset($scripts['Katakana'])) {
+            unset($scripts['Han'], $scripts['Hiragana'], $scripts['Katakana']);
+            $scripts['Japanese'] = true;
+        } elseif (isset($scripts['Hangul'])) {
+            unset($scripts['Han'], $scripts['Hangul']);
+            $scripts['Korean'] = true;
+        }
+        $scripts = array_keys($scripts);
+        sort($scripts);
+
+        return $scripts;
+    }
+
+    private function unicodeLevenshtein(string $left, string $right): int
+    {
+        $leftCharacters = preg_split('//u', $left, -1, PREG_SPLIT_NO_EMPTY);
+        $rightCharacters = preg_split('//u', $right, -1, PREG_SPLIT_NO_EMPTY);
+        if (! is_array($leftCharacters) || ! is_array($rightCharacters)) {
+            return max(mb_strlen($left), mb_strlen($right));
+        }
+        if (count($leftCharacters) > 80 || count($rightCharacters) > 80) {
+            return max(count($leftCharacters), count($rightCharacters));
+        }
+
+        $previous = range(0, count($rightCharacters));
+        foreach ($leftCharacters as $leftIndex => $leftCharacter) {
+            $current = [$leftIndex + 1];
+            foreach ($rightCharacters as $rightIndex => $rightCharacter) {
+                $current[] = min(
+                    $current[$rightIndex] + 1,
+                    $previous[$rightIndex + 1] + 1,
+                    $previous[$rightIndex] + ($leftCharacter === $rightCharacter ? 0 : 1),
+                );
+            }
+            $previous = $current;
+        }
+
+        return $previous[count($rightCharacters)];
     }
 
     /**
@@ -3483,7 +5087,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 // e.g. "grand" vs "gran", "hotel" vs "hôtel"
                 if (mb_strlen($token) >= 4 && mb_strlen($candidate) >= 4) {
                     $maxLen = max(mb_strlen($token), mb_strlen($candidate));
-                    if (levenshtein($token, $candidate) <= max(1, (int) ($maxLen * 0.2))) {
+                    if ($this->unicodeLevenshtein($token, $candidate) <= max(1, (int) ($maxLen * 0.2))) {
                         $matches++;
 
                         break;
@@ -3526,7 +5130,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function detectSeriesSignals(array $programme): array
     {
-        $subtitle = trim((string) ($programme['subtitle'] ?? ''));
         $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
 
         $season = null;
@@ -3551,35 +5154,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($season === null && $episode === null) {
             [$season, $episode] = $this->parseSeasonEpisode($episodeNum);
         }
-        $seFromText = false;
-        if ($season === null && $episode === null) {
-            $haystack = $subtitle.' '.trim((string) ($programme['desc'] ?? ''));
-            if (trim($haystack) !== '') {
-                [$season, $episode] = $this->parseSeasonEpisodeFromText($haystack);
-                if ($season !== null || $episode !== null) {
-                    $seFromText = true;
-                }
-            }
-        }
-
-        $hasSubtitle = $subtitle !== '';
         $hasParsedEpisode = $season !== null || $episode !== null;
-        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH|MV|SP)\d+/i', $episodeNum);
-
-        $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
-
-        $confidence = 'none';
-        if ($hasSubtitle && ($hasParsedEpisode || $hasEpisodicProviderId) && ! $seFromText) {
-            $confidence = 'high';
-        } elseif ($isSeriesEpisode) {
-            $confidence = 'medium';
-        }
 
         return [
-            'is_series_episode' => $isSeriesEpisode,
+            'is_series_episode' => $hasParsedEpisode,
             'season' => $season,
             'episode' => $episode,
-            'confidence' => $confidence,
+            'confidence' => $hasParsedEpisode ? 'high' : 'none',
         ];
     }
 
@@ -3601,54 +5182,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         // On-screen formats: S01E02, 1x02
-        if (preg_match('/s(\d{1,2})\s*e(\d{1,3})/i', $value, $m)) {
+        if (preg_match('/^s(\d{1,2})\s*e(\d{1,3})$/D', $value, $m)) {
             return [(int) $m[1], (int) $m[2]];
         }
-        if (preg_match('/(\d{1,2})x(\d{1,3})/', $value, $m)) {
+        if (preg_match('/^(\d{1,2})x(\d{1,3})$/D', $value, $m)) {
             return [(int) $m[1], (int) $m[2]];
-        }
-
-        // Localized wording: Staffel 3 Folge 12 / Folge 12
-        if (preg_match('/staffel\s*(\d{1,2}).{0,12}(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/u', $value, $m)) {
-            return [(int) $m[1], (int) $m[2]];
-        }
-        if (preg_match('/(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/u', $value, $m)) {
-            return [null, (int) $m[1]];
-        }
-
-        return [null, null];
-    }
-
-    /**
-     * Parse season/episode from arbitrary text (subtitle/desc) covering DE/EN/ES/FR markers.
-     *
-     * @return array{0: int|null, 1: int|null}
-     */
-    private function parseSeasonEpisodeFromText(string $text): array
-    {
-        $value = mb_strtolower(trim($text));
-        if ($value === '') {
-            return [null, null];
-        }
-
-        $patterns = [
-            '/\bs(\d{1,2})\s?e(\d{1,3})\b/i',
-            '/\b(\d{1,2})x(\d{1,3})\b/',
-            '/\bstaffel\s*(\d{1,2})[\s,.\-]+(?:folge|episode|ep\.?|teil)\s*(\d{1,3})/iu',
-            '/\btemporada\s*(\d{1,2})[\s,.\-]+(?:cap[ií]tulo|episodio|ep\.?)\s*(\d{1,3})/iu',
-            '/\bseason\s*(\d{1,2})[\s,.\-]+episode\s*(\d{1,3})/i',
-            '/\bsaison\s*(\d{1,2})[\s,.\-]+(?:[ée]pisode|ep\.?)\s*(\d{1,3})/iu',
-            '/\bt(\d{1,2})\s*[\.\-x]\s*e?(\d{1,3})/i',
-        ];
-
-        foreach ($patterns as $pattern) {
-            if (preg_match($pattern, $value, $m)) {
-                return [(int) $m[1], (int) $m[2]];
-            }
-        }
-
-        if (preg_match('/(?:folge|episode|ep\.?|teil|cap[ií]tulo|episodio)\s*(\d{1,3})/iu', $value, $m)) {
-            return [null, (int) $m[1]];
         }
 
         return [null, null];
@@ -3716,22 +5254,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Detect known series-franchise keywords in programme titles.
-     */
-    private function hasEpisodicTitleKeyword(string $title): bool
-    {
-        $titleLower = mb_strtolower($title);
-
-        foreach (self::EPISODIC_TITLE_KEYWORDS as $keyword) {
-            if (str_contains($titleLower, $keyword)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
      * Resolve episode details from TMDB by season/episode, using cached season payloads.
      *
      * @param  array<string, array|null>  $seasonCache
@@ -3795,8 +5317,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $language = $settings->tmdb_language ?? 'de-DE';
 
             return ['key' => $key, 'language' => $language];
-        } catch (\Throwable $e) {
-            Log::warning('[EpgEnricher] Failed to resolve TMDB credentials', ['error' => $e->getMessage()]);
+        } catch (\Throwable) {
+            Log::warning('[EpgEnricher] Failed to resolve TMDB credentials', ['reason' => 'configuration_unavailable']);
 
             return null;
         }
