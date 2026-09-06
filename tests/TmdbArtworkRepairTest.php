@@ -118,7 +118,7 @@ namespace App\Services {
             $this->tvSearches++;
 
             return match ($this->scenario) {
-                'long-walk' => [
+                'long-walk', 'long-walk-unsafe-art' => [
                     'tmdb_id' => 100,
                     'name' => 'The Long Walk',
                     'original_name' => 'The Long Walk',
@@ -201,6 +201,11 @@ namespace App\Services {
             $details = match ($this->scenario) {
                 'long-walk' => [
                     'overview' => 'An unrelated reality competition.',
+                    'poster_url' => 'https://image.tmdb.org/t/p/w500/tv-poster.jpg',
+                    'backdrop_url' => 'https://image.tmdb.org/t/p/original/tv-backdrop.jpg',
+                ],
+                'long-walk-unsafe-art' => [
+                    'overview' => 'An unrelated reality competition.',
                     'poster_url' => 'https://fixture.invalid/tv-poster.jpg',
                     'backdrop_url' => 'https://fixture.invalid/tv-backdrop.jpg',
                 ],
@@ -275,7 +280,7 @@ namespace App\Services {
             $this->movieSearches++;
 
             return match ($this->scenario) {
-                'long-walk' => [
+                'long-walk', 'long-walk-unsafe-art' => [
                     'tmdb_id' => 200,
                     'title' => 'The Long Walk',
                     'original_title' => 'The Long Walk',
@@ -358,6 +363,13 @@ namespace App\Services {
             $details = match ($this->scenario) {
                 'long-walk' => [
                     'overview' => 'In a deadly annual contest, young men must keep walking.',
+                    'poster_url' => 'https://image.tmdb.org/t/p/w500/movie-poster.jpg',
+                    'backdrop_url' => 'https://image.tmdb.org/t/p/original/movie-backdrop.jpg',
+                    'cast' => ['Cooper Hoffman', 'David Jonsson'],
+                    'director' => ['Francis Lawrence'],
+                ],
+                'long-walk-unsafe-art' => [
+                    'overview' => 'In a deadly annual contest, young men must keep walking.',
                     'poster_url' => 'https://fixture.invalid/movie-poster.jpg',
                     'backdrop_url' => 'https://fixture.invalid/movie-backdrop.jpg',
                     'cast' => ['Cooper Hoffman', 'David Jonsson'],
@@ -365,8 +377,8 @@ namespace App\Services {
                 ],
                 'illuminati' => [
                     'overview' => 'Robert Langdon investigates a threat against the Vatican.',
-                    'poster_url' => 'https://fixture.invalid/illuminati-poster.jpg',
-                    'backdrop_url' => 'https://fixture.invalid/illuminati-backdrop.jpg',
+                    'poster_url' => 'https://image.tmdb.org/t/p/w500/illuminati-poster.jpg',
+                    'backdrop_url' => 'https://image.tmdb.org/t/p/original/illuminati-backdrop.jpg',
                     'cast' => ['Tom Hanks', 'Ewan McGregor', 'Ayelet Zurer'],
                     'director' => ['Ron Howard'],
                 ],
@@ -445,7 +457,7 @@ namespace App\Services {
             $this->movieAlternativeRequests++;
 
             return match ($this->scenario) {
-                'long-walk' => [['title' => 'The Long Walk - Der Todesmarsch', 'iso_3166_1' => 'DE']],
+                'long-walk', 'long-walk-unsafe-art' => [['title' => 'The Long Walk - Der Todesmarsch', 'iso_3166_1' => 'DE']],
                 'illuminati' => [['title' => 'Illuminati', 'iso_3166_1' => 'DE']],
                 default => [],
             };
@@ -502,6 +514,7 @@ namespace App\Services {
             private bool $throwOnTvAlternativeTitles = false,
             private bool $throwOnTvTranslations = false,
             private bool $returnSoleCandidates = false,
+            private array $seasons = [],
         ) {
             parent::__construct('candidate-api');
         }
@@ -562,6 +575,13 @@ namespace App\Services {
             $this->movieDetailsRequests++;
 
             return $this->movieDetails[$tmdbId] ?? null;
+        }
+
+        public function getSeasonDetails(int $tmdbId, int $season): ?array
+        {
+            $this->seasonRequests++;
+
+            return $this->seasons[$tmdbId.':'.$season] ?? null;
         }
 
         public function getTvAlternativeTitles(int $tmdbId): array
@@ -767,6 +787,8 @@ namespace Tests {
     $searchMethod->setAccessible(true);
     $sanitizeTmdbCacheMethod = $reflection->getMethod('sanitizeTmdbCache');
     $sanitizeTmdbCacheMethod->setAccessible(true);
+    $trustedTmdbImageUrlMethod = $reflection->getMethod('isTrustedTmdbImageUrl');
+    $trustedTmdbImageUrlMethod->setAccessible(true);
     $detectSeriesSignalsMethod = $reflection->getMethod('detectSeriesSignals');
     $detectSeriesSignalsMethod->setAccessible(true);
 
@@ -2147,14 +2169,137 @@ namespace Tests {
     $longWalkTmdb = new TmdbService('long-walk');
     $longWalkResult = enrich($plugin, $method, $longWalk, $longWalkTmdb, $longWalkCache);
 
-    assertSameValue('https://fixture.invalid/movie-backdrop.jpg', $longWalk['icon'], 'Movie backdrop should repair an untrusted provider icon.');
+    $legacyUnsafePosterPrimary = [
+        'title' => 'The Long Walk - Der Todesmarsch',
+        'date' => '2025',
+        'desc' => 'USA 2025. Bei einem Todesmarsch darf niemand stehen bleiben.',
+        'category' => 'Movie',
+    ];
+    $legacyUnsafePosterPrimaryCache = [];
+    $legacyUnsafePosterPrimarySeasonCache = [];
+    $legacyUnsafePosterPrimaryImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $legacyUnsafePosterPrimary,
+        new TmdbService('long-walk-unsafe-art'),
+        $legacyUnsafePosterPrimaryCache,
+        ['primary_artwork' => 'poster', 'overwrite_artwork' => 'replace'],
+        $legacyUnsafePosterPrimarySeasonCache,
+        $legacyUnsafePosterPrimaryImagesCache,
+        false,
+        true,
+    );
+    assertSameValue(null, $legacyUnsafePosterPrimary['icon'] ?? null, 'Legacy TMDB poster-first mode must not promote an untrusted TMDB poster.');
+    assertSameValue([], $legacyUnsafePosterPrimary['images'] ?? [], 'Legacy TMDB poster and backdrop URLs must not be serialized when untrusted.');
+    assertSameValue([], array_filter($legacyUnsafePosterPrimaryCache, fn (mixed $value): bool => is_array($value) && (($value['poster_url'] ?? null) !== null || ($value['backdrop_url'] ?? null) !== null)), 'Legacy runtime cache entries must not retain rejected artwork URLs.');
+
+    foreach ([
+        'http scheme' => 'http://image.tmdb.org/t/p/w500/art.jpg',
+        'lookalike host' => 'https://image.tmdb.org.invalid/t/p/w500/art.jpg',
+        'explicit port' => 'https://image.tmdb.org:443/t/p/w500/art.jpg',
+        'userinfo' => 'https://user@image.tmdb.org/t/p/w500/art.jpg',
+        'query' => 'https://image.tmdb.org/t/p/w500/art.jpg?token=fixture',
+        'fragment' => 'https://image.tmdb.org/t/p/w500/art.jpg#fixture',
+        'relative path' => '/t/p/w500/art.jpg',
+        'malformed URL' => 'https://image.tmdb.org:invalid/t/p/w500/art.jpg',
+        'whitespace URL' => 'https://image.tmdb.org/t/p/w500/art image.jpg',
+    ] as $label => $url) {
+        assertSameValue(false, $trustedTmdbImageUrlMethod->invoke($plugin, $url), 'TMDB '.$label.' must be rejected for poster, backdrop, and episode-still output.');
+    }
+    assertSameValue(true, $trustedTmdbImageUrlMethod->invoke($plugin, 'https://image.tmdb.org/t/p/w500/art.jpg'), 'A canonical TMDB image URL must remain accepted.');
+
+    $modernUnsafeArtwork = [
+        'title' => 'Modern Unsafe Artwork',
+        'date' => '2024',
+        'icon' => 'http://provider.invalid/protected.jpg',
+        'images' => [[
+            'url' => 'http://provider.invalid/protected.jpg',
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+            'source' => 'schedules_direct',
+        ]],
+    ];
+    $modernUnsafeArtworkCache = [];
+    $modernUnsafeArtworkTmdb = new CandidateTmdbService(
+        movieCandidates: [[
+            'tmdb_id' => 741,
+            'title' => 'Modern Unsafe Artwork',
+            'original_title' => 'Modern Unsafe Artwork',
+            'original_language' => 'en',
+            'release_date' => '2024-01-01',
+            'overview' => '',
+        ]],
+        movieDetails: [741 => normalizedMovieDetailsFixture(
+            741,
+            'Modern Unsafe Artwork',
+            posterUrl: 'https://attacker.invalid/poster.jpg',
+            backdropUrl: 'https://attacker.invalid/backdrop.jpg',
+        )],
+    );
+    enrich($plugin, $method, $modernUnsafeArtwork, $modernUnsafeArtworkTmdb, $modernUnsafeArtworkCache, ['overwrite_artwork' => 'replace'], overwrite: true);
+    assertSameValue('http://provider.invalid/protected.jpg', $modernUnsafeArtwork['icon'] ?? null, 'Invalid modern TMDB art must not replace trusted provider HTTP artwork.');
+    assertSameValue([], $modernUnsafeArtworkCache, 'Invalid modern TMDB artwork must not be cached.');
+
+    $unsafeStill = [
+        'title' => 'Unsafe Still',
+        'episode_num' => '0.0',
+    ];
+    $unsafeStillCache = [];
+    $unsafeStillSeasonCache = [];
+    $unsafeStillImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $unsafeStill,
+        new CandidateTmdbService(
+            tvCandidates: [[
+                'tmdb_id' => 742,
+                'name' => 'Unsafe Still',
+                'original_name' => 'Unsafe Still',
+                'original_language' => 'en',
+                'first_air_date' => '2024-01-01',
+                'overview' => '',
+            ]],
+            tvDetails: [742 => normalizedTvDetailsFixture(742, 'Unsafe Still', backdropUrl: 'https://image.tmdb.org/t/p/original/safe-backdrop.jpg')],
+            seasons: ['742:1' => ['episodes' => [[
+                'episode_number' => 1,
+                'overview' => '',
+                'still_path' => 'https://attacker.invalid/episode.jpg',
+            ]]],],
+        ),
+        $unsafeStillCache,
+        [],
+        $unsafeStillSeasonCache,
+        $unsafeStillImagesCache,
+        true,
+    );
+    assertSameValue(false, in_array('https://attacker.invalid/episode.jpg', array_column($unsafeStill['images'] ?? [], 'url'), true), 'Unsafe episode still URLs must not be emitted from a warm season-cache path.');
+
+    $persistedUnsafeTmdbArtwork = [
+        'title' => 'Persisted Artwork Repair',
+        'icon' => 'https://attacker.invalid/persisted.jpg',
+        'images' => [
+            ['url' => 'https://attacker.invalid/persisted.jpg', 'type' => 'backdrop', 'source' => 'tmdb', 'orient' => 'L'],
+            ['url' => 'https://provider.invalid/preserved.jpg', 'type' => 'fanart', 'source' => 'schedules_direct', 'scope' => 'programme', 'orient' => 'L', 'width' => 1920, 'height' => 1080],
+        ],
+    ];
+    $persistedUnsafeTmdbArtworkCache = [];
+    enrich($plugin, $method, $persistedUnsafeTmdbArtwork, new CandidateTmdbService(), $persistedUnsafeTmdbArtworkCache);
+    assertSameValue('https://provider.invalid/preserved.jpg', $persistedUnsafeTmdbArtwork['icon'] ?? null, 'Persisted unsafe TMDB artwork must be removed without erasing valid provider artwork.');
+
+    assertSameValue('https://image.tmdb.org/t/p/original/movie-backdrop.jpg', $longWalk['icon'], 'Movie backdrop should repair an untrusted provider icon.');
     assertSameValue(
         [
+            'https://image.tmdb.org/t/p/original/movie-backdrop.jpg',
             'https://fixture.invalid/movie-backdrop.jpg',
-            'https://fixture.invalid/movie-poster.jpg',
+            'https://image.tmdb.org/t/p/w500/movie-poster.jpg',
             'https://provider.invalid/unknown.jpg',
             'https://provider.invalid/logo.png',
-            'https://fixture.invalid/movie-backdrop.jpg',
+            'https://image.tmdb.org/t/p/original/movie-backdrop.jpg',
         ],
         array_column($longWalk['images'], 'url'),
         'A movie primary should bracket secondary artwork for first- and last-icon consumers.'
@@ -2163,7 +2308,7 @@ namespace Tests {
     assertSameValue('tmdb', $longWalk['images'][0]['source'] ?? null, 'TMDB provenance should win deduplication over an unprovenanced record with the same URL and role.');
     assertSameValue($longWalk['icon'], $longWalk['images'][array_key_last($longWalk['images'])]['url'], 'The terminal movie image should duplicate the selected primary URL.');
     assertSameValue('backdrop', $longWalk['images'][array_key_last($longWalk['images'])]['type'], 'The terminal movie primary duplicate should retain its image type.');
-    assertTrueValue(in_array('https://fixture.invalid/movie-poster.jpg', array_column($longWalk['images'], 'url'), true), 'Portrait poster should remain in images.');
+    assertTrueValue(in_array('https://image.tmdb.org/t/p/w500/movie-poster.jpg', array_column($longWalk['images'], 'url'), true), 'Portrait poster should remain in images.');
     assertTrueValue($longWalkResult['changed'], 'Artwork repair should report a changed programme.');
 
     $stableLongWalk = json_encode($longWalk, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -2196,7 +2341,7 @@ namespace Tests {
         enrich($plugin, $method, $conflictingArtwork, $conflictingTmdb, $conflictingCache);
 
         assertSameValue(
-            'https://fixture.invalid/movie-backdrop.jpg',
+            'https://image.tmdb.org/t/p/original/movie-backdrop.jpg',
             $conflictingArtwork['icon'],
             ucfirst($geometry).' fanart with conflicting geometry should be repaired by the TMDB backdrop.'
         );
@@ -2216,7 +2361,7 @@ namespace Tests {
         'icon' => 'https://provider.invalid/illuminati-unknown.jpg',
     ];
     enrich($plugin, $method, $illuminati, $illuminatiTmdb, $illuminatiCache);
-    assertSameValue('https://fixture.invalid/illuminati-backdrop.jpg', $illuminati['icon'], 'Strong German alternative-title evidence should match Angels & Demons.');
+    assertSameValue('https://image.tmdb.org/t/p/original/illuminati-backdrop.jpg', $illuminati['icon'], 'Strong German alternative-title evidence should match Angels & Demons.');
 
     $weakIlluminati = [
         'title' => 'Illuminati',
@@ -2226,7 +2371,7 @@ namespace Tests {
         'icon' => 'https://provider.invalid/weak-unknown.jpg',
     ];
     enrich($plugin, $method, $weakIlluminati, $illuminatiTmdb, $illuminatiCache);
-    assertSameValue('https://fixture.invalid/illuminati-backdrop.jpg', $weakIlluminati['icon'], 'A tagged alternative title may use exact release year as independent evidence without description overlap.');
+    assertSameValue('https://image.tmdb.org/t/p/original/illuminati-backdrop.jpg', $weakIlluminati['icon'], 'A tagged alternative title may use exact release year as independent evidence without description overlap.');
     assertSameValue('selected', $weakIlluminati['tmdb_decision']['result'] ?? null, 'Year-corroborated alternative-title selection must retain selected evidence.');
     assertSameValue(2, count($illuminatiCache), 'Distinct successful description-sensitive identities should remain isolated in cache.');
 
@@ -2683,7 +2828,7 @@ namespace Tests {
     $providerCache = [];
     $providerTmdb = new TmdbService('long-walk');
     $providerResult = enrich($plugin, $method, $provider, $providerTmdb, $providerCache);
-    assertSameValue('https://fixture.invalid/movie-backdrop.jpg', $provider['icon'], 'Unscoped landscape branding should be repaired by validated TMDB artwork.');
+    assertSameValue('https://image.tmdb.org/t/p/original/movie-backdrop.jpg', $provider['icon'], 'Unscoped landscape branding should be repaired by validated TMDB artwork.');
     assertTrueValue($providerTmdb->tvSearches + $providerTmdb->movieSearches > 0, 'Unscoped complete metadata should not retain the no-op fast path.');
     assertSameValue(true, $providerResult['changed'], 'Unscoped artwork repair should report a change.');
 

@@ -1667,6 +1667,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return $result;
         }
 
+        if ($this->removeUntrustedTmdbProgrammeArtwork($programme)) {
+            $result['changed'] = true;
+        }
+
         // Check if programme already has all data we'd enrich
         // (e.g. from Schedules Direct / Gracenote during EPG cache generation)
         $categoryValue = $programme['category'] ?? '';
@@ -1910,6 +1914,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             if ($tmdbData !== null) {
+                $this->sanitizeTmdbArtworkUrls($tmdbData);
                 $tmdbData['_match_evidence'] = $matchEvidence;
                 // Preserve successful evidence-specific identities. Abstentions are retried
                 // because a transient candidate error must not become a durable cache miss.
@@ -1968,7 +1973,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         // Enrich poster/icon
-        $posterUrl = $tmdbData['poster_url'] ?? null;
+        $posterUrl = is_string($tmdbData['poster_url'] ?? null)
+            && $this->isTrustedTmdbImageUrl($tmdbData['poster_url'])
+            ? $tmdbData['poster_url']
+            : null;
         $backdropUrl = null;
         $mediaType = $tmdbData['_media_type'] ?? null;
 
@@ -2017,6 +2025,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         $tmdbData['backdrop_url'] ?? null,
                         $overwriteArtwork,
                     );
+                    $candidates = array_values(array_filter(
+                        $candidates,
+                        fn (array $candidate): bool => $this->isTrustedTmdbImageUrl((string) ($candidate['url'] ?? '')),
+                    ));
                     $selectedBackdrop = null;
                     foreach ($candidates as $candidate) {
                         if (($candidate['type'] ?? null) === 'backdrop') {
@@ -2106,7 +2118,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Preserve the established details fallback only when the images response has no
         // backdrop candidates. A nonempty response without vote evidence is an abstention.
         if ($enrichBackdrops && ! $hasBackdropMetadata && ! $backdropRejected) {
-            $backdropUrl = $tmdbData['backdrop_url'] ?? null;
+            $backdropUrl = is_string($tmdbData['backdrop_url'] ?? null)
+                && $this->isTrustedTmdbImageUrl($tmdbData['backdrop_url'])
+                ? $tmdbData['backdrop_url']
+                : null;
         }
 
         // The correctly matched series or movie backdrop remains the XMLTV primary.
@@ -2204,7 +2219,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
-                if ($enrichBackdrops && $stillUrl !== '') {
+                if ($enrichBackdrops && $stillUrl !== '' && $this->isTrustedTmdbImageUrl($stillUrl)) {
                     // Keep exact episode art available without replacing the trusted
                     // series or movie backdrop at the XMLTV primary boundaries.
                     $hasTmdbEpisodeStill = false;
@@ -2538,7 +2553,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ];
         }
 
-        return $out;
+        return array_values(array_filter(
+            $out,
+            fn (array $image): bool => $this->isTrustedTmdbImageUrl((string) ($image['url'] ?? '')),
+        ));
     }
 
     /**
@@ -2786,9 +2804,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
     private function tmdbImageFilePath(string $url): ?string
     {
+        if (! $this->isTrustedTmdbImageUrl($url)) {
+            return null;
+        }
         $parts = parse_url($url);
         if (! is_array($parts)
-            || strtolower((string) ($parts['host'] ?? '')) !== 'image.tmdb.org'
             || ! preg_match('#^/t/p/[^/]+(/.+)$#', (string) ($parts['path'] ?? ''), $matches)) {
             return null;
         }
@@ -4797,10 +4817,69 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $parts = parse_url($url);
 
         return is_array($parts)
+            && filter_var($url, FILTER_VALIDATE_URL) !== false
             && ($parts['scheme'] ?? null) === 'https'
             && ($parts['host'] ?? null) === 'image.tmdb.org'
-            && ! isset($parts['port'], $parts['user'], $parts['pass'], $parts['query'], $parts['fragment'])
+            && ! isset($parts['port'])
+            && ! isset($parts['user'])
+            && ! isset($parts['pass'])
+            && ! isset($parts['query'])
+            && ! isset($parts['fragment'])
             && str_starts_with((string) ($parts['path'] ?? ''), '/t/p/');
+    }
+
+    /** @param array<string, mixed> $tmdbData */
+    private function sanitizeTmdbArtworkUrls(array &$tmdbData): void
+    {
+        foreach (['poster_url', 'backdrop_url'] as $field) {
+            if (($tmdbData[$field] ?? null) !== null
+                && (! is_string($tmdbData[$field]) || ! $this->isTrustedTmdbImageUrl($tmdbData[$field]))) {
+                $tmdbData[$field] = null;
+            }
+        }
+    }
+
+    private function removeUntrustedTmdbProgrammeArtwork(array &$programme): bool
+    {
+        if (! is_array($programme['images'] ?? null)) {
+            return false;
+        }
+
+        $unsafeUrls = [];
+        $images = array_values(array_filter($programme['images'], function (mixed $image) use (&$unsafeUrls): bool {
+            if (! is_array($image)
+                || strtolower(trim((string) ($image['source'] ?? ''))) !== 'tmdb'
+                || ! is_string($image['url'] ?? null)
+                || $this->isTrustedTmdbImageUrl($image['url'])) {
+                return true;
+            }
+
+            $unsafeUrls[$image['url']] = true;
+
+            return false;
+        }));
+        if ($unsafeUrls === []) {
+            return false;
+        }
+
+        $programme['images'] = $images;
+        $icon = $programme['icon'] ?? null;
+        if (is_string($icon) && isset($unsafeUrls[$icon])) {
+            foreach ($images as $image) {
+                if (is_array($image) && ($image['url'] ?? null) === $icon) {
+                    return true;
+                }
+            }
+            unset($programme['icon']);
+            foreach ($images as $image) {
+                if (is_array($image) && $this->isTrustedLandscapeImage($image)) {
+                    $programme['icon'] = $image['url'];
+                    break;
+                }
+            }
+        }
+
+        return true;
     }
 
     private function isValidTmdbCacheEntry(mixed $tmdbData, bool $allowRuntimeLegacy = false): bool
@@ -4834,6 +4913,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             if (array_key_exists($field, $tmdbData)
                 && ! is_string($tmdbData[$field])
                 && $tmdbData[$field] !== null) {
+                return false;
+            }
+        }
+
+        foreach (['poster_url', 'backdrop_url'] as $field) {
+            if (($tmdbData[$field] ?? null) !== null
+                && ! $this->isTrustedTmdbImageUrl($tmdbData[$field])) {
                 return false;
             }
         }
@@ -5352,11 +5438,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             $stillPath = trim((string) ($episodeData['still_path'] ?? ''));
-            if ($stillPath !== '' && ! str_starts_with($stillPath, 'http')) {
+            if ($stillPath !== '' && str_starts_with($stillPath, '/')) {
                 $stillPath = "https://image.tmdb.org/t/p/original{$stillPath}";
             }
 
-            $episodeData['still_url'] = $stillPath;
+            $episodeData['still_url'] = $this->isTrustedTmdbImageUrl($stillPath) ? $stillPath : null;
 
             return $episodeData;
         }
