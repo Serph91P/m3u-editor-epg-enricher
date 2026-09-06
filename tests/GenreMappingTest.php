@@ -141,6 +141,9 @@ namespace Tests {
 
     assertTrueValue(in_array('map_genres_to_epg_categories', $settingIds, true), 'Emby compatible category option should remain available.');
     assertTrueValue(in_array('map_genres_to_kodi_guide_genres', $settingIds, true), 'Kodi guide genre option should be a separate setting.');
+    foreach (['overwrite_artwork', 'overwrite_descriptions', 'overwrite_categories', 'primary_artwork', 'allow_title_only_lookup'] as $settingId) {
+        assertTrueValue(in_array($settingId, $settingIds, true), "Issue 55 setting '{$settingId}' should remain available.");
+    }
 
     $fieldsById = [];
     foreach ($manifest['settings'] as $section) {
@@ -222,6 +225,24 @@ namespace Tests {
         $settingsHasher->invoke($plugin, ['map_emby_genres' => true]),
         'The legacy Emby setting should remain hash-compatible with the current key.'
     );
+    assertSameValue(
+        $settingsHasher->invoke($plugin, []),
+        $settingsHasher->invoke($plugin, ['overwrite_artwork' => null, 'primary_artwork' => 'invalid', 'allow_title_only_lookup' => false]),
+        'Absent, null, and invalid Issue 55 selectors should retain legacy cache identity.'
+    );
+    $legacyHash = $settingsHasher->invoke($plugin, []);
+    foreach ([
+        'overwrite_artwork' => 'replace',
+        'overwrite_descriptions' => 'replace',
+        'overwrite_categories' => 'replace',
+        'primary_artwork' => 'poster',
+        'allow_title_only_lookup' => true,
+    ] as $key => $value) {
+        assertTrueValue(
+            $legacyHash !== $settingsHasher->invoke($plugin, [$key => $value]),
+            "Effective Issue 55 setting '{$key}' must invalidate the enrichment cache."
+        );
+    }
 
     echo "Genre mapping tests passed.\n";
 }

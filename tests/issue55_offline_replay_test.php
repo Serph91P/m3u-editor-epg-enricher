@@ -148,7 +148,20 @@ namespace Tests {
         return $kind.'_'.substr(hash('sha256', $url), 0, 16);
     }
 
-    function replayManifestCase(string $id, array $programme): array
+    function replayPreviewProgrammeFields(array $programme): array
+    {
+        return [
+            'category' => replayPreviewText($programme['category'] ?? null),
+            'has_description' => trim((string) ($programme['desc'] ?? '')) !== '',
+            'primary_role' => $programme['images'][0]['type'] ?? null,
+            'secondary_roles' => array_values(array_unique(array_filter(array_map(
+                static fn (mixed $image): ?string => is_array($image) && is_string($image['type'] ?? null) ? $image['type'] : null,
+                array_slice($programme['images'] ?? [], 1),
+            )))),
+        ];
+    }
+
+    function replayManifestCase(string $id, array $programme, array $before = []): array
     {
         $decision = is_array($programme['tmdb_decision'] ?? null) ? $programme['tmdb_decision'] : [];
         $roles = array_values(array_unique(array_filter(array_map(
@@ -177,6 +190,8 @@ namespace Tests {
         return [
             'id' => $id,
             'evidence' => $evidence,
+            'before' => replayPreviewProgrammeFields($before),
+            'after' => replayPreviewProgrammeFields($programme),
             'applicability' => [
                 'class' => $decision['class'] ?? 'ambiguous_identity',
                 'result' => $decision['result'] ?? 'unmatched',
@@ -217,6 +232,8 @@ namespace Tests {
                 ."<dt>Subtitle</dt><dd>".replayHtmlEscape($evidence['subtitle'] ?? '')."</dd>"
                 ."<dt>Year</dt><dd>".replayHtmlEscape($evidence['year'] ?? '')."</dd>"
                 ."<dt>Category</dt><dd>".replayHtmlEscape($evidence['category'] ?? '')."</dd>"
+                ."<dt>Before</dt><dd>".replayHtmlEscape(json_encode($case['before'] ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE))."</dd>"
+                ."<dt>After</dt><dd>".replayHtmlEscape(json_encode($case['after'] ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE))."</dd>"
                 ."<dt>Decision</dt><dd>".replayHtmlEscape($applicability['class'] ?? '')." / ".replayHtmlEscape($applicability['result'] ?? '')." / ".replayHtmlEscape($applicability['reason'] ?? '')."</dd>"
                 ."<dt>Candidate evidence</dt><dd>".replayHtmlEscape($case['selected_candidate_fingerprint'] ?? '')." / ".replayHtmlEscape($case['runner_up_candidate_fingerprint'] ?? '')."</dd>"
                 ."<dt>Score / margin</dt><dd>".replayHtmlEscape($case['score'] ?? '')." / ".replayHtmlEscape($case['margin'] ?? '')."</dd>"
@@ -245,11 +262,20 @@ namespace Tests {
     $plugin = new Plugin();
     $method = (new ReflectionClass($plugin))->getMethod('enrichProgrammeFromTmdb');
     $method->setAccessible(true);
-    $run = static function (array $programme, ReplayTmdbService $tmdb, bool $episodes = false) use ($plugin, $method): array {
+    $run = static function (
+        array $programme,
+        ReplayTmdbService $tmdb,
+        bool $episodes = false,
+        array $options = [],
+        bool $posters = true,
+        bool $backdrops = true,
+        bool $categories = true,
+        bool $descriptions = true,
+    ) use ($plugin, $method): array {
         $cache = [];
         $seasonCache = [];
         $imagesCache = [];
-        $method->invokeArgs($plugin, [&$programme, $tmdb, &$cache, false, true, true, true, true, false, false, false, $episodes, &$seasonCache, &$imagesCache, []]);
+        $method->invokeArgs($plugin, [&$programme, $tmdb, &$cache, false, $categories, $descriptions, $posters, $backdrops, false, false, false, $episodes, &$seasonCache, &$imagesCache, $options]);
 
         return [$programme, $tmdb];
     };
@@ -280,6 +306,37 @@ namespace Tests {
     [$missingTranslation, $missingTranslationTmdb] = $run(['title' => '静かな街 (2024)', 'title_language' => 'ja-JP', 'episode_num' => '0.0'], new ReplayTmdbService([$missingTranslationCandidate], [], [], []));
     $descriptionCandidate = ['tmdb_id' => 907, 'name' => 'Signal Harborxyz', 'original_name' => 'Signal Harborxyz', 'original_language' => 'en', 'first_air_date' => '', 'overview' => 'shared lighthouse harbour mystery', 'cast' => ['Ada Person', 'Ben Person']];
     [$incompatibleDescription, $incompatibleDescriptionTmdb] = $run(['title' => 'Signal Harbor', 'title_language' => 'en-US', 'desc' => 'Ada Person and Ben Person share a lighthouse harbour mystery', 'desc_language' => 'es-ES', 'date' => '2024'], new ReplayTmdbService([$descriptionCandidate], [], [907 => tvDetails(907, 'Signal Harborxyz', 'https://image.tmdb.org/t/p/original/harbour.jpg')], []));
+    $primaryCandidate = ['tmdb_id' => 908, 'title' => 'Primary Choice', 'original_title' => 'Primary Choice', 'original_language' => 'en', 'release_date' => '2024-01-01', 'overview' => ''];
+    $primaryDetails = movieDetails(908, 'Primary Choice', 'https://image.tmdb.org/t/p/original/primary-backdrop.jpg');
+    $primaryDetails['poster_url'] = 'https://image.tmdb.org/t/p/w500/primary-poster.jpg';
+    [$posterPrimary, $posterPrimaryTmdb] = $run(['title' => 'Primary Choice', 'date' => '2024'], new ReplayTmdbService([], [$primaryCandidate], [], [908 => $primaryDetails]), false, ['primary_artwork' => 'poster', 'overwrite_artwork' => 'replace']);
+    [$posterFallback, $posterFallbackTmdb] = $run(['title' => 'Primary Choice', 'date' => '2024'], new ReplayTmdbService([], [$primaryCandidate], [], [908 => $primaryDetails]), false, ['primary_artwork' => 'poster', 'overwrite_artwork' => 'replace'], false, true);
+    [$backdropFallback, $backdropFallbackTmdb] = $run(['title' => 'Primary Choice', 'date' => '2024'], new ReplayTmdbService([], [$primaryCandidate], [], [908 => $primaryDetails]), false, ['primary_artwork' => 'backdrop', 'overwrite_artwork' => 'replace'], true, false);
+    $originalDisabledArtwork = [
+        'title' => 'Provider Artwork',
+        'icon' => 'https://provider.invalid/primary.jpg',
+        'images' => [
+            ['url' => 'https://provider.invalid/secondary.jpg', 'type' => 'poster', 'orient' => 'P'],
+            ['url' => 'https://provider.invalid/primary.jpg', 'type' => 'fanart', 'orient' => 'L', 'width' => 1920, 'height' => 1080, 'scope' => 'programme'],
+            ['url' => 'https://provider.invalid/secondary.jpg', 'type' => 'poster', 'orient' => 'P'],
+        ],
+    ];
+    [$disabledArtwork, $disabledArtworkTmdb] = $run($originalDisabledArtwork, new ReplayTmdbService([], [], [], []), false, ['overwrite_artwork' => 'replace'], false, false);
+    $titleOnlyCandidate = ['tmdb_id' => 909, 'name' => 'Unique Fixture Work', 'original_name' => 'Unique Fixture Work', 'original_language' => 'en', 'first_air_date' => '2024-01-01', 'overview' => ''];
+    [$titleOnly, $titleOnlyTmdb] = $run(['title' => 'Unique Fixture Work', 'title_language' => 'en-US'], new ReplayTmdbService([$titleOnlyCandidate], [], [909 => tvDetails(909, 'Unique Fixture Work', 'https://image.tmdb.org/t/p/original/title-only.jpg')], []), false, ['allow_title_only_lookup' => true]);
+    [$titleOnlyAmbiguous, $titleOnlyAmbiguousTmdb] = $run(['title' => 'Shared Signal', 'title_language' => 'en-US'], new ReplayTmdbService(
+        [['tmdb_id' => 911, 'name' => 'Shared Signal', 'original_name' => 'Shared Signal', 'original_language' => 'en', 'first_air_date' => '2024-01-01', 'overview' => '']],
+        [['tmdb_id' => 912, 'title' => 'Shared Signal', 'original_title' => 'Shared Signal', 'original_language' => 'en', 'release_date' => '2024-01-01', 'overview' => '']],
+        [911 => tvDetails(911, 'Shared Signal', 'https://image.tmdb.org/t/p/original/title-only-tv.jpg')],
+        [912 => movieDetails(912, 'Shared Signal', 'https://image.tmdb.org/t/p/original/title-only-movie.jpg')],
+    ), false, ['allow_title_only_lookup' => true]);
+    [$titleOnlySports, $titleOnlySportsTmdb] = $run(['title' => 'Fixture Cup Live', 'category' => 'Sports', 'title_language' => 'en-US'], new ReplayTmdbService([$titleOnlyCandidate], [], [909 => tvDetails(909, 'Unique Fixture Work', 'https://image.tmdb.org/t/p/original/title-only.jpg')], []), false, ['allow_title_only_lookup' => true]);
+    $domainDetails = movieDetails(910, 'Domain Controls', 'https://image.tmdb.org/t/p/original/domain-backdrop.jpg');
+    $domainDetails['overview'] = 'Replacement overview';
+    $domainDetails['genres'] = 'Drama';
+    $domainCandidate = ['tmdb_id' => 910, 'title' => 'Domain Controls', 'original_title' => 'Domain Controls', 'original_language' => 'en', 'release_date' => '2024-01-01', 'overview' => ''];
+    [$domainReplace, $domainReplaceTmdb] = $run(['title' => 'Domain Controls', 'date' => '2024', 'desc' => 'Provider description', 'category' => 'Provider category'], new ReplayTmdbService([], [$domainCandidate], [], [910 => $domainDetails]), false, ['overwrite_descriptions' => 'replace', 'overwrite_categories' => 'missing_only', 'overwrite_artwork' => 'missing_only'], false, false);
+    [$domainDisabled, $domainDisabledTmdb] = $run(['title' => 'Domain Controls', 'date' => '2024', 'desc' => 'Provider description', 'category' => 'Provider category'], new ReplayTmdbService([], [$domainCandidate], [], [910 => $domainDetails]), false, ['overwrite_descriptions' => 'replace', 'overwrite_categories' => 'replace'], false, false, false, false);
 
     replayAssert(($catalogue['tmdb_decision']['result'] ?? null) === 'selected' && $catalogueTmdb->tvCandidateSearches === 1, 'Catalogue normalization replay mismatch.');
     replayAssert(($ambiguous['tmdb_decision']['class'] ?? null) === 'ambiguous_identity' && $ambiguousTmdb->tvCandidateSearches === 1 && $ambiguousTmdb->movieCandidateSearches === 1, 'Global ambiguity replay mismatch.');
@@ -293,6 +350,15 @@ namespace Tests {
     replayAssert(($malformedLocale['tmdb_decision']['reason'] ?? null) === 'malformed_language_tag' && $malformedLocaleTmdb->tvCandidateSearches + $malformedLocaleTmdb->movieCandidateSearches === 0, 'Malformed locale replay mismatch.');
     replayAssert(($missingTranslation['tmdb_decision']['reason'] ?? null) === 'explicit_alias_unavailable' && $missingTranslationTmdb->tvAlternativeRequests === 1 && $missingTranslationTmdb->tvTranslationRequests === 1 && $missingTranslationTmdb->tvDetailsRequests === 0, 'Missing translation replay mismatch: '.json_encode([$missingTranslation['tmdb_decision'] ?? null, $missingTranslationTmdb->tvAlternativeRequests, $missingTranslationTmdb->tvTranslationRequests, $missingTranslationTmdb->tvDetailsRequests], JSON_UNESCAPED_UNICODE));
     replayAssert(($incompatibleDescription['tmdb_decision']['reason'] ?? null) === 'language_incompatible_description' && $incompatibleDescriptionTmdb->tvDetailsRequests === 0, 'Description-language rejection replay mismatch.');
+    replayAssert(($posterPrimary['icon'] ?? null) === 'https://image.tmdb.org/t/p/w500/primary-poster.jpg' && ($posterPrimary['images'][0]['type'] ?? null) === 'poster', 'Poster primary mode must prefer enabled work poster over backdrop.');
+    replayAssert(($posterFallback['icon'] ?? null) === 'https://image.tmdb.org/t/p/original/primary-backdrop.jpg' && ! in_array('poster', array_column($posterFallback['images'] ?? [], 'type'), true), 'Poster primary mode must fall back without emitting a disabled poster.');
+    replayAssert(($backdropFallback['icon'] ?? null) === 'https://image.tmdb.org/t/p/w500/primary-poster.jpg' && ! in_array('backdrop', array_column($backdropFallback['images'] ?? [], 'type'), true), 'Backdrop primary mode must fall back without emitting a disabled backdrop.');
+    replayAssert($disabledArtwork['icon'] === $originalDisabledArtwork['icon'] && $disabledArtwork['images'] === $originalDisabledArtwork['images'] && $disabledArtworkTmdb->tvCandidateSearches + $disabledArtworkTmdb->movieCandidateSearches === 0, 'Disabled artwork must leave icon and images byte-for-byte unchanged.');
+    replayAssert(($titleOnly['tmdb_decision']['result'] ?? null) === 'selected' && $titleOnlyTmdb->tvCandidateSearches === 1, 'Opt-in title-only lookup must accept a uniquely corroborated identity.');
+    replayAssert(($titleOnlyAmbiguous['tmdb_decision']['class'] ?? null) === 'ambiguous_identity' && $titleOnlyAmbiguousTmdb->tvCandidateSearches === 1 && $titleOnlyAmbiguousTmdb->movieCandidateSearches === 1, 'Title-only lookup must reject ambiguous movie/series candidates.');
+    replayAssert(($titleOnlySports['tmdb_decision']['class'] ?? null) === 'unknown' && $titleOnlySportsTmdb->tvCandidateSearches + $titleOnlySportsTmdb->movieCandidateSearches === 0, 'Title-only sports/event inputs must remain fail-closed.');
+    replayAssert(($domainReplace['desc'] ?? null) === 'Replacement overview' && ($domainReplace['category'] ?? null) === 'Provider category', 'Explicit description replacement must not replace categories in missing-only mode.');
+    replayAssert(($domainDisabled['desc'] ?? null) === 'Provider description' && ($domainDisabled['category'] ?? null) === 'Provider category', 'Disabled description and category domains must win over replacement selectors.');
 
     $output = [];
     $replayProgrammes = [
@@ -308,6 +374,10 @@ namespace Tests {
         'malformed_locale' => $malformedLocale,
         'missing_translation' => $missingTranslation,
         'incompatible_description' => $incompatibleDescription,
+        'poster_primary' => $posterPrimary,
+        'title_only_accepted' => $titleOnly,
+        'title_only_ambiguous' => $titleOnlyAmbiguous,
+        'title_only_sports_refused' => $titleOnlySports,
     ];
     foreach ($replayProgrammes as $name => $programme) {
         $decision = $programme['tmdb_decision'];
@@ -321,9 +391,27 @@ namespace Tests {
     }
     $serialized = json_encode($output, JSON_THROW_ON_ERROR);
     replayAssert(! str_contains($serialized, 'provider.invalid') && ! str_contains($serialized, 'https://'), 'Replay output leaked an unsafe provider value.');
-    $manifest = ['version' => 1, 'cases' => []];
+    $manifest = [
+        'version' => 1,
+        'configuration' => [
+            'overwrite_existing' => false,
+            'overwrite_artwork' => 'replace',
+            'overwrite_descriptions' => 'missing_only',
+            'overwrite_categories' => 'missing_only',
+            'primary_artwork' => 'poster',
+            'allow_title_only_lookup' => true,
+        ],
+        'cases' => [],
+    ];
     foreach ($replayProgrammes as $name => $programme) {
-        $manifest['cases'][] = replayManifestCase($name, $programme);
+        $before = match ($name) {
+            'poster_primary' => ['title' => 'Primary Choice', 'date' => '2024'],
+            'title_only_accepted' => ['title' => 'Unique Fixture Work', 'title_language' => 'en-US'],
+            'title_only_ambiguous' => ['title' => 'Shared Signal', 'title_language' => 'en-US'],
+            'title_only_sports_refused' => ['title' => 'Fixture Cup Live', 'category' => 'Sports', 'title_language' => 'en-US'],
+            default => [],
+        };
+        $manifest['cases'][] = replayManifestCase($name, $programme, $before);
     }
     $goldenPath = replayOption('golden');
     if ($goldenPath !== null && file_get_contents($goldenPath) !== $serialized."\n") {

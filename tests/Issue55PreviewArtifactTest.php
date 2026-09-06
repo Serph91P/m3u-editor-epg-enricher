@@ -56,8 +56,16 @@ namespace Tests {
     previewAssert(file_get_contents($firstGallery) === file_get_contents($secondGallery), 'The preview gallery must be reproducible.');
 
     $manifest = json_decode((string) file_get_contents($firstManifest), true, 512, JSON_THROW_ON_ERROR);
-    previewAssert(is_array($manifest['cases'] ?? null) && count($manifest['cases']) === 12, 'The preview manifest must contain the exact bounded replay case set.');
+    previewAssert(is_array($manifest['cases'] ?? null) && count($manifest['cases']) === 16, 'The preview manifest must contain the exact bounded replay case set.');
     $casesById = array_column($manifest['cases'], null, 'id');
+    previewAssert([
+        'overwrite_existing' => false,
+        'overwrite_artwork' => 'replace',
+        'overwrite_descriptions' => 'missing_only',
+        'overwrite_categories' => 'missing_only',
+        'primary_artwork' => 'poster',
+        'allow_title_only_lookup' => true,
+    ] === ($manifest['configuration'] ?? null), 'The preview must disclose its synthetic Issue 55 configuration.');
     foreach ([
         'ambiguous' => 'ambiguous_identity',
         'confusable' => 'mixed_script_identity_rejected',
@@ -73,6 +81,10 @@ namespace Tests {
         previewAssert(! array_key_exists('description', $case['evidence'] ?? []), 'Replay evidence must never include raw descriptions.');
     }
     previewAssert(['source' => 'original'] === ($casesById['catalogue']['selected_title_provenance'] ?? null), 'The preview must expose privacy-safe original-title provenance for an accepted identity.');
+    previewAssert('poster' === ($casesById['poster_primary']['after']['primary_role'] ?? null), 'The preview must show the selected poster-first primary role.');
+    previewAssert('selected' === ($casesById['title_only_accepted']['applicability']['result'] ?? null), 'The preview must show title-only opt-in acceptance.');
+    previewAssert('ambiguous_identity' === ($casesById['title_only_ambiguous']['applicability']['reason'] ?? null), 'The preview must show title-only ambiguity refusal.');
+    previewAssert('known_non_catalogue_title_only' === ($casesById['title_only_sports_refused']['applicability']['reason'] ?? null), 'The preview must show sports title-only refusal.');
     previewAssert(str_contains((string) file_get_contents($firstGallery), '&lt;script&gt;'), 'The gallery must HTML-escape fixture evidence.');
     $serialized = (string) file_get_contents($firstManifest).(string) file_get_contents($firstGallery);
     previewAssert(! str_contains($serialized, 'provider.invalid') && ! str_contains($serialized, 'https://') && ! str_contains($serialized, 'private fixture description'), 'The preview artifact must redact provider hosts, URLs, and descriptions.');

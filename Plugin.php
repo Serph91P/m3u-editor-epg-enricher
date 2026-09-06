@@ -46,7 +46,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.04-structured-bound-identity';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.06-optional-enrichment';
 
     private const TMDB_IDENTITY_DETAIL_CANDIDATE_LIMIT = 1;
     private const TMDB_IDENTITY_TITLE_RECORD_LIMIT_PER_CHANNEL = 50;
@@ -814,6 +814,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $mapGenresToKodiGuideGenres = $settings['map_genres_to_kodi_guide_genres'] ?? false;
         $keywordDetection = $settings['keyword_category_detection'] ?? true;
         $enrichEpisodeDetails = $settings['enrich_episode_details'] ?? true;
+        $enrichmentOptions = [
+            'overwrite_artwork' => $this->normalizeOverwriteMode($settings['overwrite_artwork'] ?? null),
+            'overwrite_descriptions' => $this->normalizeOverwriteMode($settings['overwrite_descriptions'] ?? null),
+            'overwrite_categories' => $this->normalizeOverwriteMode($settings['overwrite_categories'] ?? null),
+            'primary_artwork' => $this->normalizePrimaryArtwork($settings['primary_artwork'] ?? null),
+            'allow_title_only_lookup' => ($settings['allow_title_only_lookup'] ?? false) === true,
+        ];
 
         // Load TMDB service if enrichment enabled
         $tmdb = null;
@@ -995,7 +1002,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         'epg_source_id' => (string) $epgId,
                         'tmdb_language' => $currentLanguage,
                         'tmdb_language_reason' => $tmdbLanguageReason,
-                    ],
+                    ] + $enrichmentOptions,
                     $context,
                 );
 
@@ -1092,7 +1099,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     'epg_source_id' => (string) $epgId,
                     'tmdb_language' => $currentLanguage,
                     'tmdb_language_reason' => $tmdbLanguageReason,
-                ],
+                ] + $enrichmentOptions,
                 $context,
                 $dayIndex,
                 $totalDays,
@@ -1675,6 +1682,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $hasDesc = ! empty($programme['desc']);
         $trustedLandscapeIcon = $this->hasTrustedLandscapeIcon($programme);
         $trustedNonTmdbLandscapeIcon = $this->hasTrustedNonTmdbLandscapeIcon($programme);
+        $overwriteArtwork = $this->domainOverwrite($lookupContext['overwrite_artwork'] ?? null, $overwrite);
+        $overwriteDescriptions = $this->domainOverwrite($lookupContext['overwrite_descriptions'] ?? null, $overwrite);
+        $overwriteCategories = $this->domainOverwrite($lookupContext['overwrite_categories'] ?? null, $overwrite);
+        $primaryArtwork = $this->normalizePrimaryArtwork($lookupContext['primary_artwork'] ?? null);
+        $allowTitleOnlyLookup = ($lookupContext['allow_title_only_lookup'] ?? false) === true;
 
         $wantsArtwork = $enrichPosters || $enrichBackdrops;
 
@@ -1690,7 +1702,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && $enrichCategories
             && $hasCategory
             && $isSeriesEpisode
-            && ! $isSeriesLikeCategory;
+            && ! $isSeriesLikeCategory
+            && $overwriteCategories;
 
         // Applicability is independent of free-form title/category text and writing toggles.
         $baseExtracted = $this->extractBaseTitle($title);
@@ -1728,6 +1741,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $structuredYear !== null,
             $externalIdentity,
             $trustedMediaType,
+            $allowTitleOnlyLookup,
+            $this->isKnownNonCatalogueTitleOnly($title, $existingCategory),
         );
         if ($applicability['class'] === 'catalogue_candidate' && ! $localeContext['valid']) {
             $applicability = [
@@ -1752,7 +1767,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Keep category mapping behavior separate from matching applicability.
         $keywordCategory = null;
-        if ($keywordDetection && $categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
+        if ($categoryMappingEnabled && $hasCategory) {
+            $mapped = $mapGenresToKodiGuideGenres
+                ? $this->mapToKodiGuideGenre($existingCategory, $forcedMediaType)
+                : $this->mapToEpgCategory($existingCategory, $forcedMediaType);
+            if ($mapped !== $existingCategory || ! is_string($categoryValue)) {
+                $programme['category'] = $mapped;
+                $result['category'] = true;
+                $result['changed'] = true;
+            }
+        }
+        if ($keywordDetection && $categoryMappingEnabled && $enrichCategories && ($overwriteCategories || ! $hasCategory || $needsCategoryFix)) {
             $keywordCategory = $this->detectCategoryFromTitle($title);
             if ($keywordCategory !== null) {
                 $programme['category'] = $mapGenresToKodiGuideGenres
@@ -1764,21 +1789,20 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         if ($applicability['class'] !== 'catalogue_candidate') {
-            if ($trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwrite)) {
+            if ($wantsArtwork && $trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwriteArtwork, $primaryArtwork, $enrichPosters, $enrichBackdrops)) {
                 $result['changed'] = true;
             }
 
             return $result;
         }
 
-        if (! $overwrite
-            && (! $wantsArtwork || ($trustedLandscapeIcon && ! $trustedEpisodeStillIcon))
+        if ((! $wantsArtwork || (! $overwriteArtwork && $trustedLandscapeIcon && ! $trustedEpisodeStillIcon))
             && ! $trustedNonTmdbLandscapeIcon
-            && ($hasCategory || ! $enrichCategories)
-            && ($hasDesc || ! $enrichDescriptions)
+            && (($hasCategory && ! $overwriteCategories) || ! $enrichCategories)
+            && (($hasDesc && ! $overwriteDescriptions) || ! $enrichDescriptions)
             && (! $enrichEpisodeDetails || ! $hasStrongSeriesSignals || $trustedEpisodeStillIcon)
             && ! $needsCategoryFix) {
-            if ($trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwrite)) {
+            if ($wantsArtwork && $trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwriteArtwork, $primaryArtwork, $enrichPosters, $enrichBackdrops)) {
                 $result['changed'] = true;
             }
 
@@ -1921,7 +1945,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $this->logMissedTitle($title, $baseTitle, $year, $forcedMediaType);
             }
 
-            if ($categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
+            if ($categoryMappingEnabled && $enrichCategories && ($overwriteCategories || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
                 $programme['category'] = $mapGenresToKodiGuideGenres
                     ? $this->mapToKodiGuideGenre('Series', 'tv')
                     : 'Series';
@@ -1929,7 +1953,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $result['changed'] = true;
             }
 
-            if ($trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwrite)) {
+            if ($wantsArtwork && $trustedLandscapeIcon && $this->finalizeImageSerialization($programme, true, $overwriteArtwork, $primaryArtwork, $enrichPosters, $enrichBackdrops)) {
                 $result['changed'] = true;
             }
 
@@ -1991,7 +2015,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         $imageSet,
                         $creds['language'],
                         $tmdbData['backdrop_url'] ?? null,
-                        $overwrite,
+                        $overwriteArtwork,
                     );
                     $selectedBackdrop = null;
                     foreach ($candidates as $candidate) {
@@ -2088,7 +2112,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // The correctly matched series or movie backdrop remains the XMLTV primary.
         // Exact episode stills are retained as typed secondary artwork.
         if ($enrichBackdrops && $backdropUrl
-            && ($overwrite || ! $trustedNonTmdbLandscapeIcon)
+            && ($overwriteArtwork || ! $trustedNonTmdbLandscapeIcon)
             && ($programme['icon'] ?? null) !== $backdropUrl) {
             $programme['icon'] = $backdropUrl;
             $result['poster'] = true;
@@ -2134,7 +2158,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         // Enrich category/genre
         $genres = $tmdbData['genres'] ?? '';
-        if ($enrichCategories && $genres !== '' && ($overwrite || ! $hasCategory)) {
+        if ($enrichCategories && $genres !== '' && ($overwriteCategories || ! $hasCategory)) {
             if ($mapGenresToKodiGuideGenres) {
                 $category = $this->mapToKodiGuideGenre($genres, $mediaType);
             } elseif ($mapGenresToEpgCategories) {
@@ -2145,16 +2169,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
             if ($category !== '') {
                 $programme['category'] = $category;
-                $result['category'] = true;
-                $result['changed'] = true;
-            }
-        } elseif (($mapGenresToKodiGuideGenres || $mapGenresToEpgCategories) && $hasCategory) {
-            // Map existing category even if not enriching from TMDB.
-            $mapped = $mapGenresToKodiGuideGenres
-                ? $this->mapToKodiGuideGenre($existingCategory, $mediaType)
-                : $this->mapToEpgCategory($existingCategory, $mediaType);
-            if ($mapped !== $existingCategory || ! is_string($categoryValue)) {
-                $programme['category'] = $mapped;
                 $result['category'] = true;
                 $result['changed'] = true;
             }
@@ -2220,7 +2234,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         $result['changed'] = true;
                     }
                     if ($backdropUrl
-                        && ($overwrite || ! $trustedNonTmdbLandscapeIcon)
+                        && ($overwriteArtwork || ! $trustedNonTmdbLandscapeIcon)
                         && ($programme['icon'] ?? null) !== $backdropUrl) {
                         $programme['icon'] = $backdropUrl;
                         $result['poster'] = true;
@@ -2230,13 +2244,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
-        if ($enrichDescriptions && $overview !== '' && ($overwrite || ! $hasDesc)) {
+        if ($enrichDescriptions && $overview !== '' && ($overwriteDescriptions || ! $hasDesc)) {
             $programme['desc'] = $overview;
             $result['description'] = true;
             $result['changed'] = true;
         }
 
-        if ($this->finalizeImageSerialization($programme, $trustedLandscapeIcon, $overwrite)) {
+        if ($wantsArtwork && $this->finalizeImageSerialization($programme, $trustedLandscapeIcon, $overwriteArtwork, $primaryArtwork, $enrichPosters, $enrichBackdrops)) {
             $result['changed'] = true;
         }
 
@@ -3044,7 +3058,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      * Bracketing gives first-only and last-wins legacy consumers the same safe
      * primary while role-aware consumers retain every typed alternative.
      */
-    private function finalizeImageSerialization(array &$programme, bool $trustedLandscapeIcon, bool $overwrite): bool
+    private function finalizeImageSerialization(
+        array &$programme,
+        bool $trustedLandscapeIcon,
+        bool $overwrite,
+        string $primaryArtwork = 'legacy',
+        bool $enrichPosters = true,
+        bool $enrichBackdrops = true,
+    ): bool
     {
         if (empty($programme['images']) || ! is_array($programme['images'])) {
             return false;
@@ -3057,17 +3078,39 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $primaryIndex = null;
         $currentPrimaryUrl = trim((string) ($programme['icon'] ?? ''));
-        foreach ($programme['images'] as $index => $image) {
-            if (($image['url'] ?? null) !== $currentPrimaryUrl) {
-                continue;
+        if (! $overwrite || $primaryArtwork === 'legacy') {
+            foreach ($programme['images'] as $index => $image) {
+                if (($image['url'] ?? null) !== $currentPrimaryUrl) {
+                    continue;
+                }
+                if ($this->isTrustedLandscapeImage($image)) {
+                    $primaryIndex = $index;
+                }
+                break;
             }
-            if ($this->isTrustedLandscapeImage($image)) {
-                $primaryIndex = $index;
-            }
-            break;
         }
 
-        if ($primaryIndex === null) {
+        if ($primaryIndex === null && $primaryArtwork !== 'legacy') {
+            $types = $primaryArtwork === 'poster' ? ['poster', 'backdrop'] : ['backdrop', 'poster'];
+            foreach ($types as $type) {
+                if (($type === 'poster' && ! $enrichPosters) || ($type === 'backdrop' && ! $enrichBackdrops)) {
+                    continue;
+                }
+                foreach ($programme['images'] as $index => $image) {
+                    if (($image['type'] ?? null) !== $type || empty($image['url'])) {
+                        continue;
+                    }
+                    if ($type === 'backdrop' && ! $this->isTrustedLandscapeImage($image)) {
+                        continue;
+                    }
+                    $programme['icon'] = $image['url'];
+                    $primaryIndex = $index;
+                    break 2;
+                }
+            }
+        }
+
+        if ($primaryIndex === null && $primaryArtwork === 'legacy') {
             foreach ($programme['images'] as $index => $image) {
                 if (! $this->isTrustedLandscapeImage($image)) {
                     continue;
@@ -3078,7 +3121,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
-        if ($primaryIndex === null) {
+        if ($primaryIndex === null && $primaryArtwork === 'legacy') {
             foreach ($programme['images'] as $index => $image) {
                 if (($image['type'] ?? null) !== 'poster') {
                     continue;
@@ -3484,6 +3527,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         bool $hasStructuredYear = false,
         ?array $externalIdentity = null,
         ?string $trustedMediaType = null,
+        bool $allowTitleOnlyLookup = false,
+        bool $knownNonCatalogueTitleOnly = false,
     ): array {
         $identity = $this->normalizeIdentityText($title);
         if ($identity === '') {
@@ -3503,9 +3548,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || $hasResolvedIdentifierPath
             || $trustedMediaType !== null;
         if (! $hasStructuredIdentity) {
+            if ($allowTitleOnlyLookup && ! $trustedProviderArt && ! $knownNonCatalogueTitleOnly) {
+                if ($graphemes < 4) {
+                    return ['class' => 'unknown', 'reason' => 'insufficient_identity_graphemes', 'result' => 'skipped'];
+                }
+
+                return ['class' => 'catalogue_candidate', 'reason' => 'title_only_opt_in', 'result' => 'not_attempted'];
+            }
+
             return [
                 'class' => 'unknown',
-                'reason' => $trustedProviderArt ? 'trusted_provider_art' : 'insufficient_structured_identity',
+                'reason' => $trustedProviderArt
+                    ? 'trusted_provider_art'
+                    : (($allowTitleOnlyLookup && $knownNonCatalogueTitleOnly) ? 'known_non_catalogue_title_only' : 'insufficient_structured_identity'),
                 'result' => 'skipped',
             ];
         }
@@ -3514,6 +3569,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return ['class' => 'catalogue_candidate', 'reason' => 'stable_catalogue_identity', 'result' => 'not_attempted'];
+    }
+
+    private function isKnownNonCatalogueTitleOnly(string $title, string $category): bool
+    {
+        if (in_array(mb_strtolower(trim($category)), ['sports', 'news'], true)) {
+            return true;
+        }
+
+        return $this->detectCategoryFromTitle($title) === 'Sports';
     }
 
     private function structuredProgrammeYear(array $programme): ?int
@@ -5470,6 +5534,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'logic_version' => self::ENRICHMENT_LOGIC_VERSION,
             'enrich_from_tmdb' => $settings['enrich_from_tmdb'] ?? true,
             'overwrite_existing' => $settings['overwrite_existing'] ?? false,
+            'overwrite_artwork' => $this->normalizeOverwriteMode($settings['overwrite_artwork'] ?? null),
+            'overwrite_descriptions' => $this->normalizeOverwriteMode($settings['overwrite_descriptions'] ?? null),
+            'overwrite_categories' => $this->normalizeOverwriteMode($settings['overwrite_categories'] ?? null),
+            'primary_artwork' => $this->normalizePrimaryArtwork($settings['primary_artwork'] ?? null),
+            'allow_title_only_lookup' => ($settings['allow_title_only_lookup'] ?? false) === true,
             'enrich_categories' => $settings['enrich_categories'] ?? true,
             'enrich_descriptions' => $settings['enrich_descriptions'] ?? true,
             'enrich_posters' => $settings['enrich_posters'] ?? true,
@@ -5484,6 +5553,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ];
 
         return md5(json_encode($relevant));
+    }
+
+    private function normalizeOverwriteMode(mixed $value): string
+    {
+        return is_string($value) && in_array($value, ['inherit', 'missing_only', 'replace'], true)
+            ? $value
+            : 'inherit';
+    }
+
+    private function domainOverwrite(mixed $mode, bool $legacyOverwrite): bool
+    {
+        return match ($this->normalizeOverwriteMode($mode)) {
+            'missing_only' => false,
+            'replace' => true,
+            default => $legacyOverwrite,
+        };
+    }
+
+    private function normalizePrimaryArtwork(mixed $value): string
+    {
+        return is_string($value) && in_array($value, ['legacy', 'poster', 'backdrop'], true)
+            ? $value
+            : 'legacy';
     }
 
     /**
