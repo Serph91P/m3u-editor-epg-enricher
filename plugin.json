@@ -50,6 +50,13 @@
           "label": "Overwrite existing metadata",
           "default": false,
           "helper_text": "Replace existing artwork and descriptions even if the programme already has data (e.g. from Schedules Direct)."
+        },
+        {
+          "id": "allow_title_only_lookup",
+          "type": "boolean",
+          "label": "Allow cautiously validated title-only lookup",
+          "default": false,
+          "helper_text": "Opt in to bounded TMDB candidate discovery when source year, ID, and episode evidence are absent. Ambiguous and sports/event matches remain rejected."
         }
       ]
     },
@@ -69,11 +76,35 @@
           "helper_text": "Fill in missing genre/category from TMDB when the programme has none."
         },
         {
+          "id": "overwrite_categories",
+          "type": "select",
+          "label": "Category replacement",
+          "default": "inherit",
+          "options": [
+            { "value": "inherit", "label": "Inherit overwrite existing" },
+            { "value": "missing_only", "label": "Missing only" },
+            { "value": "replace", "label": "Replace" }
+          ],
+          "helper_text": "Controls replacing categories from a TMDB match. Existing mapper normalization is separate and does not fetch or replace TMDB categories."
+        },
+        {
           "id": "enrich_descriptions",
           "type": "boolean",
           "label": "Enrich missing descriptions",
           "default": true,
           "helper_text": "Fill in missing programme descriptions from TMDB."
+        },
+        {
+          "id": "overwrite_descriptions",
+          "type": "select",
+          "label": "Description replacement",
+          "default": "inherit",
+          "options": [
+            { "value": "inherit", "label": "Inherit overwrite existing" },
+            { "value": "missing_only", "label": "Missing only" },
+            { "value": "replace", "label": "Replace" }
+          ],
+          "helper_text": "Controls replacing existing descriptions independently of artwork and categories."
         },
         {
           "id": "enrich_episode_details",
@@ -87,7 +118,31 @@
           "type": "boolean",
           "label": "Enrich poster/icon artwork",
           "default": true,
-          "helper_text": "Fetch poster images from TMDB and set them as the programme icon."
+          "helper_text": "Fetch poster images from TMDB as typed artwork."
+        },
+        {
+          "id": "overwrite_artwork",
+          "type": "select",
+          "label": "Artwork replacement",
+          "default": "inherit",
+          "options": [
+            { "value": "inherit", "label": "Inherit overwrite existing" },
+            { "value": "missing_only", "label": "Missing only" },
+            { "value": "replace", "label": "Replace" }
+          ],
+          "helper_text": "Controls replacing valid provider artwork independently of descriptions and categories."
+        },
+        {
+          "id": "primary_artwork",
+          "type": "select",
+          "label": "Primary artwork",
+          "default": "legacy",
+          "options": [
+            { "value": "legacy", "label": "Legacy landscape preference" },
+            { "value": "poster", "label": "Poster first" },
+            { "value": "backdrop", "label": "Backdrop first" }
+          ],
+          "helper_text": "Select the untyped primary icon when artwork replacement is permitted. Disabled artwork types are never selected."
         },
         {
           "id": "enrich_backdrops",

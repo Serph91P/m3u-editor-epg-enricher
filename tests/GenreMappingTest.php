@@ -56,9 +56,23 @@ namespace App\Services {
         {
             return [
                 'tmdb_id' => $tmdbId,
+                'tvdb_id' => null,
+                'imdb_id' => null,
                 'name' => 'Profile Matrix Fixture',
+                'original_name' => 'Profile Matrix Fixture',
                 'genres' => 'Basketball',
                 'overview' => '',
+                'poster_url' => null,
+                'backdrop_url' => null,
+                'first_air_date' => '2024-01-01',
+                'vote_average' => null,
+                'vote_count' => null,
+                'status' => null,
+                'number_of_seasons' => null,
+                'number_of_episodes' => null,
+                'cast' => null,
+                'director' => null,
+                'youtube_trailer' => null,
             ];
         }
 
@@ -127,6 +141,9 @@ namespace Tests {
 
     assertTrueValue(in_array('map_genres_to_epg_categories', $settingIds, true), 'Emby compatible category option should remain available.');
     assertTrueValue(in_array('map_genres_to_kodi_guide_genres', $settingIds, true), 'Kodi guide genre option should be a separate setting.');
+    foreach (['overwrite_artwork', 'overwrite_descriptions', 'overwrite_categories', 'primary_artwork', 'allow_title_only_lookup'] as $settingId) {
+        assertTrueValue(in_array($settingId, $settingIds, true), "Issue 55 setting '{$settingId}' should remain available.");
+    }
 
     $fieldsById = [];
     foreach ($manifest['settings'] as $section) {
@@ -158,7 +175,11 @@ namespace Tests {
         'emby_and_kodi' => [true, true, 'Basketball'],
     ];
     foreach ($profileMatrix as $profile => [$mapEmby, $mapKodi, $expectedCategory]) {
-        $programme = ['title' => 'Profile Matrix Fixture'];
+        $programme = [
+            'title' => 'Profile Matrix Fixture',
+            'tmdb_id' => 42,
+            'tmdb_media_type' => 'tv',
+        ];
         $cache = [];
         $seasonCache = [];
         $imagesCache = [];
@@ -204,6 +225,24 @@ namespace Tests {
         $settingsHasher->invoke($plugin, ['map_emby_genres' => true]),
         'The legacy Emby setting should remain hash-compatible with the current key.'
     );
+    assertSameValue(
+        $settingsHasher->invoke($plugin, []),
+        $settingsHasher->invoke($plugin, ['overwrite_artwork' => null, 'primary_artwork' => 'invalid', 'allow_title_only_lookup' => false]),
+        'Absent, null, and invalid Issue 55 selectors should retain legacy cache identity.'
+    );
+    $legacyHash = $settingsHasher->invoke($plugin, []);
+    foreach ([
+        'overwrite_artwork' => 'replace',
+        'overwrite_descriptions' => 'replace',
+        'overwrite_categories' => 'replace',
+        'primary_artwork' => 'poster',
+        'allow_title_only_lookup' => true,
+    ] as $key => $value) {
+        assertTrueValue(
+            $legacyHash !== $settingsHasher->invoke($plugin, [$key => $value]),
+            "Effective Issue 55 setting '{$key}' must invalidate the enrichment cache."
+        );
+    }
 
     echo "Genre mapping tests passed.\n";
 }
