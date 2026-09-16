@@ -1714,16 +1714,9 @@ namespace Tests {
         $titleCardSeasonCache,
         $titleCardImagesCache,
     );
-    assertSameValue(null, $titleCard['icon'] ?? null, 'A zero-vote German 16:9 title card must not become primary artwork.');
-    assertSameValue([
-        'source' => 'tmdb',
-        'asset_type' => 'backdrop',
-        'reason' => 'no_backdrop_with_vote_evidence',
-    ], $titleCard['artwork_rejection'] ?? null, 'A rejected primary must retain safe TMDB provenance and reason metadata.');
-    assertSameValue([], array_values(array_filter(
-        $titleCard['images'] ?? [],
-        fn (array $image): bool => ($image['type'] ?? null) === 'backdrop'
-    )), 'Rejected title-card metadata must not be serialized as a programme backdrop.');
+    assertSameValue('https://image.tmdb.org/t/p/w1280/german-16x9-zero-vote-title-card.jpg', $titleCard['icon'] ?? null, 'A geometrically valid unvoted backdrop must remain eligible; TMDB metadata cannot prove it is a title card.');
+    assertSameValue(null, $titleCard['artwork_rejection'] ?? null, 'An unvoted but geometrically valid backdrop is not a rejection condition.');
+    assertSameValue('tmdb_metadata_unrated', $titleCard['images'][0]['artwork_quality'] ?? null, 'Unvoted artwork must retain explicit quality provenance instead of fabricated vote evidence.');
 
     $roteRosenImages = [
         'posters' => [[
@@ -1766,7 +1759,7 @@ namespace Tests {
         false,
         false,
     );
-    assertSameValue(null, $roteRosenNoOverwrite['icon'] ?? null, 'Rote Rosen must retain zero-vote abstention when overwrite is disabled.');
+    assertSameValue('https://image.tmdb.org/t/p/w1280/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg', $roteRosenNoOverwrite['icon'] ?? null, 'A missing backdrop role must be filled by a geometrically valid unvoted image even when overwrite is disabled.');
 
     $roteRosenOverwrite = [
         'title' => 'Rote Rosen',
@@ -1788,13 +1781,13 @@ namespace Tests {
         false,
         true,
     );
-    $roteRosenBackdrop = 'https://image.tmdb.org/t/p/original/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg';
+    $roteRosenBackdrop = 'https://image.tmdb.org/t/p/w1280/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg';
     assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['icon'] ?? null, 'Overwrite mode should select the exact validated Rote Rosen details backdrop.');
     assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['images'][0]['url'] ?? null, 'The unrated Rote Rosen primary must be the first image.');
     assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['images'][array_key_last($roteRosenOverwrite['images'])]['url'] ?? null, 'The unrated Rote Rosen primary must also be the last image.');
     assertSameValue('tmdb', $roteRosenOverwrite['images'][0]['source'] ?? null, 'The unrated fallback must retain TMDB provenance.');
     assertSameValue('programme', $roteRosenOverwrite['images'][0]['scope'] ?? null, 'The unrated fallback must retain programme scope.');
-    assertSameValue('tmdb_details_unrated_fallback', $roteRosenOverwrite['images'][0]['artwork_quality'] ?? null, 'The unrated fallback must have distinct quality provenance.');
+    assertSameValue('tmdb_metadata_unrated', $roteRosenOverwrite['images'][0]['artwork_quality'] ?? null, 'An unvoted image-endpoint backdrop must retain explicit non-vote provenance.');
     assertTrueValue(in_array('poster', array_column($roteRosenOverwrite['images'], 'type'), true), 'The Rote Rosen poster must remain secondary artwork.');
 
     $roteRosenCategory = [
@@ -1876,7 +1869,7 @@ namespace Tests {
     assertSameValue('tmdb_vote_evidence', $sceneControl['images'][0]['artwork_quality'] ?? null, 'Selected scene artwork must retain its TMDB metadata provenance.');
     assertSameValue(false, isset($sceneControl['artwork_rejection']), 'A suitable scene candidate must clear the rejection state.');
     $artworkQualityEvidence = [
-        'rejected_zero_vote_title_cards' => 1,
+        'accepted_unrated_landscape_backdrops' => 1,
         'selected_scene_controls' => 1,
     ];
 
@@ -2131,6 +2124,42 @@ namespace Tests {
         $finalizeImageSerialization->invokeArgs($plugin, [&$benchmarkProgramme, true, false]);
         assertSameValue($serializedBenchmarkProgramme, json_encode($benchmarkProgramme, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Issue 47 serialization should be deterministic on repeat runs.');
     }
+
+    // Regression: current host details add logo_url and cast_list. They must not turn
+    // a validated candidate into a false miss, while invalid known additions remain rejected.
+    $shapeMethod = $reflection->getMethod('hasValidTmdbDetailsShape');
+    $shapeMethod->setAccessible(true);
+    $hostMovieDetails = normalizedMovieDetailsFixture(801, 'Host Contract Movie', 'Host contract fixture.');
+    $hostMovieDetails['logo_url'] = 'https://image.tmdb.org/t/p/w500/host-logo.png';
+    $hostMovieDetails['cast_list'] = [['id' => 1, 'name' => 'Fixture Actor']];
+    $hostMovieDetails['future_host_field'] = ['safe' => 'ignored'];
+    $hostMovieDetails['_media_type'] = 'movie';
+    assertSameValue(true, $shapeMethod->invoke($plugin, $hostMovieDetails, 'movie'), 'Additive movie details from the current host must remain valid.');
+    $hostMovieCandidate = [
+        'tmdb_id' => 801,
+        'title' => 'Host Contract Movie',
+        'original_title' => 'Host Contract Movie',
+        'release_date' => '2024-01-01',
+        'overview' => 'Host contract fixture.',
+    ];
+    $hostMovieTmdb = new CandidateTmdbService(movieCandidates: [$hostMovieCandidate], movieDetails: [801 => $hostMovieDetails]);
+    $provisional = null;
+    $hostMovieResult = $searchMethod->invokeArgs($plugin, [$hostMovieTmdb, 'Host Contract Movie', null, null, '', &$provisional]);
+    assertSameValue(801, $hostMovieResult['tmdb_id'] ?? null, 'The candidate path must resolve additive movie details rather than returning a false miss.');
+    assertSameValue(false, array_key_exists('future_host_field', $hostMovieResult), 'Unknown host additions must not leak into the persisted plugin contract.');
+    assertSameValue(false, array_key_exists('logo_url', $hostMovieResult), 'Known but unused host additions must be controlledly ignored after validation.');
+
+    $hostTvDetails = normalizedTvDetailsFixture(802, 'Host Contract TV', 'Host TV contract fixture.');
+    $hostTvDetails['logo_url'] = 'https://image.tmdb.org/t/p/w500/host-tv-logo.png';
+    $hostTvDetails['cast_list'] = [['id' => 2, 'name' => 'Fixture Actor']];
+    $hostTvDetails['_media_type'] = 'tv';
+    assertSameValue(true, $shapeMethod->invoke($plugin, $hostTvDetails, 'tv'), 'Additive TV details from the current host must remain valid.');
+    $invalidKnownAddition = $hostTvDetails;
+    $invalidKnownAddition['logo_url'] = 'https://untrusted.invalid/logo.png';
+    assertSameValue(false, $shapeMethod->invoke($plugin, $invalidKnownAddition, 'tv'), 'An invalid known image field must still be rejected.');
+    $wrongType = $hostMovieDetails;
+    $wrongType['_media_type'] = 'tv';
+    assertSameValue(false, $shapeMethod->invoke($plugin, $wrongType, 'movie'), 'A contradictory media type must still be rejected.');
 
     echo "TMDB artwork repair tests passed.\n";
     echo json_encode([

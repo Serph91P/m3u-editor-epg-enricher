@@ -12,10 +12,9 @@ use App\Plugins\Contracts\PluginSelectOptionsProviderInterface;
 use App\Plugins\Support\PluginActionResult;
 use App\Plugins\Support\PluginExecutionContext;
 use App\Plugins\Support\PluginSelectOptionsContext;
-use App\Services\EpgCacheService;
+use App\Services\EpgCacheEnrichmentService;
 use App\Services\TmdbService;
 use App\Settings\GeneralSettings;
-use Carbon\Carbon;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -43,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.02-series-movie-primary';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.15-tmdb-contract-normalization';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -655,8 +654,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
-        $this->invalidatePlaylistEpgCaches($playlistIds, array_values(array_unique($modifiedEpgIds)), $context);
-
         $notice = implode(' ', array_unique($notices));
         if (empty($combinedStats)) {
             return PluginActionResult::success("Enrichment finished for {$playlistLabel}: {$notice}");
@@ -725,38 +722,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         )));
     }
 
-    /**
-     * Invalidate generated XMLTV output only for selected playlists that use a modified EPG.
-     *
-     * @param  array<int>  $playlistIds
-     * @param  array<int>  $modifiedEpgIds
-     */
-    private function invalidatePlaylistEpgCaches(
-        array $playlistIds,
-        array $modifiedEpgIds,
-        PluginExecutionContext $context,
-    ): void {
-        if ($modifiedEpgIds === [] || ($context->dryRun ?? false)) {
-            return;
-        }
-
-        $affectedPlaylistIds = Channel::query()
-            ->whereIn('playlist_id', $playlistIds)
-            ->where('enabled', true)
-            ->whereNotNull('epg_channel_id')
-            ->whereHas('epgChannel', fn ($query) => $query->whereIn('epg_id', $modifiedEpgIds))
-            ->distinct()
-            ->pluck('playlist_id')
-            ->all();
-
-        if ($affectedPlaylistIds === []) {
-            return;
-        }
-
-        foreach (Playlist::query()->whereKey($affectedPlaylistIds)->get() as $playlist) {
-            EpgCacheService::clearPlaylistEpgCacheFile($playlist);
-        }
-    }
 
     /**
      * Core enrichment logic. Reads cached JSONL, enriches with TMDB, writes back.
@@ -799,6 +764,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (! $epg) {
             return PluginActionResult::failure("EPG [{$epgId}] not found.");
         }
+
+        return $this->enrichHostSnapshotPages($epg, $epgId, $playlistIds, $context);
+
+        // Removed direct cache adapter. Snapshot/apply above is the sole runtime path.
 
         $cacheService = app(EpgCacheService::class);
         if (! $cacheService->isCacheValid($epg)) {
@@ -914,6 +883,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($cacheDir === null) {
             return PluginActionResult::failure('Could not resolve EPG cache directory.');
         }
+        $sqliteFile = "{$cacheDir}/programmes.sqlite";
+        if (Storage::disk('local')->exists($sqliteFile)) {
+            return $this->processSqliteStore(
+                $sqliteFile, $targetChannelIds, $tmdb, $overwrite, $enrichCategories,
+                $enrichDescriptions, $enrichPosters, $enrichBackdrops, $mapGenresToEpgCategories,
+                $mapGenresToKodiGuideGenres, $keywordDetection, $enrichEpisodeDetails,
+                $tmdbCache, $tmdbSeasonCache, $imagesCache,
+                ['epg_source_id' => (string) $epgId, 'tmdb_language' => $currentLanguage],
+                $context, $epg->name, $minDate, $maxDate, $playlistIds, $epgId,
+            );
+        }
+
         $currentDate = Carbon::parse($minDate);
         $endDate = Carbon::parse($maxDate);
         $totalDays = $currentDate->diffInDays($endDate) + 1;
@@ -1102,6 +1083,119 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
+     * Enrich host-owned canonical programme snapshots and submit only conditional patches.
+     */
+    private function enrichHostSnapshotPages(Epg $epg, int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
+    {
+        try {
+            $service = app(EpgCacheEnrichmentService::class);
+        } catch (\Throwable) {
+            return PluginActionResult::failure('Host EPG enrichment API is unavailable; no cache files were accessed.');
+        }
+        $targetChannels = $this->resolveTargetChannelIds($epgId, $playlistIds);
+        if ($targetChannels === []) {
+            return PluginActionResult::success('No playlist channels are mapped to this EPG - nothing to enrich.');
+        }
+        $settings = $context->settings;
+        if (! ($settings['enrich_from_tmdb'] ?? true)) {
+            return PluginActionResult::success('TMDB enrichment is disabled - nothing to do.');
+        }
+        $tmdb = app(TmdbService::class);
+        if (! $tmdb->isConfigured()) {
+            return PluginActionResult::failure('TMDB API key not configured; no enrichment was applied.');
+        }
+        $tmdbCache = $this->loadTmdbCache();
+        $tmdbSeasonCache = $this->loadTmdbSeasonCache();
+        $imagesCache = $this->loadTmdbImagesCache();
+        $stats = ['programmes_processed' => 0, 'programmes_updated' => 0, 'programmes_already_enriched' => 0, 'posters_added' => 0, 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
+        $cursor = null;
+        do {
+            $snapshot = $service->snapshot($context, $epg, array_filter(['limit' => 100, 'cursor' => $cursor], fn ($value): bool => $value !== null));
+            if (($snapshot['status'] ?? null) !== 'ok') {
+                return PluginActionResult::failure('Host EPG snapshot rejected: '.($snapshot['status'] ?? 'unknown').'.');
+            }
+            $patches = [];
+            $pageStats = $stats;
+            foreach (($snapshot['programmes'] ?? []) as $row) {
+                if ($context->cancellationRequested()) {
+                    return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
+                }
+                $programme = $row['programme'] ?? null;
+                if (! is_array($programme) || ! in_array($programme['channel'] ?? null, $targetChannels, true)) {
+                    continue;
+                }
+                $pageStats['programmes_processed']++;
+                $result = $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => '']);
+                $pageStats['tmdb_lookups'] += $result['lookup'] ? 1 : 0;
+                $pageStats['tmdb_cache_hits'] += $result['cache_hit'] ? 1 : 0;
+                $changes = $this->canonicalHostChanges($row['programme'], $programme);
+                if ($changes === []) {
+                    $pageStats['programmes_already_enriched']++;
+                    continue;
+                }
+                $patches[] = ['locator' => $row['locator'] ?? '', 'row_revision' => $row['row_revision'] ?? '', 'changes' => $changes];
+                $pageStats['posters_added'] += $result['poster'] ? 1 : 0;
+                $pageStats['categories_added'] += $result['category'] ? 1 : 0;
+                $pageStats['descriptions_added'] += $result['description'] ? 1 : 0;
+            }
+            if ($patches !== []) {
+                $appliedPatches = $patches;
+                $apply = $service->apply($context, $epg, (string) ($snapshot['token'] ?? ''), $patches);
+                $status = $apply['status'] ?? 'unknown';
+                if (in_array($status, ['stale_snapshot', 'conflict'], true)) {
+                    $retry = $service->snapshot($context, $epg, ['limit' => 100]);
+                    if (($retry['status'] ?? null) !== 'ok') {
+                        return PluginActionResult::failure('Host EPG retry snapshot rejected: '.($retry['status'] ?? 'unknown').'.');
+                    }
+                    $retryPatches = array_map(fn (array $retryRow): array => ['locator' => $retryRow['locator'] ?? '', 'row_revision' => $retryRow['row_revision'] ?? '', 'changes' => $this->canonicalHostChanges($retryRow['programme'] ?? [], $this->enrichCopy($retryRow['programme'] ?? [], $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId))], array_filter($retry['programmes'] ?? [], fn (array $retryRow): bool => in_array(($retryRow['programme']['channel'] ?? null), $targetChannels, true)));
+                    $retryPatches = array_values(array_filter($retryPatches, fn (array $patch): bool => $patch['changes'] !== []));
+                    $appliedPatches = $retryPatches;
+                    $apply = $retryPatches === [] ? ['status' => 'noop'] : $service->apply($context, $epg, (string) ($retry['token'] ?? ''), $retryPatches);
+                    $status = $apply['status'] ?? 'unknown';
+                }
+                if ($status === 'applied') {
+                    $pageStats['programmes_updated'] += count($appliedPatches);
+                } elseif ($status !== 'noop') {
+                    return PluginActionResult::failure('Host EPG apply rejected: '.$status.'. No updates were reported.');
+                }
+            }
+            $stats = $pageStats;
+            $cursor = $snapshot['next_cursor'] ?? null;
+        } while ($cursor !== null);
+        $this->saveTmdbCache($tmdbCache);
+        $this->saveTmdbSeasonCache($tmdbSeasonCache);
+        $this->saveTmdbImagesCache($imagesCache);
+        return PluginActionResult::success("Enrichment complete for '{$epg->name}': {$stats['programmes_updated']}/{$stats['programmes_processed']} programmes updated.", $stats);
+    }
+
+    private function enrichCopy(array $programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId): array
+    {
+        $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => '']);
+        return $programme;
+    }
+
+    private function canonicalHostChanges(array $before, array $after): array
+    {
+        $changes = [];
+        foreach (['title', 'subtitle', 'desc', 'category', 'episode_num', 'episode_nums', 'rating', 'icon', 'new', 'previously_shown', 'premiere', 'production_year'] as $field) {
+            if (array_key_exists($field, $after) && ($after[$field] ?? null) !== ($before[$field] ?? null)) {
+                $changes[$field] = $after[$field];
+            }
+        }
+        if (($after['images'] ?? []) !== ($before['images'] ?? [])) {
+            $images = [];
+            foreach ((array) ($after['images'] ?? []) as $image) {
+                if (! is_array($image) || ! isset($image['url'], $image['width'], $image['height'])) { continue; }
+                $type = match ($image['type'] ?? '') { 'backdrop' => 'fanart', 'screenshot' => 'banner', default => $image['type'] ?? '' };
+                if (! in_array($type, ['poster', 'banner', 'fanart', 'logo'], true)) { continue; }
+                $images[] = ['url' => $image['url'], 'type' => $type, 'width' => (int) $image['width'], 'height' => (int) $image['height'], 'orient' => $image['orient'] ?? ((int) $image['width'] >= (int) $image['height'] ? 'L' : 'P'), 'size' => (int) ($image['size'] ?? 1)];
+            }
+            $changes['images'] = $images;
+        }
+        return $changes;
+    }
+
+    /**
      * Resolve EPG channel_id strings that are mapped in the given playlists.
      *
      * @param  array<int>  $playlistIds
@@ -1154,6 +1248,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ->count();
     }
 
+    // Removed direct JSONL/PDO cache adapter. Canonical programme mutation is host-owned.
     /**
      * Process a single date's JSONL file: enrich only targeted playlist channels.
      *
@@ -1183,6 +1278,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         string $date = '',
         ?callable $clock = null,
     ): array {
+        throw new \LogicException('Direct EPG cache access is disabled; use EpgCacheEnrichmentService snapshots.');
+
         $result = [
             'processed' => 0,
             'updated' => 0,
@@ -1322,6 +1419,47 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
+     * Current m3u-editor caches programme payloads in a SQLite store. The plugin
+     * deliberately keeps JSONL as a legacy fallback above, but must not report
+     * current SQLite dates as missing. Updates are one transaction and are
+     * abandoned if an EPG rebuild atomically replaced the store meanwhile.
+     */
+    private function processSqliteStore(string $sqliteFile, array $targetChannelIds, TmdbService $tmdb, bool $overwrite, bool $enrichCategories, bool $enrichDescriptions, bool $enrichPosters, bool $enrichBackdrops, bool $mapGenresToEpgCategories, bool $mapGenresToKodiGuideGenres, bool $keywordDetection, bool $enrichEpisodeDetails, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $lookupContext, PluginExecutionContext $context, string $epgName, string $minDate, string $maxDate, array $playlistIds, int $epgId): PluginActionResult
+    {
+        throw new \LogicException('Direct EPG cache access is disabled; use EpgCacheEnrichmentService snapshots.');
+
+        $stats = ['programmes_processed'=>0,'programmes_updated'=>0,'programmes_already_enriched'=>0,'posters_added'=>0,'categories_added'=>0,'descriptions_added'=>0,'days_processed'=>0,'days_skipped'=>0,'days_unchanged'=>0,'channels_targeted'=>count($targetChannelIds),'tmdb_lookups'=>0,'tmdb_cache_hits'=>0];
+        $sourceHash = hash_file('sha256', Storage::disk('local')->path($sqliteFile));
+        $placeholders = implode(',', array_fill(0, count($targetChannelIds), '?'));
+        try {
+            $pdo = new \PDO('sqlite:'.Storage::disk('local')->path($sqliteFile));
+            $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+            $dates = $pdo->prepare("SELECT COUNT(DISTINCT date) FROM programmes WHERE date >= ? AND date <= ? AND channel_id IN ({$placeholders})");
+            $dates->execute(array_merge([$minDate, $maxDate], $targetChannelIds));
+            $stats['days_processed'] = (int) $dates->fetchColumn();
+            $read = $pdo->prepare("SELECT rowid, data FROM programmes WHERE date >= ? AND date <= ? AND channel_id IN ({$placeholders}) ORDER BY date, channel_id, start_ts");
+            $read->execute(array_merge([$minDate, $maxDate], $targetChannelIds));
+            $update = $pdo->prepare('UPDATE programmes SET data = ? WHERE rowid = ?');
+            $pdo->beginTransaction();
+            while (($row = $read->fetch(\PDO::FETCH_ASSOC)) !== false) {
+                if ($context->cancellationRequested()) { $pdo->rollBack(); return PluginActionResult::cancelled('Enrichment cancelled.', $stats); }
+                $programme = json_decode($row['data'], true);
+                if (! is_array($programme) || trim((string) ($programme['title'] ?? '')) === '') { continue; }
+                $stats['programmes_processed']++;
+                $r = $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, $overwrite, $enrichCategories, $enrichDescriptions, $enrichPosters, $enrichBackdrops, $mapGenresToEpgCategories, $mapGenresToKodiGuideGenres, $keywordDetection, $enrichEpisodeDetails, $tmdbSeasonCache, $imagesCache, $lookupContext);
+                if ($r['changed']) { $update->execute([json_encode($programme, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE), $row['rowid']]); $stats['programmes_updated']++; }
+                else { $stats['programmes_already_enriched']++; }
+                $stats['posters_added'] += $r['poster'] ? 1 : 0; $stats['categories_added'] += $r['category'] ? 1 : 0; $stats['descriptions_added'] += $r['description'] ? 1 : 0; $stats['tmdb_lookups'] += $r['lookup'] ? 1 : 0; $stats['tmdb_cache_hits'] += $r['cache_hit'] ? 1 : 0;
+            }
+            if (hash_file('sha256', Storage::disk('local')->path($sqliteFile)) !== $sourceHash) { $pdo->rollBack(); return PluginActionResult::failure('EPG cache changed during enrichment; no SQLite changes were saved.'); }
+            $pdo->commit();
+        } catch (\Throwable $e) { if (isset($pdo) && $pdo->inTransaction()) { $pdo->rollBack(); } return PluginActionResult::failure('Could not enrich SQLite EPG cache: '.$e->getMessage()); }
+        $this->saveTmdbCache($tmdbCache); $this->saveTmdbSeasonCache($tmdbSeasonCache); $this->saveTmdbImagesCache($imagesCache);
+        if ($stats['programmes_updated'] > 0) { $this->invalidatePlaylistEpgCaches($playlistIds, [$epgId], $context); }
+        return PluginActionResult::success("Enrichment complete for '{$epgName}': {$stats['programmes_updated']}/{$stats['programmes_processed']} programmes updated across {$stats['channels_targeted']} channels, {$stats['days_processed']} day(s).", $stats);
+    }
+
+    /**
      * Enrich a single programme with TMDB data.
      * Skips programmes that already have artwork/descriptions (e.g. from Schedules Direct / Gracenote).
      *
@@ -1373,8 +1511,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $hasDesc = ! empty($programme['desc']);
         $trustedLandscapeIcon = $this->hasTrustedLandscapeIcon($programme);
         $trustedNonTmdbLandscapeIcon = $this->hasTrustedNonTmdbLandscapeIcon($programme);
+        $trustedPoster = $this->hasTrustedPoster($programme);
 
         $wantsArtwork = $enrichPosters || $enrichBackdrops;
+        // Role requirements are independent: a usable backdrop is not evidence that
+        // poster artwork exists, and a poster must not suppress a requested backdrop.
+        $needsPoster = $enrichPosters && ! $trustedPoster;
+        $needsBackdrop = $enrichBackdrops && ! $trustedLandscapeIcon;
 
         $seriesSignals = $this->detectSeriesSignals($programme);
         $hasEpisodicTitleKeyword = $this->hasEpisodicTitleKeyword($title);
@@ -1395,7 +1538,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && ! $isSeriesLikeCategory;
 
         if (! $overwrite
-            && (! $wantsArtwork || ($trustedLandscapeIcon && ! $trustedEpisodeStillIcon))
+            && (! $wantsArtwork || (! $needsPoster && ! $needsBackdrop && ! $trustedEpisodeStillIcon))
             && ! $trustedNonTmdbLandscapeIcon
             && ($hasCategory || ! $enrichCategories)
             && ($hasDesc || ! $enrichDescriptions)
@@ -2006,15 +2149,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function loadTmdbImagesCache(): array
     {
-        $path = storage_path('app/plugin-data/epg-enricher/tmdb-images-cache.json');
-        if (! file_exists($path)) {
+        $path = 'plugin-data/epg-enricher/tmdb-images-cache.json';
+        if (! Storage::disk('local')->exists($path)) {
             return [];
         }
-        $raw = file_get_contents($path);
-        if ($raw === false) {
-            return [];
-        }
-        $decoded = json_decode($raw, true);
+        $decoded = json_decode(Storage::disk('local')->get($path), true);
 
         return is_array($decoded) ? array_filter($decoded, 'is_array') : [];
     }
@@ -2026,13 +2165,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function saveTmdbImagesCache(array $cache): void
     {
-        $dir = storage_path('app/plugin-data/epg-enricher');
-        if (! is_dir($dir)) {
-            @mkdir($dir, 0775, true);
-        }
-        $path = $dir.'/tmdb-images-cache.json';
         $successfulResponses = array_filter($cache, 'is_array');
-        @file_put_contents($path, json_encode($successfulResponses, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
+        Storage::disk('local')->put(
+            'plugin-data/epg-enricher/tmdb-images-cache.json',
+            json_encode($successfulResponses, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+        );
     }
 
     /**
@@ -2195,10 +2333,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $detailsBackdropPath = $detailsBackdropUrl !== null
             ? $this->tmdbImageFilePath($detailsBackdropUrl)
             : null;
+        // Vote metadata is a ranking signal, not evidence of media identity or
+        // image quality. TMDB does not expose enough semantics to identify a title
+        // card from metadata, so a geometrically valid unvoted backdrop remains a
+        // usable role candidate.
         $backdrops = array_values(array_filter(
             $images['backdrops'] ?? [],
-            fn (array $backdrop): bool => $this->hasBackdropVoteEvidence($backdrop)
-                && $this->isGenuineLandscapeBackdrop($backdrop)
+            fn (array $backdrop): bool => $this->isGenuineLandscapeBackdrop($backdrop)
         ));
         if ($backdrops === [] && $allowUnratedDetailsFallback && $detailsBackdropPath !== null) {
             foreach ($images['backdrops'] ?? [] as $backdrop) {
@@ -2274,7 +2415,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'scope' => 'programme',
                 'language' => $b['iso_639_1'] ?? null,
                 'language_rank' => $rank($b, $langPrioBack),
-                'artwork_quality' => $isDetailsFallback ? 'tmdb_details_unrated_fallback' : 'tmdb_vote_evidence',
+                'artwork_quality' => $isDetailsFallback
+                    ? 'tmdb_details_unrated_fallback'
+                    : ($this->hasBackdropVoteEvidence($b) ? 'tmdb_vote_evidence' : 'tmdb_metadata_unrated'),
             ];
         }
 
@@ -2371,6 +2514,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         foreach ($programme['images'] as $image) {
             if (($image['url'] ?? null) === $icon && $this->isTrustedLandscapeImage($image)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * A portrait role is complete only when an actual poster entry exists. The
+     * generic programme icon is deliberately not used here: it can be a channel
+     * logo or a backdrop and must not suppress poster enrichment.
+     */
+    private function hasTrustedPoster(array $programme): bool
+    {
+        if (! is_array($programme['images'] ?? null)) {
+            return false;
+        }
+
+        foreach ($programme['images'] as $image) {
+            if (strtolower(trim((string) ($image['type'] ?? ''))) !== 'poster') {
+                continue;
+            }
+            if (is_string($image['url'] ?? null) && trim($image['url']) !== '') {
                 return true;
             }
         }
@@ -2508,7 +2674,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Legacy TMDB backdrops predate the bounded quality decision and must be
         // re-evaluated instead of preventing the new logic from running.
         if ($source === 'tmdb' && $type === 'backdrop'
-            && ! in_array($image['artwork_quality'] ?? null, ['tmdb_vote_evidence', 'tmdb_details_unrated_fallback', 'details_fallback'], true)) {
+            && ! in_array($image['artwork_quality'] ?? null, ['tmdb_vote_evidence', 'tmdb_metadata_unrated', 'tmdb_details_unrated_fallback', 'details_fallback'], true)) {
             return false;
         }
 
@@ -2925,8 +3091,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     && $details['_media_type'] !== $selectedMediaType)) {
                 return null;
             }
-            $details = array_merge($details, ['_media_type' => $selectedMediaType]);
-            if (! $this->hasValidTmdbDetailsShape($details, $selectedMediaType)) {
+            $details = $this->normalizeTmdbDetails($details + ['_media_type' => $selectedMediaType], $selectedMediaType);
+            if ($details === null) {
                 return null;
             }
             $best = array_merge($best, $details, [
@@ -3254,26 +3420,26 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ],
         ];
         $schema = $schemas[$mediaType] ?? null;
-        if ($schema === null
-            || array_diff_key($schema, $tmdbData) !== []
-            || array_diff_key($tmdbData, $schema) !== []) {
+        if ($schema === null || array_diff_key($schema, $tmdbData) !== []) {
             return false;
+        }
+
+        // Host detail responses are additive. Validate the stable contract and the
+        // optional fields we know about, but do not turn a harmless future field
+        // into a false TMDB miss. Unknown keys are discarded before persistence.
+        $optionalSchema = [
+            'logo_url' => 'tmdb-image-url-null',
+            'cast_list' => 'structured-list',
+        ];
+        foreach ($optionalSchema as $field => $type) {
+            if (array_key_exists($field, $tmdbData) && ! $this->isValidTmdbDetailValue($tmdbData[$field], $type)) {
+                return false;
+            }
         }
 
         foreach ($schema as $field => $type) {
             $value = $tmdbData[$field];
-            $valid = match ($type) {
-                'positive-int' => is_int($value) && $value > 0,
-                'media-type' => $value === $mediaType,
-                'int-null' => is_int($value) || $value === null,
-                'string' => is_string($value),
-                'string-null' => is_string($value) || $value === null,
-                'number-null' => is_int($value) || is_float($value) || $value === null,
-                'string-list' => is_array($value)
-                    && array_is_list($value)
-                    && count(array_filter($value, 'is_string')) === count($value),
-                default => false,
-            };
+            $valid = $this->isValidTmdbDetailValue($value, $type, $mediaType);
             if (! $valid) {
                 return false;
             }
@@ -3287,6 +3453,41 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return true;
+    }
+
+    /**
+     * Normalizes a host response for the on-disk title cache. Host additions are
+     * deliberately not persisted unless this plugin has an explicit consumer for
+     * them; known additions are still type-checked above.
+     */
+    private function normalizeTmdbDetails(array $details, string $mediaType): ?array
+    {
+        $details['_media_type'] = $mediaType;
+        if (! $this->hasValidTmdbDetailsShape($details, $mediaType)) {
+            return null;
+        }
+
+        $fields = $mediaType === 'tv'
+            ? ['tmdb_id', '_media_type', 'tvdb_id', 'imdb_id', 'name', 'original_name', 'overview', 'poster_url', 'backdrop_url', 'first_air_date', 'genres', 'vote_average', 'vote_count', 'status', 'number_of_seasons', 'number_of_episodes', 'cast', 'director', 'youtube_trailer']
+            : ['tmdb_id', '_media_type', 'imdb_id', 'title', 'original_title', 'overview', 'poster_url', 'backdrop_url', 'release_date', 'genres', 'vote_average', 'vote_count', 'runtime', 'status', 'cast', 'director', 'youtube_trailer'];
+
+        return array_intersect_key($details, array_flip($fields));
+    }
+
+    private function isValidTmdbDetailValue(mixed $value, string $type, ?string $mediaType = null): bool
+    {
+        return match ($type) {
+            'positive-int' => is_int($value) && $value > 0,
+            'media-type' => $value === $mediaType,
+            'int-null' => is_int($value) || $value === null,
+            'string' => is_string($value),
+            'string-null' => is_string($value) || $value === null,
+            'number-null' => is_int($value) || is_float($value) || $value === null,
+            'string-list' => is_array($value) && array_is_list($value) && count(array_filter($value, 'is_string')) === count($value),
+            'tmdb-image-url-null' => $value === null || (is_string($value) && $this->isTrustedTmdbImageUrl($value)),
+            'structured-list' => is_array($value) && array_is_list($value) && ! array_filter($value, fn (mixed $item): bool => ! is_array($item)),
+            default => false,
+        };
     }
 
     private function isTrustedTmdbImageUrl(string $url): bool

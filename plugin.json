@@ -1,14 +1,15 @@
 {
   "id": "epg-enricher",
   "name": "EPG Enricher",
-  "version": "1.13.8",
-  "api_version": "1.0.0",
+  "version": "1.14.0",
+  "api_version": "1.1.0",
   "description": "Enriches EPG programme data with TMDB artwork (posters, backdrops), genres and descriptions. Only processes channels that are mapped in your playlists, complementing existing Schedules Direct / Gracenote metadata where data is missing.",
   "repository": "Serph91P/m3u-editor-epg-enricher",
   "entrypoint": "Plugin.php",
   "class": "AppLocalPlugins\\EpgEnricher\\Plugin",
   "capabilities": [
-    "epg_processor"
+    "epg_processor",
+    "epg_cache_enrichment"
   ],
   "hooks": [
     "epg.cache.generated"
@@ -85,16 +86,16 @@
         {
           "id": "enrich_posters",
           "type": "boolean",
-          "label": "Enrich poster/icon artwork",
+          "label": "Enrich programme posters",
           "default": true,
-          "helper_text": "Fetch poster images from TMDB and set them as the programme icon."
+          "helper_text": "Fetch missing portrait programme posters from TMDB. Posters are stored as a poster role; a backdrop or channel icon does not count as a poster."
         },
         {
           "id": "enrich_backdrops",
           "type": "boolean",
           "label": "Enrich backdrop images",
           "default": true,
-          "helper_text": "Fetch backdrop (landscape) images from TMDB and add them to the programme images array."
+          "helper_text": "Fetch missing landscape programme backdrops from TMDB. Existing usable source backdrops are preserved unless overwrite is enabled."
         }
       ]
     },
