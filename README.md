@@ -57,9 +57,9 @@ Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because n
 
 ## Artwork roles, XMLTV and clients
 
-The plugin keeps programme artwork roles separate in the JSONL cache: `poster` for portrait programme artwork, `backdrop` for landscape programme artwork, `screenshot` for episode stills, and `logo` for programme clearlogos. Channel logos remain channel metadata. A backdrop does not satisfy an enabled poster requirement, and a poster never replaces the generic programme icon by itself.
+The plugin submits separate canonical artwork roles through the host API: `poster` for portrait programme artwork, `backdrop` for landscape programme artwork, `screenshot` for episode stills, and `logo` for programme clearlogos. The host owns cache persistence and serialization; channel logos remain channel metadata. A backdrop does not satisfy an enabled poster requirement, and a poster never replaces the generic programme icon by itself.
 
-For the current host export, `programme.icon` remains the generic `<icon>` fallback for icon-only XMLTV consumers. Typed `images` need a host serializer that emits standard XMLTV `<image>` elements; plugin-only changes cannot make an arbitrary consumer read roles it never imports. The companion patch prepared against m3u-editor `4bec0c45c03c6924a5641a83d3866fed515f051c` maps poster/backdrop/still roles to standard XMLTV image values and skips clearlogos from that standard role set.
+For the current host export, `programme.icon` remains the generic `<icon>` fallback for icon-only XMLTV consumers. Typed `images` require the host serializer to emit standard XMLTV `<image>` elements; plugin-only changes cannot make an arbitrary consumer read roles it never imports. The approved host API contract is at m3u-editor `4a2cb859a48b9d24f3e873be34ccb3b22411a379`; no live server, XMLTV-consumer, or Emby validation is claimed here.
 
 TMDB vote fields rank otherwise eligible images but do not prove content identity or visual suitability. A geometrically valid unvoted backdrop is retained with explicit `tmdb_metadata_unrated` provenance rather than being reported as a positively-rated selection. A client can still crop, cache, or ignore a role after a correct feed has been exported; that is distinct from an enrichment failure.
 
