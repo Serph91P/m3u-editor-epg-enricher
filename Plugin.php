@@ -832,6 +832,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $pageStats['descriptions_added'] += $result['description'] ? 1 : 0;
             }
             if ($patches !== []) {
+                if ($context->cancellationRequested()) {
+                    return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
+                }
                 $appliedPatches = $patches;
                 $apply = $service->apply($context, $epg, (string) ($snapshot['token'] ?? ''), $patches);
                 $status = $apply['status'] ?? 'unknown';
@@ -843,6 +846,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $retryPatches = array_map(fn (array $retryRow): array => ['locator' => $retryRow['locator'] ?? '', 'row_revision' => $retryRow['row_revision'] ?? '', 'changes' => $this->canonicalHostChanges($retryRow['programme'] ?? [], $this->enrichCopy($retryRow['programme'] ?? [], $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage))], array_filter($retry['programmes'] ?? [], fn (array $retryRow): bool => in_array(($retryRow['programme']['channel'] ?? null), $targetChannels, true)));
                     $retryPatches = array_values(array_filter($retryPatches, fn (array $patch): bool => $patch['changes'] !== []));
                     $appliedPatches = $retryPatches;
+                    if ($retryPatches !== [] && $context->cancellationRequested()) {
+                        return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
+                    }
                     $apply = $retryPatches === [] ? ['status' => 'noop'] : $service->apply($context, $epg, (string) ($retry['token'] ?? ''), $retryPatches);
                     $status = $apply['status'] ?? 'unknown';
                     $snapshot = $retry;
@@ -2035,11 +2041,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $orient = strtoupper(trim((string) ($image['orient'] ?? '')));
         $source = strtolower(trim((string) ($image['source'] ?? '')));
         $scope = strtolower(trim((string) ($image['scope'] ?? '')));
+        $canonicalTmdbRole = $source === ''
+            && in_array($type, ['fanart', 'banner'], true)
+            && $this->tmdbImageFilePath((string) ($image['url'] ?? '')) !== null;
 
         if (empty($image['url'])
             || $orient !== 'L'
             || ! in_array($type, ['backdrop', 'fanart', 'screenshot'], true)
-            || ($source !== 'tmdb' && ! in_array($scope, ['programme', 'movie', 'series', 'episode'], true))) {
+            || ($source !== 'tmdb' && ! $canonicalTmdbRole && ! in_array($scope, ['programme', 'movie', 'series', 'episode'], true))) {
             return false;
         }
 
