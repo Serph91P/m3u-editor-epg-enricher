@@ -166,8 +166,15 @@ namespace Tests {
     assertSameValue(0, count($cancelledHost->applies), 'Cancellation must not mutate host-owned EPG data.');
 
     $source = file_get_contents(__DIR__.'/../Plugin.php');
-    foreach (['programmes.sqlite', 'new \\PDO', 'processDateFile', 'processSqliteStore'] as $forbidden) {
-        assertSameValue(false, str_contains($source, $forbidden), "Plugin must not retain direct EPG storage adapter marker {$forbidden}.");
+    $tokens = token_get_all($source);
+    $pluginCode = '';
+    foreach ($tokens as $token) {
+        $pluginCode .= is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true)
+            ? ''
+            : (is_array($token) ? $token[1] : $token);
+    }
+    foreach (['programmes.sqlite', 'new \\PDO', 'sqlite', 'pdo', '.jsonl', 'programmes-', 'metadata.json', 'processDateFile', 'processSqliteStore', 'invalidatePlaylistEpgCaches'] as $forbidden) {
+        assertSameValue(false, str_contains(strtolower($pluginCode), strtolower($forbidden)), "Plugin must not retain direct EPG storage adapter marker {$forbidden}.");
     }
 
     echo "Host enrichment API tests passed.\n";
