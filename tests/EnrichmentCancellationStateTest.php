@@ -19,9 +19,36 @@ namespace Tests {
     use App\Plugins\Support\PluginExecutionContext; use App\Services\{EpgCacheEnrichmentService, EpgCacheService, TmdbService}; use App\Settings\GeneralSettings; use AppLocalPlugins\EpgEnricher\Plugin; use ReflectionMethod;
     function same(mixed $e, mixed $a, string $m): void { if ($e !== $a) { fwrite(STDERR, "$m\nExpected: ".var_export($e, true)."\nActual: ".var_export($a, true)."\n"); exit(1); } }
     function execute(array $applyStatuses = ['applied'], array $snapshotStatuses = [], int $cancelAfter = PHP_INT_MAX): array { $host = new EpgCacheEnrichmentService(); $host->applyStatuses = $applyStatuses; $host->snapshotStatuses = $snapshotStatuses; $GLOBALS['cancellationServices'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => new TmdbService(), GeneralSettings::class => new GeneralSettings()]; $context = new PluginExecutionContext(); $context->cancelAfter = $cancelAfter; $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true); return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context]; }
-    [$cancelled, $cancelledHost, $cancelledContext] = execute(['applied'], [], 1); same('cancelled', $cancelled->status, 'Cancellation must remain visible at the host snapshot boundary.'); same(false, $cancelled->success, 'Cancelled work must not report success.'); same(0, count($cancelledHost->applies), 'Cancellation must not apply host-owned EPG data.'); same(0, $cancelled->data['programmes_updated'] ?? 0, 'Cancellation must not count unpublished updates.'); same(['Processing canonical host EPG snapshot.'], $cancelledContext->messages, 'Cancellation must occur before publication.');
-    foreach (['legacy_cache_read_only', 'capability_denied', 'invalid_patch', 'rate_limited', 'timeout'] as $outcome) { [$result, $host, $context] = execute([$outcome]); same(false, $result->success, "$outcome must fail closed."); same(0, $result->data['programmes_updated'] ?? 0, "$outcome must not count updates."); same(1, count($host->applies), "$outcome must not fall back to direct storage."); same(['Processing canonical host EPG snapshot.'], $context->messages, "$outcome must not claim a published patch."); }
-    [$unavailable, $unavailableHost] = execute(['applied'], ['plugin_not_enabled']); same(false, $unavailable->success, 'An unavailable host snapshot must fail closed.'); same(0, count($unavailableHost->applies), 'An unavailable host snapshot must not attempt a file fallback.');
+    // This is the migrated cancellation/state contract: the canonical snapshot is
+    // immutable to the plugin, and only an accepted host apply may publish a patch.
+    [$cancelled, $cancelledHost, $cancelledContext] = execute(['applied'], [], 1);
+    same('cancelled', $cancelled->status, 'Cancellation must remain visible at the host snapshot boundary.');
+    same(false, $cancelled->success, 'Cancelled work must not report success.');
+    same(1, $cancelled->data['channels_targeted'] ?? null, 'Cancellation must retain selected-channel scope.');
+    same(0, count($cancelledHost->applies), 'Cancellation must not apply host-owned EPG data.');
+    same(0, $cancelled->data['programmes_processed'] ?? 0, 'Cancellation before the first programme must not count processing.');
+    same(0, $cancelled->data['programmes_updated'] ?? 0, 'Cancellation must not count unpublished updates.');
+    same(['Processing canonical host EPG snapshot.'], $cancelledContext->messages, 'Cancellation must occur before publication.');
+
+    // Each host rejection retains the previous “no unintended cache/state write”
+    // safety property, without recreating the removed direct-cache adapter.
+    foreach (['legacy_cache_read_only', 'capability_denied', 'invalid_patch', 'rate_limited', 'timeout'] as $outcome) {
+        [$result, $host, $context] = execute([$outcome]);
+        same('failed', $result->status, "$outcome must fail rather than report completion.");
+        same(false, $result->success, "$outcome must fail closed.");
+        same(0, $result->data['programmes_processed'] ?? 0, "$outcome must not report an uncommitted page as completed work.");
+        same(0, $result->data['programmes_updated'] ?? 0, "$outcome must not count updates.");
+        same(1, count($host->applies), "$outcome must not fall back to direct storage.");
+        same('cancel-token', $host->applies[0]['token'] ?? null, "$outcome must remain bound to its snapshot token.");
+        same(['Processing canonical host EPG snapshot.'], $context->messages, "$outcome must not claim a published patch.");
+    }
+
+    [$unavailable, $unavailableHost, $unavailableContext] = execute(['applied'], ['plugin_not_enabled']);
+    same('failed', $unavailable->status, 'An unavailable host snapshot must fail closed.');
+    same(false, $unavailable->success, 'An unavailable host snapshot must not report success.');
+    same(0, count($unavailableHost->applies), 'An unavailable host snapshot must not attempt a file fallback.');
+    same(0, $unavailable->data['programmes_updated'] ?? 0, 'An unavailable host snapshot must not report updates.');
+    same([], $unavailableContext->messages, 'A rejected snapshot must not claim processing or publication.');
     $source = (string) file_get_contents(__DIR__.'/../Plugin.php'); foreach (['tmdb-cache.json', 'tmdb-season-cache.json', 'tmdb-images-cache.json'] as $owned) { same(true, str_contains($source, $owned), "Plugin-owned lookup state $owned must remain available."); } foreach (['enrichment-state.json', 'enrichment-checkpoint', 'programmes-', 'metadata.json'] as $forbidden) { same(false, str_contains($source, $forbidden), "Host EPG state marker $forbidden must not return."); }
     $reflection = new \ReflectionClass(Plugin::class); foreach (['saveEpgEnrichmentState', 'saveEnrichmentCheckpoint', 'loadEnrichmentState', 'loadEnrichmentCheckpoint'] as $removed) { same(false, $reflection->hasMethod($removed), "Legacy state method $removed must not be callable."); }
     echo "Enrichment cancellation state tests passed.\n";
