@@ -73,11 +73,16 @@ namespace App\Services {
         public array $applies = [];
         public array $applyStatuses = ['applied'];
         public array $snapshotStatuses = [];
+        public array $pages = [];
         public function snapshot(object $context, object $epg, array $selection = []): array
         {
             $this->snapshots[] = $selection;
             if (($status = array_shift($this->snapshotStatuses)) !== null) {
                 return ['status' => $status];
+            }
+            $page = $this->pages[count($this->snapshots) - 1] ?? null;
+            if ($page !== null) {
+                return ['status' => 'ok', 'token' => 'token-'.count($this->snapshots), 'programmes' => $page['programmes'], 'next_cursor' => $page['next_cursor'] ?? null];
             }
             return ['status' => 'ok', 'token' => 'token-'.count($this->snapshots), 'programmes' => [['locator' => 'programme:MQ==', 'row_revision' => 'revision-'.count($this->snapshots), 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']],], 'next_cursor' => null];
         }
@@ -103,11 +108,12 @@ namespace Tests {
     use ReflectionMethod;
 
     function assertSameValue(mixed $expected, mixed $actual, string $message): void { if ($expected !== $actual) { fwrite(STDERR, $message."\nExpected: ".var_export($expected, true)."\nActual: ".var_export($actual, true)."\n"); exit(1); } }
-    function runFixture(array $statuses = ['applied'], array $snapshotStatuses = [], int $cancelAfterChecks = PHP_INT_MAX): array
+    function runFixture(array $statuses = ['applied'], array $snapshotStatuses = [], int $cancelAfterChecks = PHP_INT_MAX, array $pages = []): array
     {
         $host = new EpgCacheEnrichmentService();
         $host->applyStatuses = $statuses;
         $host->snapshotStatuses = $snapshotStatuses;
+        $host->pages = $pages;
         $GLOBALS['hostEnrichmentServices'] = [EpgCacheService::class => new EpgCacheService(), TmdbService::class => new TmdbService(), EpgCacheEnrichmentService::class => $host, GeneralSettings::class => new GeneralSettings()];
         $method = new ReflectionMethod(new Plugin(), 'doEnrich');
         $method->setAccessible(true);

@@ -887,7 +887,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      * Resolve EPG channel_id strings that are mapped in the given playlists.
      *
      * @param  array<int>  $playlistIds
-     * @return array<string> EPG channel_id strings used in JSONL files
+     * @return array<string> canonical EPG channel IDs eligible for enrichment
      */
     private function resolveTargetChannelIds(int $epgId, array $playlistIds): array
     {
@@ -903,7 +903,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ->distinct()
             ->pluck('epg_channel_id');
 
-        // Map to the string channel_id used in JSONL, filtered to this EPG
+        // Map enabled playlist channels to canonical EPG channel IDs for this source.
         return EpgChannel::query()
             ->where('epg_id', $epgId)
             ->whereIn('id', $epgChannelDbIds)
