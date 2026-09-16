@@ -66,7 +66,7 @@ namespace App\Models {
 
 namespace App\Services {
     class EpgCacheService { public function isCacheValid(object $epg): bool { return true; } }
-    class TmdbService { public function isConfigured(): bool { return true; } }
+    class TmdbService { protected string $language = ''; public function isConfigured(): bool { return true; } }
     class EpgCacheEnrichmentService
     {
         public array $snapshots = [];

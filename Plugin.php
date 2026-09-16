@@ -790,6 +790,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (! $tmdb->isConfigured()) {
             return PluginActionResult::failure('TMDB API key not configured; no enrichment was applied.');
         }
+        $tmdbLanguage = $this->effectiveTmdbLanguage($settings);
+        try {
+            $this->setTmdbLanguage($tmdb, $tmdbLanguage);
+        } catch (\Throwable) {
+            return PluginActionResult::failure('TMDB language configuration could not be applied; no enrichment was applied.');
+        }
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
         $imagesCache = $this->loadTmdbImagesCache();
@@ -812,7 +818,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     continue;
                 }
                 $pageStats['programmes_processed']++;
-                $result = $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => '']);
+                $result = $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage]);
                 $pageStats['tmdb_lookups'] += $result['lookup'] ? 1 : 0;
                 $pageStats['tmdb_cache_hits'] += $result['cache_hit'] ? 1 : 0;
                 $changes = $this->canonicalHostChanges($row['programme'], $programme);
@@ -834,11 +840,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     if (($retry['status'] ?? null) !== 'ok') {
                         return PluginActionResult::failure('Host EPG retry snapshot rejected: '.($retry['status'] ?? 'unknown').'.');
                     }
-                    $retryPatches = array_map(fn (array $retryRow): array => ['locator' => $retryRow['locator'] ?? '', 'row_revision' => $retryRow['row_revision'] ?? '', 'changes' => $this->canonicalHostChanges($retryRow['programme'] ?? [], $this->enrichCopy($retryRow['programme'] ?? [], $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId))], array_filter($retry['programmes'] ?? [], fn (array $retryRow): bool => in_array(($retryRow['programme']['channel'] ?? null), $targetChannels, true)));
+                    $retryPatches = array_map(fn (array $retryRow): array => ['locator' => $retryRow['locator'] ?? '', 'row_revision' => $retryRow['row_revision'] ?? '', 'changes' => $this->canonicalHostChanges($retryRow['programme'] ?? [], $this->enrichCopy($retryRow['programme'] ?? [], $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage))], array_filter($retry['programmes'] ?? [], fn (array $retryRow): bool => in_array(($retryRow['programme']['channel'] ?? null), $targetChannels, true)));
                     $retryPatches = array_values(array_filter($retryPatches, fn (array $patch): bool => $patch['changes'] !== []));
                     $appliedPatches = $retryPatches;
                     $apply = $retryPatches === [] ? ['status' => 'noop'] : $service->apply($context, $epg, (string) ($retry['token'] ?? ''), $retryPatches);
                     $status = $apply['status'] ?? 'unknown';
+                    $snapshot = $retry;
                 }
                 if ($status === 'applied') {
                     $pageStats['programmes_updated'] += count($appliedPatches);
@@ -856,9 +863,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return PluginActionResult::success("Enrichment complete for '{$epg->name}': {$stats['programmes_updated']}/{$stats['programmes_processed']} programmes updated.", $stats);
     }
 
-    private function enrichCopy(array $programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId): array
+    private function enrichCopy(array $programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage): array
     {
-        $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => '']);
+        $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage]);
         return $programme;
     }
 
@@ -3375,6 +3382,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     {
         $property = new ReflectionProperty($tmdb, 'language');
         $property->setValue($tmdb, $language);
+    }
+
+    /**
+     * Resolve the per-plugin override once, falling back to the host-wide TMDB language.
+     */
+    private function effectiveTmdbLanguage(array $settings): string
+    {
+        $language = trim((string) ($settings['tmdb_language'] ?? ''));
+        if ($language !== '') {
+            return $language;
+        }
+
+        try {
+            $language = trim((string) (app(GeneralSettings::class)->tmdb_language ?? ''));
+        } catch (\Throwable) {
+            $language = '';
+        }
+
+        return $language !== '' ? $language : 'de-DE';
     }
 
     /**

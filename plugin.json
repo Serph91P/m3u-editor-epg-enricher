@@ -194,7 +194,6 @@
     ],
     "tables": [],
     "files": [
-      "plugin-data/epg-enricher/enrichment-state.json",
       "plugin-data/epg-enricher/tmdb-season-cache.json"
     ],
     "default_cleanup_policy": "preserve"

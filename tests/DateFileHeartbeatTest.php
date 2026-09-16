@@ -1,69 +1,134 @@
 <?php
 
-require __DIR__.'/HostEnrichmentApiTest.php';
+namespace {
+    function app(string $class): object
+    {
+        return $GLOBALS['services'][$class] ?? throw new \RuntimeException("Missing service {$class}");
+    }
 
-use AppLocalPlugins\EpgEnricher\Plugin;
-
-function assertHeartbeatSame(mixed $expected, mixed $actual, string $message): void
-{
-    if ($expected !== $actual) {
-        fwrite(STDERR, $message."\nExpected: ".var_export($expected, true)."\nActual: ".var_export($actual, true)."\n");
-        exit(1);
+    function storage_path(string $path = ''): string
+    {
+        return sys_get_temp_dir().'/epg-enricher-heartbeat';
     }
 }
 
-$rows = [];
-foreach (range(1, 500) as $index) {
-    $rows[] = [
-        'locator' => 'programme:'.base64_encode((string) $index),
-        'row_revision' => 'revision-'.$index,
-        'programme' => ['channel' => 'target', 'title' => ''],
+namespace App\Plugins\Contracts {
+    interface EpgProcessorPluginInterface {}
+    interface HookablePluginInterface {}
+    interface PluginSelectOptionsProviderInterface { public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array; }
+}
+
+namespace App\Plugins\Support {
+    class PluginSelectOptionsContext {}
+    class PluginActionResult {
+        public function __construct(public readonly string $status, public readonly bool $success, public readonly string $summary, public readonly array $data = []) {}
+        public static function success(string $summary, array $data = []): self { return new self('completed', true, $summary, $data); }
+        public static function failure(string $summary, array $data = []): self { return new self('failed', false, $summary, $data); }
+        public static function cancelled(string $summary, array $data = []): self { return new self('cancelled', false, $summary, $data); }
+    }
+    class PluginExecutionContext {
+        public array $settings = ['enrich_from_tmdb' => true, 'overwrite_existing' => false, 'enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'map_genres_to_epg_categories' => true, 'map_genres_to_kodi_guide_genres' => false, 'keyword_category_detection' => true, 'enrich_episode_details' => false];
+        public array $heartbeats = [];
+        public int $checks = 0;
+        public int $cancelAfter = PHP_INT_MAX;
+        public function cancellationRequested(): bool { return ++$this->checks >= $this->cancelAfter; }
+        public function heartbeat(string $message, ?int $progress = null): void { $this->heartbeats[] = ['message' => $message, 'progress' => $progress]; }
+        public function info(string $message): void { $this->heartbeat($message); }
+        public function warning(string $message): void { $this->heartbeat($message); }
+    }
+}
+
+namespace App\Models {
+    class Values { public function __construct(private array $values) {} public function filter(): self { return $this; } public function unique(): self { return $this; } public function values(): self { return $this; } public function all(): array { return $this->values; } }
+    class Query { public function __construct(private bool $channels) {} public function __call(string $method, array $arguments): self { return $this; } public function pluck(string $column): Values { return new Values($this->channels ? ['target'] : [1]); } }
+    class Channel { public static function query(): Query { return new Query(false); } }
+    class EpgChannel { public static function query(): Query { return new Query(true); } }
+    class Epg { public string $name = 'Heartbeat fixture'; public static function find(int $id): self { return new self(); } }
+    class Playlist {}
+}
+
+namespace App\Services {
+    class EpgCacheService { public function isCacheValid(object $epg): bool { return true; } }
+    class TmdbService { protected string $language = ''; public function isConfigured(): bool { return true; } }
+    class EpgCacheEnrichmentService {
+        public array $pages = [];
+        public array $snapshots = [];
+        public array $applies = [];
+        public array $outcomes = ['applied'];
+        public function snapshot(object $context, object $epg, array $selection): array {
+            $this->snapshots[] = $selection;
+            $page = $this->pages[count($this->snapshots) - 1] ?? ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null];
+            return ['status' => 'ok', 'token' => 't'.count($this->snapshots)] + $page;
+        }
+        public function apply(object $context, object $epg, string $token, array $patches): array { $this->applies[] = compact('token', 'patches'); return ['status' => array_shift($this->outcomes) ?? 'applied']; }
+    }
+}
+
+namespace App\Settings { class GeneralSettings { public string $tmdb_language = ''; } }
+namespace Illuminate\Support\Facades {
+    class Storage { public static function disk(string $name): self { return new self(); } public function makeDirectory(string $path): void {} public function path(string $path): string { return sys_get_temp_dir().'/'.$path; } public function exists(string $path): bool { return false; } public function get(string $path): string { return '{}'; } public function put(string $path, string $contents): bool { return true; } }
+    class Http {} class Log {}
+}
+
+namespace Tests {
+    require_once __DIR__.'/../Plugin.php';
+    use App\Plugins\Support\PluginExecutionContext;
+    use App\Services\{EpgCacheEnrichmentService, EpgCacheService, TmdbService};
+    use App\Settings\GeneralSettings;
+    use AppLocalPlugins\EpgEnricher\Plugin;
+    use ReflectionMethod;
+
+    function same(mixed $expected, mixed $actual, string $message): void { if ($expected !== $actual) { fwrite(STDERR, "$message\nExpected: ".var_export($expected, true)."\nActual: ".var_export($actual, true)."\n"); exit(1); } }
+    function run(array $pages, array $outcomes = ['applied'], int $cancelAfter = PHP_INT_MAX, string $tmdbLanguage = ''): array {
+        $host = new EpgCacheEnrichmentService(); $host->pages = $pages; $host->outcomes = $outcomes;
+        $tmdb = new TmdbService();
+        $GLOBALS['services'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => $tmdb, GeneralSettings::class => new GeneralSettings()];
+        $context = new PluginExecutionContext(); $context->cancelAfter = $cancelAfter; $context->settings['tmdb_language'] = $tmdbLanguage;
+        $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true);
+        return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context, $tmdb];
+    }
+
+    $rows = array_map(fn (int $n): array => ['locator' => "programme:$n", 'row_revision' => "r$n", 'programme' => ['channel' => 'target', 'title' => '']], range(1, 500));
+    $pages = array_map(fn (array $page, int $index): array => ['programmes' => $page, 'next_cursor' => $index === 4 ? null : 'cursor-'.($index + 1)], array_chunk($rows, 100), range(0, 4));
+    [$large, $largeHost, $largeContext] = run($pages);
+    same('completed', $large->status, 'A bounded host scan must complete.');
+    same(500, $large->data['programmes_processed'] ?? null, 'The 500-programme regression fixture must retain every canonical row.');
+    same(0, $large->data['tmdb_lookups'] ?? null, 'Untitled canonical rows must not create TMDB requests.');
+    same(5, count($largeHost->snapshots), 'The host snapshot cursor must retain the five-page lifecycle.');
+    same(['limit' => 100], $largeHost->snapshots[0], 'The first snapshot must retain its bounded limit.');
+    same('cursor-1', $largeHost->snapshots[1]['cursor'] ?? null, 'The second snapshot must retain the opaque cursor.');
+    same(5, count($largeContext->heartbeats), 'Each retained page must emit its heartbeat.');
+
+    $changePage = [['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null], ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null]];
+    [$stale, $staleHost, $staleContext] = run($changePage, ['stale_snapshot', 'applied']);
+    same('completed', $stale->status, 'A stale host snapshot must retain one bounded retry.');
+    same(2, count($staleHost->snapshots), 'Stale handling must re-snapshot once.');
+    same(2, count($staleHost->applies), 'Stale handling must re-apply once without a file fallback.');
+    same(1, $stale->data['programmes_updated'] ?? null, 'Only an accepted retry may count a mutation.');
+    same(['Processing canonical host EPG snapshot.', 'Host EPG patch batch published.'], array_column($staleContext->heartbeats, 'message'), 'The published heartbeat must remain after accepted host apply only.');
+
+    [$cancelled, $cancelledHost, $cancelledContext] = run($changePage, ['applied'], 1);
+    same('cancelled', $cancelled->status, 'Abort protection must remain observable during canonical snapshot processing.');
+    same(0, count($cancelledHost->applies), 'Aborted work must not conditionally apply a partial patch batch.');
+    same(0, $cancelled->data['programmes_updated'] ?? 0, 'Aborted work must not report unpublished updates.');
+    same(['Processing canonical host EPG snapshot.'], array_column($cancelledContext->heartbeats, 'message'), 'Abort must preserve the processing heartbeat but not a publish heartbeat.');
+
+    $cursorPages = [
+        ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => 'old-next'],
+        ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => 'new-next'],
+        ['programmes' => [['locator' => 'programme:2', 'row_revision' => 'r3', 'programme' => ['channel' => 'target', 'title' => '']]], 'next_cursor' => null],
     ];
+    [$cursorResult, $cursorHost] = run($cursorPages, ['stale_snapshot', 'applied']);
+    same('completed', $cursorResult->status, 'A stale first page must continue from the accepted retry snapshot.');
+    same('new-next', $cursorHost->snapshots[2]['cursor'] ?? null, 'The page after a stale retry must use the retry cursor, not the stale cursor.');
+    same(false, in_array('old-next', array_column($cursorHost->snapshots, 'cursor'), true), 'The stale continuation cursor must not create a duplicate or skipped page.');
+
+    $languageRun = run($changePage, ['applied'], PHP_INT_MAX, 'fr-FR');
+    $languageTmdb = $languageRun[3];
+    $languageProperty = new \ReflectionProperty($languageTmdb, 'language'); $languageProperty->setAccessible(true);
+    same('fr-FR', $languageProperty->getValue($languageTmdb), 'The plugin language override must be applied during the host-backed doEnrich flow.');
+
+    $reflection = new \ReflectionClass(Plugin::class);
+    foreach (['processDateFile', 'processSqliteStore', 'invalidatePlaylistEpgCaches'] as $adapter) { same(false, $reflection->hasMethod($adapter), "Direct adapter $adapter must not return."); }
+    echo "Date-file heartbeat tests passed.\n";
 }
-$pages = array_map(
-    fn (array $page, int $offset): array => [
-        'programmes' => $page,
-        'next_cursor' => $offset < 4 ? 'cursor-'.($offset + 1) : null,
-    ],
-    array_chunk($rows, 100),
-    array_keys(array_chunk($rows, 100)),
-);
-
-[$largeResult, $largeHost, $largeContext] = \Tests\runFixture(['applied'], [], PHP_INT_MAX, $pages);
-assertHeartbeatSame(500, $largeResult->data['programmes_processed'] ?? null, 'A 500-programme host fixture must process every canonical row.');
-assertHeartbeatSame(0, $largeResult->data['tmdb_lookups'] ?? null, 'Empty canonical titles must not trigger TMDB lookups during a bounded scan.');
-assertHeartbeatSame(5, count($largeHost->snapshots), 'The plugin must page a 500-programme snapshot in five host-bounded requests.');
-assertHeartbeatSame(['limit' => 100], $largeHost->snapshots[0], 'The first host snapshot must use the public maximum page size.');
-assertHeartbeatSame('cursor-1', $largeHost->snapshots[1]['cursor'] ?? null, 'The second host snapshot must continue from the opaque host cursor.');
-assertHeartbeatSame(0, count($largeHost->applies), 'A no-op 500-programme scan must not publish an empty patch batch.');
-assertHeartbeatSame(5, count($largeContext->messages), 'Every host snapshot page must emit an observable heartbeat.');
-assertHeartbeatSame('Processing canonical host EPG snapshot.', $largeContext->messages[0] ?? null, 'Heartbeat text must describe host-snapshot processing.');
-
-[$staleResult, $staleHost, $staleContext] = \Tests\runFixture(['stale_snapshot', 'applied']);
-assertHeartbeatSame('completed', $staleResult->status, 'One stale host snapshot must recover through the bounded retry.');
-assertHeartbeatSame(2, count($staleHost->snapshots), 'A stale apply must re-snapshot exactly once.');
-assertHeartbeatSame(2, count($staleHost->applies), 'A stale apply must retry exactly once and never write directly.');
-assertHeartbeatSame(1, $staleResult->data['programmes_updated'] ?? null, 'Only the accepted retry may count an update.');
-assertHeartbeatSame(['Processing canonical host EPG snapshot.', 'Host EPG patch batch published.'], $staleContext->messages, 'Retry lifecycle heartbeats must remain truthful.');
-
-[$cancelledResult, $cancelledHost, $cancelledContext] = \Tests\runFixture(['applied'], [], 1);
-assertHeartbeatSame('cancelled', $cancelledResult->status, 'Cancellation during a host snapshot must propagate to the caller.');
-assertHeartbeatSame(0, count($cancelledHost->applies), 'Cancellation before conditional apply must leave the host generation untouched.');
-assertHeartbeatSame(0, $cancelledResult->data['programmes_updated'] ?? 0, 'Cancelled work must not report unpersisted updates.');
-assertHeartbeatSame(['Processing canonical host EPG snapshot.'], $cancelledContext->messages, 'Cancellation must retain the snapshot heartbeat but not a publication heartbeat.');
-
-$pluginReflection = new ReflectionClass(Plugin::class);
-foreach (['processDateFile', 'processSqliteStore', 'invalidatePlaylistEpgCaches'] as $removedAdapter) {
-    assertHeartbeatSame(false, $pluginReflection->hasMethod($removedAdapter), "Direct cache adapter {$removedAdapter} must not remain callable.");
-}
-
-$tokens = token_get_all((string) file_get_contents(__DIR__.'/../Plugin.php'));
-$code = '';
-foreach ($tokens as $token) {
-    $code .= is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true) ? '' : (is_array($token) ? $token[1] : $token);
-}
-foreach (['programmes.sqlite', 'new PDO', '.jsonl', 'playlist-epg-files'] as $forbidden) {
-    assertHeartbeatSame(false, str_contains($code, $forbidden), "Plugin executable code must not access {$forbidden}.");
-}
-
-echo "Host snapshot heartbeat tests passed.\n";

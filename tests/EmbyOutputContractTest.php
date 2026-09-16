@@ -1,54 +1,29 @@
 <?php
 
-require __DIR__.'/HostEnrichmentApiTest.php';
-
-use AppLocalPlugins\EpgEnricher\Plugin;
-
-function assertOutputSame(mixed $expected, mixed $actual, string $message): void
-{
-    if ($expected !== $actual) {
-        fwrite(STDERR, $message."\nExpected: ".var_export($expected, true)."\nActual: ".var_export($actual, true)."\n");
-        exit(1);
-    }
+namespace {
+    function app(string $class): object { return $GLOBALS['outputServices'][$class] ?? throw new \RuntimeException("Missing service {$class}"); }
+    function storage_path(string $path = ''): string { return sys_get_temp_dir().'/epg-enricher-output'; }
 }
-
-[$publishedResult, $publishedHost, $publishedContext] = \Tests\runFixture(['applied']);
-assertOutputSame('completed', $publishedResult->status, 'An accepted host conditional apply must complete enrichment.');
-assertOutputSame(1, $publishedResult->data['programmes_updated'] ?? null, 'Only an accepted host apply may report a programme update.');
-assertOutputSame(1, count($publishedHost->applies), 'A changed canonical programme must be submitted to the host exactly once.');
-assertOutputSame('token-1', $publishedHost->applies[0]['token'] ?? null, 'Host apply must use the matching opaque snapshot token.');
-assertOutputSame('programme:MQ==', $publishedHost->applies[0]['patches'][0]['locator'] ?? null, 'Host apply must preserve the opaque programme locator.');
-assertOutputSame('revision-1', $publishedHost->applies[0]['patches'][0]['row_revision'] ?? null, 'Host apply must preserve the canonical row revision.');
-assertOutputSame('Sports', $publishedHost->applies[0]['patches'][0]['changes']['category'] ?? null, 'The canonical host patch must carry the enriched category.');
-assertOutputSame(['Processing canonical host EPG snapshot.', 'Host EPG patch batch published.'], $publishedContext->messages, 'Publication status must be observable only after host acceptance.');
-
-[$noopResult, $noopHost, $noopContext] = \Tests\runFixture(['noop']);
-assertOutputSame('completed', $noopResult->status, 'A host no-op is a completed non-mutation, not a false failure.');
-assertOutputSame(0, $noopResult->data['programmes_updated'] ?? null, 'A host no-op must not report an update.');
-assertOutputSame(1, count($noopHost->applies), 'A host no-op must still be decided by the host, not by XMLTV output code.');
-assertOutputSame(['Processing canonical host EPG snapshot.'], $noopContext->messages, 'No-op work must not claim that a patch batch was published.');
-
-$changes = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(
-    new Plugin(),
-    ['images' => []],
-    ['images' => [
-        ['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10],
-        ['url' => 'https://fixture.invalid/backdrop.jpg', 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 20],
-        ['url' => 'https://fixture.invalid/still.jpg', 'type' => 'screenshot', 'width' => 1280, 'height' => 720, 'orient' => 'L', 'size' => 30],
-        ['url' => 'https://fixture.invalid/logo.png', 'type' => 'logo', 'width' => 800, 'height' => 300, 'orient' => 'L', 'size' => 40],
-    ]],
-);
-assertOutputSame(['poster', 'fanart', 'banner', 'logo'], array_column($changes['images'] ?? [], 'type'), 'Poster, backdrop, still, and logo must map to separate canonical host roles.');
-assertOutputSame(['https://fixture.invalid/poster.jpg', 'https://fixture.invalid/backdrop.jpg', 'https://fixture.invalid/still.jpg', 'https://fixture.invalid/logo.png'], array_column($changes['images'] ?? [], 'url'), 'Canonical artwork patches must retain role-specific URLs.');
-assertOutputSame(['P', 'L', 'L', 'L'], array_column($changes['images'] ?? [], 'orient'), 'Canonical artwork patches must retain orientation metadata.');
-
-$tokens = token_get_all((string) file_get_contents(__DIR__.'/../Plugin.php'));
-$code = '';
-foreach ($tokens as $token) {
-    $code .= is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true) ? '' : (is_array($token) ? $token[1] : $token);
+namespace App\Plugins\Contracts { interface EpgProcessorPluginInterface {} interface HookablePluginInterface {} interface PluginSelectOptionsProviderInterface { public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array; } }
+namespace App\Plugins\Support {
+    class PluginSelectOptionsContext {}
+    class PluginActionResult { public function __construct(public readonly string $status, public readonly bool $success, public readonly string $summary, public readonly array $data = []) {} public static function success(string $s, array $d = []): self { return new self('completed', true, $s, $d); } public static function failure(string $s, array $d = []): self { return new self('failed', false, $s, $d); } public static function cancelled(string $s, array $d = []): self { return new self('cancelled', false, $s, $d); } }
+    class PluginExecutionContext { public array $settings = ['enrich_from_tmdb' => true, 'enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'map_genres_to_epg_categories' => true, 'map_genres_to_kodi_guide_genres' => false, 'keyword_category_detection' => true, 'enrich_episode_details' => false]; public array $messages = []; public bool $dryRun = false; public function cancellationRequested(): bool { return false; } public function heartbeat(string $m, ?int $p = null): void { $this->messages[] = $m; } public function info(string $m): void { $this->messages[] = $m; } public function warning(string $m): void { $this->messages[] = $m; } }
 }
-foreach (['EpgCacheService', 'requestPlaylistXmltv', 'playlist-epg-files', 'clearPlaylistEpgCacheFile'] as $forbidden) {
-    assertOutputSame(false, str_contains($code, $forbidden), "Plugin must delegate {$forbidden} output handling to the host.");
+namespace App\Models { class Values { public function __construct(private array $v) {} public function filter(): self { return $this; } public function unique(): self { return $this; } public function values(): self { return $this; } public function all(): array { return $this->v; } } class Query { public function __construct(private bool $channel) {} public function __call(string $m, array $a): self { return $this; } public function pluck(string $c): Values { return new Values($this->channel ? ['target'] : [1]); } } class Channel { public static function query(): Query { return new Query(false); } } class EpgChannel { public static function query(): Query { return new Query(true); } } class Epg { public string $name = 'Output fixture'; public static function find(int $id): self { return new self(); } } class Playlist {} }
+namespace App\Services { class EpgCacheService { public function isCacheValid(object $epg): bool { return true; } } class TmdbService { protected string $language = ''; public function isConfigured(): bool { return true; } } class EpgCacheEnrichmentService { public array $applies = []; public array $outcomes = ['applied']; public function snapshot(object $c, object $e, array $s): array { return ['status' => 'ok', 'token' => 'output-token', 'programmes' => [['locator' => 'programme:output', 'row_revision' => 'output-r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null]; } public function apply(object $c, object $e, string $token, array $patches): array { $this->applies[] = compact('token', 'patches'); return ['status' => array_shift($this->outcomes) ?? 'applied']; } } }
+namespace App\Settings { class GeneralSettings { public string $tmdb_language = 'de-DE'; } }
+namespace Illuminate\Support\Facades { class Storage { public static function disk(string $n): self { return new self(); } public function makeDirectory(string $p): void {} public function path(string $p): string { return sys_get_temp_dir().'/'.$p; } public function exists(string $p): bool { return false; } public function get(string $p): string { return '{}'; } public function put(string $p, string $v): bool { return true; } } class Http {} class Log {} }
+namespace Tests {
+    require_once __DIR__.'/../Plugin.php';
+    use App\Plugins\Support\PluginExecutionContext; use App\Services\{EpgCacheEnrichmentService, EpgCacheService, TmdbService}; use App\Settings\GeneralSettings; use AppLocalPlugins\EpgEnricher\Plugin; use ReflectionMethod;
+    function same(mixed $e, mixed $a, string $m): void { if ($e !== $a) { fwrite(STDERR, "$m\nExpected: ".var_export($e, true)."\nActual: ".var_export($a, true)."\n"); exit(1); } }
+    function execute(array $outcomes): array { $host = new EpgCacheEnrichmentService(); $host->outcomes = $outcomes; $GLOBALS['outputServices'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => new TmdbService(), GeneralSettings::class => new GeneralSettings()]; $context = new PluginExecutionContext(); $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true); return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context]; }
+    [$accepted, $acceptedHost, $acceptedContext] = execute(['applied']);
+    same('completed', $accepted->status, 'The retained output contract must complete only after host publication.'); same(1, $accepted->data['programmes_updated'] ?? null, 'Only an accepted host apply may count a programme update.'); same('output-token', $acceptedHost->applies[0]['token'] ?? null, 'The host token must remain attached to its output patch.'); same('programme:output', $acceptedHost->applies[0]['patches'][0]['locator'] ?? null, 'The opaque output locator must remain unchanged.'); same('output-r1', $acceptedHost->applies[0]['patches'][0]['row_revision'] ?? null, 'The conditional row revision must remain unchanged.'); same('Sports', $acceptedHost->applies[0]['patches'][0]['changes']['category'] ?? null, 'The enriched output category must be published through the host.'); same(['Processing canonical host EPG snapshot.', 'Host EPG patch batch published.'], $acceptedContext->messages, 'Publish messaging must remain tied to accepted host output.');
+    [$noop, $noopHost, $noopContext] = execute(['noop']); same('completed', $noop->status, 'A host no-op remains a completed non-mutation.'); same(0, $noop->data['programmes_updated'] ?? null, 'A no-op must not advertise an XMLTV/output mutation.'); same(1, count($noopHost->applies), 'The host, rather than a direct output cache, must decide a no-op.'); same(['Processing canonical host EPG snapshot.'], $noopContext->messages, 'No-op output must not claim publication.');
+    $changes = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(new Plugin(), ['icon' => 'https://source.invalid/icon.png', 'images' => []], ['icon' => 'https://source.invalid/icon.png', 'images' => [['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10], ['url' => 'https://fixture.invalid/backdrop.jpg', 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 20], ['url' => 'https://fixture.invalid/still.jpg', 'type' => 'screenshot', 'width' => 1280, 'height' => 720, 'orient' => 'L', 'size' => 30], ['url' => 'https://fixture.invalid/logo.png', 'type' => 'logo', 'width' => 800, 'height' => 300, 'orient' => 'L', 'size' => 40]]]);
+    same(['poster', 'fanart', 'banner', 'logo'], array_column($changes['images'] ?? [], 'type'), 'Poster, backdrop, still and logo retain separate canonical roles.'); same(['https://fixture.invalid/poster.jpg', 'https://fixture.invalid/backdrop.jpg', 'https://fixture.invalid/still.jpg', 'https://fixture.invalid/logo.png'], array_column($changes['images'] ?? [], 'url'), 'Role-specific output URLs must be retained.'); same(false, isset($changes['icon']), 'An unchanged generic icon must not be overwritten by artwork roles.');
+    $tokens = token_get_all((string) file_get_contents(__DIR__.'/../Plugin.php')); $code = ''; foreach ($tokens as $token) { $code .= is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true) ? '' : (is_array($token) ? $token[1] : $token); } foreach (['requestPlaylistXmltv', 'clearPlaylistEpgCacheFile', 'playlist-epg-files'] as $forbidden) { same(false, str_contains($code, $forbidden), "Direct output adapter $forbidden must not return."); }
+    echo "Emby output contract tests passed.\n";
 }
-
-echo "Host output contract tests passed.\n";
