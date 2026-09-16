@@ -2047,7 +2047,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         if (empty($image['url'])
             || $orient !== 'L'
-            || ! in_array($type, ['backdrop', 'fanart', 'screenshot'], true)
+            || (! in_array($type, ['backdrop', 'fanart', 'screenshot'], true) && ! $canonicalTmdbRole)
             || ($source !== 'tmdb' && ! $canonicalTmdbRole && ! in_array($scope, ['programme', 'movie', 'series', 'episode'], true))) {
             return false;
         }

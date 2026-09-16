@@ -51,20 +51,26 @@ namespace Tests {
     same(['P', 'L', 'L', 'L'], array_column($changes['images'] ?? [], 'orient'), 'Artwork orientations must remain role-specific.');
     same([10, 20, 30, 40], array_column($changes['images'] ?? [], 'size'), 'Artwork sizes must survive canonical serialization.');
     same(false, isset($changes['icon']), 'An unchanged generic icon must not be overwritten by artwork roles.');
-    $hostRoundTrip = [
-        'icon' => 'https://image.tmdb.org/t/p/w1280/host-fanart.jpg',
-        'images' => [[
-            'url' => 'https://image.tmdb.org/t/p/w1280/host-fanart.jpg',
-            'type' => 'fanart',
-            'width' => 1280,
-            'height' => 720,
-            'orient' => 'L',
-            'size' => 1,
-        ]],
-    ];
     $trustedLandscape = new ReflectionMethod(Plugin::class, 'hasTrustedLandscapeIcon');
     $trustedLandscape->setAccessible(true);
-    same(true, $trustedLandscape->invoke(new Plugin(), $hostRoundTrip), 'A canonical host round-trip of a TMDB fanart role must remain trusted and avoid repeated artwork repair.');
+    foreach (['fanart', 'banner'] as $canonicalRole) {
+        $hostRoundTrip = [
+            'icon' => "https://image.tmdb.org/t/p/w1280/host-{$canonicalRole}.jpg",
+            'images' => [[
+                'url' => "https://image.tmdb.org/t/p/w1280/host-{$canonicalRole}.jpg",
+                'type' => $canonicalRole,
+                'width' => 1280,
+                'height' => 720,
+                'orient' => 'L',
+                'size' => 1,
+            ]],
+        ];
+        same(true, $trustedLandscape->invoke(new Plugin(), $hostRoundTrip), "A canonical host round-trip of a TMDB {$canonicalRole} role must remain trusted and avoid repeated artwork repair.");
+    }
+    $untrustedBannerRoundTrip = $hostRoundTrip;
+    $untrustedBannerRoundTrip['icon'] = 'https://untrusted.invalid/host-banner.jpg';
+    $untrustedBannerRoundTrip['images'][0]['url'] = $untrustedBannerRoundTrip['icon'];
+    same(false, $trustedLandscape->invoke(new Plugin(), $untrustedBannerRoundTrip), 'A source-less banner outside the verified TMDB host must not become trusted.');
     $tokens = token_get_all((string) file_get_contents(__DIR__.'/../Plugin.php')); $code = ''; foreach ($tokens as $token) { $code .= is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true) ? '' : (is_array($token) ? $token[1] : $token); } foreach (['requestPlaylistXmltv', 'clearPlaylistEpgCacheFile', 'playlist-epg-files'] as $forbidden) { same(false, str_contains($code, $forbidden), "Direct output adapter $forbidden must not return."); }
     echo "Emby output contract tests passed.\n";
 }
