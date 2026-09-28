@@ -778,6 +778,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         } catch (\Throwable) {
             return PluginActionResult::failure('Host EPG enrichment API is unavailable; no cache files were accessed.');
         }
+        if (! method_exists($service, 'snapshot') || ! method_exists($service, 'apply')) {
+            return PluginActionResult::failure('Host EPG enrichment API is unavailable; no cache files were accessed.');
+        }
         $targetChannels = $this->resolveTargetChannelIds($epgId, $playlistIds);
         if ($targetChannels === []) {
             return PluginActionResult::success('No playlist channels are mapped to this EPG - nothing to enrich.');
@@ -800,11 +803,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
         $imagesCache = $this->loadTmdbImagesCache();
         $stats = ['programmes_processed' => 0, 'programmes_updated' => 0, 'programmes_already_enriched' => 0, 'posters_added' => 0, 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
-        $cursor = null;
+        $afterId = 0;
         do {
-            $snapshot = $service->snapshot($context, $epg, array_filter(['limit' => 100, 'cursor' => $cursor], fn ($value): bool => $value !== null));
+            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
             if (($snapshot['status'] ?? null) !== 'ok') {
-                return PluginActionResult::failure('Host EPG snapshot rejected: '.($snapshot['status'] ?? 'unknown').'.');
+                return PluginActionResult::failure('Host EPG snapshot rejected: '.($snapshot['status'] ?? 'unknown').'.', $stats);
             }
             $context->heartbeat('Processing canonical host EPG snapshot.');
             $patches = [];
@@ -826,7 +829,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $pageStats['programmes_already_enriched']++;
                     continue;
                 }
-                $patches[] = ['locator' => $row['locator'] ?? '', 'row_revision' => $row['row_revision'] ?? '', 'changes' => $changes];
+                $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
                 $pageStats['posters_added'] += $result['poster'] ? 1 : 0;
                 $pageStats['categories_added'] += $result['category'] ? 1 : 0;
                 $pageStats['descriptions_added'] += $result['description'] ? 1 : 0;
@@ -836,20 +839,23 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
                 }
                 $appliedPatches = $patches;
-                $apply = $service->apply($context, $epg, (string) ($snapshot['token'] ?? ''), $patches);
+                $apply = $service->apply($context, $epg, $patches);
                 $status = $apply['status'] ?? 'unknown';
-                if (in_array($status, ['stale_snapshot', 'conflict'], true)) {
-                    $retry = $service->snapshot($context, $epg, array_filter(['limit' => 100, 'cursor' => $cursor], fn ($value): bool => $value !== null));
-                    if (($retry['status'] ?? null) !== 'ok') {
-                        return PluginActionResult::failure('Host EPG retry snapshot rejected: '.($retry['status'] ?? 'unknown').'.');
+                if ($status === 'stale') {
+                    if ($context->cancellationRequested()) {
+                        return PluginActionResult::cancelled('Enrichment cancelled before host retry.', $stats);
                     }
-                    $retryPatches = array_map(fn (array $retryRow): array => ['locator' => $retryRow['locator'] ?? '', 'row_revision' => $retryRow['row_revision'] ?? '', 'changes' => $this->canonicalHostChanges($retryRow['programme'] ?? [], $this->enrichCopy($retryRow['programme'] ?? [], $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage))], array_filter($retry['programmes'] ?? [], fn (array $retryRow): bool => in_array(($retryRow['programme']['channel'] ?? null), $targetChannels, true)));
+                    $retry = $service->snapshot($context, $epg, $afterId, 100);
+                    if (($retry['status'] ?? null) !== 'ok') {
+                        return PluginActionResult::failure('Host EPG retry snapshot rejected: '.($retry['status'] ?? 'unknown').'.', $stats);
+                    }
+                    $retryPatches = array_map(fn (array $retryRow): array => ['id' => $retryRow['id'] ?? 0, 'hash' => $retryRow['hash'] ?? '', 'changes' => $this->canonicalHostChanges($retryRow['programme'] ?? [], $this->enrichCopy($retryRow['programme'] ?? [], $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage))], array_filter($retry['programmes'] ?? [], fn (array $retryRow): bool => in_array(($retryRow['programme']['channel'] ?? null), $targetChannels, true)));
                     $retryPatches = array_values(array_filter($retryPatches, fn (array $patch): bool => $patch['changes'] !== []));
                     $appliedPatches = $retryPatches;
                     if ($retryPatches !== [] && $context->cancellationRequested()) {
                         return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
                     }
-                    $apply = $retryPatches === [] ? ['status' => 'noop'] : $service->apply($context, $epg, (string) ($retry['token'] ?? ''), $retryPatches);
+                    $apply = $retryPatches === [] ? ['status' => 'noop'] : $service->apply($context, $epg, $retryPatches);
                     $status = $apply['status'] ?? 'unknown';
                     $snapshot = $retry;
                 }
@@ -857,12 +863,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $pageStats['programmes_updated'] += count($appliedPatches);
                     $context->heartbeat('Host EPG patch batch published.');
                 } elseif ($status !== 'noop') {
-                    return PluginActionResult::failure('Host EPG apply rejected: '.$status.'. No updates were reported.');
+                    return PluginActionResult::failure('Host EPG apply rejected: '.$status.'. No updates were reported.', $stats);
                 }
             }
             $stats = $pageStats;
-            $cursor = $snapshot['next_cursor'] ?? null;
-        } while ($cursor !== null);
+            $afterId = $snapshot['next'] ?? null;
+        } while ($afterId !== null);
         $this->saveTmdbCache($tmdbCache);
         $this->saveTmdbSeasonCache($tmdbSeasonCache);
         $this->saveTmdbImagesCache($imagesCache);

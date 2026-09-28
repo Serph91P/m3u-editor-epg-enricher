@@ -15,7 +15,7 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 ## Requirements
 
 - TMDB API key configured in M3U Editor general settings
-- M3U Editor host API 1.1.0 or later, with `EpgCacheEnrichmentService` deployed before this plugin version is enabled
+- M3U Editor plugin API 1.0.0, with the `EpgCacheEnrichmentService` capability from [host PR #1556](https://github.com/m3ue/m3u-editor/pull/1556) deployed before this plugin version is enabled
 - At least one EPG source with a valid cache
 - Channels mapped to EPG channels in at least one playlist
 
@@ -51,15 +51,15 @@ Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because n
    - Checks the local TMDB title cache
    - If not cached, searches TMDB (movie first, then TV series)
    - Fetches full details (poster, backdrop, genres, overview)
-   - Submits bounded conditional patches; the host publishes accepted changes
+   - Reads bounded pages using the host's integer cursor and submits conditional `id`/`hash` patches; the host publishes accepted changes
 5. Programmes that already have metadata (e.g. from Schedules Direct / Gracenote) are skipped unless "Overwrite existing" is enabled
-6. Upgrade sequence: deploy the host API first, then enable this plugin release. Legacy caches remain read-only until the host has generated a supported immutable cache. This repository does not claim live server or Emby validation.
+6. Upgrade sequence: deploy the host capability first, then enable this plugin release. The manifest API version is 1.0.0 because the host validator requires an exact match; this does not imply that a pre-#1556 1.0.0 host provides the enrichment service. The plugin fails without that service and never uses direct cache access. This repository does not claim live server, XMLTV-consumer, or Emby validation.
 
 ## Artwork roles, XMLTV and clients
 
-The plugin submits separate canonical artwork roles through the host API: `poster` for portrait programme artwork, `backdrop` for landscape programme artwork, `screenshot` for episode stills, and `logo` for programme clearlogos. The host owns cache persistence and serialization; channel logos remain channel metadata. A backdrop does not satisfy an enabled poster requirement, and a poster never replaces the generic programme icon by itself.
+The plugin submits canonical artwork through the host API. The host accepts its canonical `poster`, `banner`, `fanart`, and `logo` image types; plugin `backdrop` and `screenshot` candidates are normalized to `fanart` and `banner` respectively before submission. The host owns cache persistence and serialization; channel logos remain channel metadata. A backdrop does not satisfy an enabled poster requirement, and a poster never replaces the generic programme icon by itself.
 
-For the current host export, `programme.icon` remains the generic `<icon>` fallback for icon-only XMLTV consumers. Typed `images` require the host serializer to emit standard XMLTV `<image>` elements; plugin-only changes cannot make an arbitrary consumer read roles it never imports. The approved host API contract is at m3u-editor `4a2cb859a48b9d24f3e873be34ccb3b22411a379`; no live server, XMLTV-consumer, or Emby validation is claimed here.
+For the current host export, `programme.icon` remains the generic `<icon>` fallback for icon-only XMLTV consumers. Plugin-only changes cannot make an arbitrary consumer read image roles it never imports. The pending host API contract is [m3u-editor PR #1556](https://github.com/m3ue/m3u-editor/pull/1556); no live server, XMLTV-consumer, or Emby validation is claimed here.
 
 TMDB vote fields rank otherwise eligible images but do not prove content identity or visual suitability. A geometrically valid unvoted backdrop is retained with explicit `tmdb_metadata_unrated` provenance rather than being reported as a positively-rated selection. A client can still crop, cache, or ignore a role after a correct feed has been exported; that is distinct from an enrichment failure.
 

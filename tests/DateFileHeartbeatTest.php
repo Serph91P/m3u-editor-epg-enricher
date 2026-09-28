@@ -55,12 +55,12 @@ namespace App\Services {
         public array $snapshots = [];
         public array $applies = [];
         public array $outcomes = ['applied'];
-        public function snapshot(object $context, object $epg, array $selection): array {
-            $this->snapshots[] = $selection;
-            $page = $this->pages[count($this->snapshots) - 1] ?? ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null];
-            return ['status' => 'ok', 'token' => 't'.count($this->snapshots)] + $page;
+        public function snapshot(object $context, object $epg, int $afterId = 0, int $limit = 500): array {
+            $this->snapshots[] = compact('afterId', 'limit');
+            $page = $this->pages[count($this->snapshots) - 1] ?? ['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null];
+            return ['status' => 'ok'] + $page;
         }
-        public function apply(object $context, object $epg, string $token, array $patches): array { $this->applies[] = compact('token', 'patches'); return ['status' => array_shift($this->outcomes) ?? 'applied']; }
+        public function apply(object $context, object $epg, array $patches): array { $this->applies[] = compact('patches'); return ['status' => array_shift($this->outcomes) ?? 'applied']; }
     }
 }
 
@@ -88,19 +88,19 @@ namespace Tests {
         return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context, $tmdb];
     }
 
-    $rows = array_map(fn (int $n): array => ['locator' => "programme:$n", 'row_revision' => "r$n", 'programme' => ['channel' => 'target', 'title' => '']], range(1, 500));
-    $pages = array_map(fn (array $page, int $index): array => ['programmes' => $page, 'next_cursor' => $index === 4 ? null : 'cursor-'.($index + 1)], array_chunk($rows, 100), range(0, 4));
+    $rows = array_map(fn (int $n): array => ['id' => $n, 'hash' => "h$n", 'programme' => ['channel' => 'target', 'title' => '']], range(1, 500));
+    $pages = array_map(fn (array $page, int $index): array => ['programmes' => $page, 'next' => $index === 4 ? null : ($index + 1) * 100], array_chunk($rows, 100), range(0, 4));
     [$large, $largeHost, $largeContext] = run($pages);
     same('completed', $large->status, 'A bounded host scan must complete.');
     same(500, $large->data['programmes_processed'] ?? null, 'The 500-programme regression fixture must retain every canonical row.');
     same(0, $large->data['tmdb_lookups'] ?? null, 'Untitled canonical rows must not create TMDB requests.');
     same(5, count($largeHost->snapshots), 'The host snapshot cursor must retain the five-page lifecycle.');
-    same(['limit' => 100], $largeHost->snapshots[0], 'The first snapshot must retain its bounded limit.');
-    same('cursor-1', $largeHost->snapshots[1]['cursor'] ?? null, 'The second snapshot must retain the opaque cursor.');
+    same(['afterId' => 0, 'limit' => 100], $largeHost->snapshots[0], 'The first snapshot must retain its bounded limit.');
+    same(100, $largeHost->snapshots[1]['afterId'] ?? null, 'The second snapshot must use the returned id cursor.');
     same(5, count($largeContext->heartbeats), 'Each retained page must emit its heartbeat.');
 
-    $changePage = [['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null], ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null]];
-    [$stale, $staleHost, $staleContext] = run($changePage, ['stale_snapshot', 'applied']);
+    $changePage = [['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null], ['programmes' => [['id' => 1, 'hash' => 'h2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null]];
+    [$stale, $staleHost, $staleContext] = run($changePage, ['stale', 'applied']);
     same('completed', $stale->status, 'A stale host snapshot must retain one bounded retry.');
     same(2, count($staleHost->snapshots), 'Stale handling must re-snapshot once.');
     same(2, count($staleHost->applies), 'Stale handling must re-apply once without a file fallback.');
@@ -114,14 +114,14 @@ namespace Tests {
     same(['Processing canonical host EPG snapshot.'], array_column($cancelledContext->heartbeats, 'message'), 'Abort must preserve the processing heartbeat but not a publish heartbeat.');
 
     $cursorPages = [
-        ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => 'old-next'],
-        ['programmes' => [['locator' => 'programme:1', 'row_revision' => 'r2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => 'new-next'],
-        ['programmes' => [['locator' => 'programme:2', 'row_revision' => 'r3', 'programme' => ['channel' => 'target', 'title' => '']]], 'next_cursor' => null],
+        ['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],
+        ['programmes' => [['id' => 1, 'hash' => 'h2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 2],
+        ['programmes' => [['id' => 2, 'hash' => 'h3', 'programme' => ['channel' => 'target', 'title' => '']]], 'next' => null],
     ];
-    [$cursorResult, $cursorHost] = run($cursorPages, ['stale_snapshot', 'applied']);
+    [$cursorResult, $cursorHost] = run($cursorPages, ['stale', 'applied']);
     same('completed', $cursorResult->status, 'A stale first page must continue from the accepted retry snapshot.');
-    same('new-next', $cursorHost->snapshots[2]['cursor'] ?? null, 'The page after a stale retry must use the retry cursor, not the stale cursor.');
-    same(false, in_array('old-next', array_column($cursorHost->snapshots, 'cursor'), true), 'The stale continuation cursor must not create a duplicate or skipped page.');
+    same(2, $cursorHost->snapshots[2]['afterId'] ?? null, 'The page after a stale retry must use the retry cursor, not the stale cursor.');
+    same(false, in_array(1, array_column($cursorHost->snapshots, 'afterId'), true), 'The stale continuation cursor must not create a duplicate or skipped page.');
 
     $languageRun = run($changePage, ['applied'], PHP_INT_MAX, 'fr-FR');
     $languageTmdb = $languageRun[3];

@@ -11,7 +11,7 @@ namespace App\Plugins\Support {
     class PluginExecutionContext { public array $settings = ['enrich_from_tmdb' => true, 'enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'map_genres_to_epg_categories' => true, 'map_genres_to_kodi_guide_genres' => false, 'keyword_category_detection' => true, 'enrich_episode_details' => false]; public array $messages = []; public int $checks = 0; public int $cancelAfter = PHP_INT_MAX; public function cancellationRequested(): bool { return ++$this->checks >= $this->cancelAfter; } public function heartbeat(string $m, ?int $p = null): void { $this->messages[] = $m; } public function info(string $m): void { $this->messages[] = $m; } public function warning(string $m): void { $this->messages[] = $m; } }
 }
 namespace App\Models { class Values { public function __construct(private array $v) {} public function filter(): self { return $this; } public function unique(): self { return $this; } public function values(): self { return $this; } public function all(): array { return $this->v; } } class Query { public function __construct(private bool $channel) {} public function __call(string $m, array $a): self { return $this; } public function pluck(string $c): Values { return new Values($this->channel ? ['target'] : [1]); } } class Channel { public static function query(): Query { return new Query(false); } } class EpgChannel { public static function query(): Query { return new Query(true); } } class Epg { public string $name = 'Cancellation fixture'; public static function find(int $id): self { return new self(); } } class Playlist {} }
-namespace App\Services { class EpgCacheService { public function isCacheValid(object $epg): bool { return true; } } class TmdbService { protected string $language = ''; public function isConfigured(): bool { return true; } } class EpgCacheEnrichmentService { public array $applies = []; public array $snapshotStatuses = []; public array $applyStatuses = ['applied']; public function snapshot(object $c, object $e, array $s): array { if (($status = array_shift($this->snapshotStatuses)) !== null) return ['status' => $status]; return ['status' => 'ok', 'token' => 'cancel-token', 'programmes' => [['locator' => 'programme:cancel', 'row_revision' => 'cancel-r1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next_cursor' => null]; } public function apply(object $c, object $e, string $token, array $patches): array { $this->applies[] = compact('token', 'patches'); return ['status' => array_shift($this->applyStatuses) ?? 'applied']; } } }
+namespace App\Services { class EpgCacheService { public function isCacheValid(object $epg): bool { return true; } } class TmdbService { protected string $language = ''; public function isConfigured(): bool { return true; } } class EpgCacheEnrichmentService { public array $applies = []; public array $snapshotStatuses = []; public array $applyStatuses = ['applied']; public function snapshot(object $c, object $e, int $afterId = 0, int $limit = 500): array { if (($status = array_shift($this->snapshotStatuses)) !== null) return ['status' => $status]; return ['status' => 'ok', 'programmes' => [['id' => 1, 'hash' => 'cancel-hash', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null]; } public function apply(object $c, object $e, array $patches): array { $this->applies[] = compact('patches'); return ['status' => array_shift($this->applyStatuses) ?? 'applied']; } } }
 namespace App\Settings { class GeneralSettings { public string $tmdb_language = 'de-DE'; } }
 namespace Illuminate\Support\Facades { class Storage { public static function disk(string $n): self { return new self(); } public function makeDirectory(string $p): void {} public function path(string $p): string { return sys_get_temp_dir().'/'.$p; } public function exists(string $p): bool { return false; } public function get(string $p): string { return '{}'; } public function put(string $p, string $v): bool { return true; } public function delete(string $p): bool { return true; } } class Http {} class Log {} }
 namespace Tests {
@@ -38,7 +38,7 @@ namespace Tests {
     same(0, $cancelledAtApplyBoundary->data['programmes_updated'] ?? 0, 'Cancellation at the host apply boundary must not count updates.');
     same(['Processing canonical host EPG snapshot.'], $cancelledAtApplyBoundaryContext->messages, 'Cancellation at the host apply boundary must not claim publication.');
 
-    [$cancelledAfterRetrySnapshot, $cancelledAfterRetrySnapshotHost, $cancelledAfterRetrySnapshotContext] = execute(['stale_snapshot', 'applied'], [], 3);
+    [$cancelledAfterRetrySnapshot, $cancelledAfterRetrySnapshotHost, $cancelledAfterRetrySnapshotContext] = execute(['stale', 'applied'], [], 3);
     same('cancelled', $cancelledAfterRetrySnapshot->status, 'Cancellation after a stale retry snapshot must remain visible at the second host apply boundary.');
     same(false, $cancelledAfterRetrySnapshot->success, 'Cancellation after a stale retry snapshot must not report success.');
     same(1, count($cancelledAfterRetrySnapshotHost->applies), 'Cancellation after a stale retry snapshot must stop before the retry publication.');
@@ -48,18 +48,18 @@ namespace Tests {
 
     // Each host rejection retains the previous “no unintended cache/state write”
     // safety property, without recreating the removed direct-cache adapter.
-    foreach (['legacy_cache_read_only', 'capability_denied', 'invalid_patch', 'rate_limited', 'timeout'] as $outcome) {
+    foreach (['busy', 'unavailable', 'denied', 'invalid_request'] as $outcome) {
         [$result, $host, $context] = execute([$outcome]);
         same('failed', $result->status, "$outcome must fail rather than report completion.");
         same(false, $result->success, "$outcome must fail closed.");
         same(0, $result->data['programmes_processed'] ?? 0, "$outcome must not report an uncommitted page as completed work.");
         same(0, $result->data['programmes_updated'] ?? 0, "$outcome must not count updates.");
         same(1, count($host->applies), "$outcome must not fall back to direct storage.");
-        same('cancel-token', $host->applies[0]['token'] ?? null, "$outcome must remain bound to its snapshot token.");
+        same(1, $host->applies[0]['patches'][0]['id'] ?? null, "$outcome must remain bound to its programme id.");
         same(['Processing canonical host EPG snapshot.'], $context->messages, "$outcome must not claim a published patch.");
     }
 
-    [$unavailable, $unavailableHost, $unavailableContext] = execute(['applied'], ['plugin_not_enabled']);
+    [$unavailable, $unavailableHost, $unavailableContext] = execute(['applied'], ['unavailable']);
     same('failed', $unavailable->status, 'An unavailable host snapshot must fail closed.');
     same(false, $unavailable->success, 'An unavailable host snapshot must not report success.');
     same(0, count($unavailableHost->applies), 'An unavailable host snapshot must not attempt a file fallback.');

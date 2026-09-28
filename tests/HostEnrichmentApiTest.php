@@ -74,21 +74,21 @@ namespace App\Services {
         public array $applyStatuses = ['applied'];
         public array $snapshotStatuses = [];
         public array $pages = [];
-        public function snapshot(object $context, object $epg, array $selection = []): array
+        public function snapshot(object $context, object $epg, int $afterId = 0, int $limit = 500): array
         {
-            $this->snapshots[] = $selection;
+            $this->snapshots[] = compact('afterId', 'limit');
             if (($status = array_shift($this->snapshotStatuses)) !== null) {
                 return ['status' => $status];
             }
             $page = $this->pages[count($this->snapshots) - 1] ?? null;
             if ($page !== null) {
-                return ['status' => 'ok', 'token' => 'token-'.count($this->snapshots), 'programmes' => $page['programmes'], 'next_cursor' => $page['next_cursor'] ?? null];
+                return ['status' => 'ok', 'programmes' => $page['programmes'], 'next' => $page['next'] ?? null];
             }
-            return ['status' => 'ok', 'token' => 'token-'.count($this->snapshots), 'programmes' => [['locator' => 'programme:MQ==', 'row_revision' => 'revision-'.count($this->snapshots), 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']],], 'next_cursor' => null];
+            return ['status' => 'ok', 'programmes' => [['id' => 1, 'hash' => 'hash-'.count($this->snapshots), 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']],], 'next' => null];
         }
-        public function apply(object $context, object $epg, string $token, array $patches): array
+        public function apply(object $context, object $epg, array $patches): array
         {
-            $this->applies[] = compact('token', 'patches');
+            $this->applies[] = compact('patches');
             return ['status' => array_shift($this->applyStatuses) ?? 'applied'];
         }
     }
@@ -125,18 +125,29 @@ namespace Tests {
 
     [$result, $host, $context] = runFixture();
     assertSameValue(1, count($host->snapshots), 'Enrichment must request one bounded host snapshot.');
-    assertSameValue(['limit' => 100], $host->snapshots[0], 'Snapshot reads must be bounded to the host maximum page size.');
+    assertSameValue(['afterId' => 0, 'limit' => 100], $host->snapshots[0], 'Snapshot reads must use the host id cursor and bounded page size.');
     assertSameValue(1, count($host->applies), 'A changed canonical programme must be conditionally applied once.');
     assertSameValue('completed', $result->status, 'Only an accepted host apply may report enrichment success.');
     assertSameValue(1, $result->data['programmes_updated'] ?? null, 'Accepted apply must count the changed programme.');
-    assertSameValue('programme:MQ==', $host->applies[0]['patches'][0]['locator'] ?? null, 'Patch must preserve the opaque host locator.');
-    assertSameValue('revision-1', $host->applies[0]['patches'][0]['row_revision'] ?? null, 'Patch must preserve the host row revision.');
+    assertSameValue(1, $host->applies[0]['patches'][0]['id'] ?? null, 'Patch must preserve the host programme id.');
+    assertSameValue('hash-1', $host->applies[0]['patches'][0]['hash'] ?? null, 'Patch must preserve the host programme hash.');
     assertSameValue('Sports', $host->applies[0]['patches'][0]['changes']['category'] ?? null, 'Canonical patch must carry the enriched category.');
     assertSameValue(['Processing canonical host EPG snapshot.', 'Host EPG patch batch published.'], $context->messages, 'Host-boundary heartbeats must remain observable.');
 
-    [$staleResult, $staleHost] = runFixture(['stale_snapshot', 'applied']);
-    assertSameValue(2, count($staleHost->snapshots), 'A stale snapshot must be re-read exactly once.');
-    assertSameValue(2, count($staleHost->applies), 'A stale snapshot must be retried exactly once.');
+    [$pagedResult, $pagedHost] = runFixture(['applied', 'applied'], [], PHP_INT_MAX, [
+        ['programmes' => [['id' => 1, 'hash' => 'page-1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],
+        ['programmes' => [['id' => 2, 'hash' => 'page-2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null],
+    ]);
+    assertSameValue([
+        ['afterId' => 0, 'limit' => 100],
+        ['afterId' => 1, 'limit' => 100],
+    ], $pagedHost->snapshots, 'Every host page must advance with its returned integer id cursor.');
+    assertSameValue(2, count($pagedHost->applies), 'Every changed page must be submitted through the host API.');
+    assertSameValue(2, $pagedResult->data['programmes_updated'] ?? null, 'Accepted pages must contribute to the total update count.');
+
+    [$staleResult, $staleHost] = runFixture(['stale', 'applied']);
+    assertSameValue(2, count($staleHost->snapshots), 'A stale page must be re-read exactly once.');
+    assertSameValue(2, count($staleHost->applies), 'A stale page must be retried exactly once.');
     assertSameValue(1, $staleResult->data['programmes_updated'] ?? null, 'Only the accepted retry counts as an update.');
 
     [$legacyResult, $legacyHost] = runFixture(['legacy_cache_read_only']);
@@ -145,25 +156,27 @@ namespace Tests {
     assertSameValue(1, count($legacyHost->applies), 'Legacy outcome must not use a direct-storage fallback.');
 
     foreach ([
-        'conflict' => ['conflict', 'conflict'],
-        'capability_denied' => ['capability_denied'],
-        'invalid_patch' => ['invalid_patch'],
-        'rate_limited' => ['rate_limited'],
-        'timeout' => ['timeout'],
+        'busy' => ['busy'],
+        'unavailable' => ['unavailable'],
+        'denied' => ['denied'],
+        'invalid_request' => ['invalid_request'],
     ] as $status => $statuses) {
         [$rejectedResult, $rejectedHost] = runFixture($statuses);
         assertSameValue(false, $rejectedResult->success, "{$status} must not claim success.");
         assertSameValue(0, $rejectedResult->data['programmes_updated'] ?? 0, "{$status} must not count updates.");
-        assertSameValue($status === 'conflict' ? 2 : 1, count($rejectedHost->applies), "{$status} must stop at the host boundary.");
+        assertSameValue(1, count($rejectedHost->applies), "{$status} must stop at the host boundary.");
     }
 
-    [$unavailableResult, $unavailableHost] = runFixture(['applied'], ['plugin_not_enabled']);
+    [$unavailableResult, $unavailableHost] = runFixture(['applied'], ['unavailable']);
     assertSameValue(false, $unavailableResult->success, 'Unavailable or unauthorized host snapshot must not claim success.');
     assertSameValue(0, count($unavailableHost->applies), 'Rejected host snapshot must not attempt a direct-storage fallback.');
 
     [$cancelledResult, $cancelledHost] = runFixture(['applied'], [], 1);
     assertSameValue('cancelled', $cancelledResult->status, 'Cancellation before host apply must propagate.');
     assertSameValue(0, count($cancelledHost->applies), 'Cancellation must not mutate host-owned EPG data.');
+
+    $manifest = json_decode(file_get_contents(__DIR__.'/../plugin.json'), true, flags: JSON_THROW_ON_ERROR);
+    assertSameValue('1.0.0', $manifest['api_version'] ?? null, 'The plugin manifest must match the host validator API version.');
 
     $source = file_get_contents(__DIR__.'/../Plugin.php');
     $tokens = token_get_all($source);
