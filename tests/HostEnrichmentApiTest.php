@@ -45,11 +45,12 @@ namespace App\Plugins\Support {
     {
         public array $settings = ['enrich_from_tmdb' => true, 'overwrite_existing' => false, 'enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'map_genres_to_epg_categories' => true, 'map_genres_to_kodi_guide_genres' => false, 'keyword_category_detection' => true, 'enrich_episode_details' => false];
         public array $messages = [];
+        public array $progresses = [];
         public bool $dryRun = false;
         public int $cancellationChecks = 0;
         public int $cancelAfterChecks = PHP_INT_MAX;
         public function cancellationRequested(): bool { return ++$this->cancellationChecks >= $this->cancelAfterChecks; }
-        public function heartbeat(string $message, ?int $progress = null): void { $this->messages[] = $message; }
+        public function heartbeat(string $message, ?int $progress = null): void { $this->messages[] = $message; $this->progresses[] = $progress; }
         public function info(string $message): void { $this->messages[] = $message; }
         public function warning(string $message): void { $this->messages[] = $message; }
     }
@@ -174,6 +175,41 @@ namespace Tests {
     [$cancelledResult, $cancelledHost] = runFixture(['applied'], [], 1);
     assertSameValue('cancelled', $cancelledResult->status, 'Cancellation before host apply must propagate.');
     assertSameValue(0, count($cancelledHost->applies), 'Cancellation must not mutate host-owned EPG data.');
+
+    $censusHost = new EpgCacheEnrichmentService();
+    $censusHost->pages = [
+        ['programmes' => [['id' => 1], ['id' => 2]], 'next' => 2],
+        ['programmes' => [['id' => 3]], 'next' => null],
+    ];
+    $GLOBALS['hostEnrichmentServices'][EpgCacheEnrichmentService::class] = $censusHost;
+    $censusContext = new PluginExecutionContext();
+    $census = new ReflectionMethod(new Plugin(), 'censusHostSnapshotProgrammes');
+    $census->setAccessible(true);
+    $censusResult = $census->invoke(new Plugin(), new \App\Models\Epg(1), $censusContext);
+    assertSameValue(true, $censusResult->success, 'The bounded host census must succeed before enrichment starts.');
+    assertSameValue(3, $censusResult->data['programmes_counted'] ?? null, 'The census must count every canonical programme without retaining its rows.');
+    assertSameValue([
+        ['afterId' => 0, 'limit' => 100],
+        ['afterId' => 2, 'limit' => 100],
+    ], $censusHost->snapshots, 'The census must use the host cursor and bounded pages.');
+    assertSameValue([], $censusHost->applies, 'The census must never apply mutations.');
+    assertSameValue('Counting canonical host EPG snapshot: 2 programmes counted.', $censusContext->messages[0] ?? null, 'The census must visibly report a count rather than a fabricated percentage.');
+    assertSameValue(true, array_key_exists(0, $censusContext->progresses), 'The census must emit a visible heartbeat.');
+    assertSameValue(null, $censusContext->progresses[0], 'The census must not fabricate percentage progress.');
+
+    $progressHost = new EpgCacheEnrichmentService();
+    $progressHost->pages = [
+        ['programmes' => [['id' => 1, 'hash' => 'progress-1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],
+        ['programmes' => [['id' => 2, 'hash' => 'progress-2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null],
+    ];
+    $GLOBALS['hostEnrichmentServices'][EpgCacheEnrichmentService::class] = $progressHost;
+    $progressContext = new PluginExecutionContext();
+    $progress = ['total' => 2, 'completed' => 0];
+    $progressMethod = new ReflectionMethod(new Plugin(), 'enrichHostSnapshotPages');
+    $progressMethod->setAccessible(true);
+    $progressMethod->invokeArgs(new Plugin(), [new \App\Models\Epg(1), 1, [1], $progressContext, &$progress]);
+    assertSameValue(['total' => 2, 'completed' => 2], $progress, 'Completed page counts must accumulate against the bounded census total.');
+    assertSameValue([50, 99], array_values(array_filter($progressContext->progresses, fn ($value): bool => $value !== null)), 'Progress must be monotonic after accepted pages and reserve 100 for the terminal heartbeat.');
 
     $manifest = json_decode(file_get_contents(__DIR__.'/../plugin.json'), true, flags: JSON_THROW_ON_ERROR);
     assertSameValue('1.0.0', $manifest['api_version'] ?? null, 'The plugin manifest must match the host validator API version.');

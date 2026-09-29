@@ -624,12 +624,33 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $playlistLabel = $this->playlistLabel($playlists);
         $context->heartbeat("Starting EPG enrichment for {$playlistLabel} ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
 
+        $progress = ['total' => 0, 'completed' => 0];
+        if ($context->settings['enrich_from_tmdb'] ?? true) {
+            foreach ($epgIds as $epgId) {
+                if ($this->resolveTargetChannelIds((int) $epgId, $playlistIds) === []) {
+                    continue;
+                }
+                if (! $this->epgLockIsAvailable((int) $epgId)) {
+                    continue;
+                }
+                $epg = Epg::find((int) $epgId);
+                if (! $epg) {
+                    return PluginActionResult::failure("EPG [{$epgId}] not found.");
+                }
+                $census = $this->censusHostSnapshotProgrammes($epg, $context);
+                if (! $census->success) {
+                    return $census;
+                }
+                $progress['total'] += (int) ($census->data['programmes_counted'] ?? 0);
+            }
+        }
+
         $combinedStats = [];
         $notices = [];
         $modifiedEpgIds = [];
 
         foreach ($epgIds as $epgId) {
-            $result = $this->doEnrich($epgId, $playlistIds, $context);
+            $result = $this->doEnrich($epgId, $playlistIds, $context, $progress);
 
             if (! $result->success) {
                 return $result;
@@ -656,6 +677,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $notice = implode(' ', array_unique($notices));
         if (empty($combinedStats)) {
+            $context->heartbeat('EPG enrichment finished without mapped programme changes.', 100);
             return PluginActionResult::success("Enrichment finished for {$playlistLabel}: {$notice}");
         }
 
@@ -666,6 +688,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($notice !== '') {
             $summary .= " {$notice}";
         }
+
+        $context->heartbeat('EPG enrichment complete: '.$progress['completed'].' canonical programmes visited.', 100);
 
         return PluginActionResult::success($summary, $combinedStats);
     }
@@ -729,7 +753,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * @param  array<int>  $playlistIds  Playlist IDs to scope enrichment to
      */
-    private function doEnrich(int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
+    private function doEnrich(int $epgId, array $playlistIds, PluginExecutionContext $context, ?array &$progress = null): PluginActionResult
     {
         $disk = Storage::disk('local');
         $disk->makeDirectory('plugin-data/epg-enricher');
@@ -746,7 +770,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         try {
-            return $this->doEnrichLocked($epgId, $playlistIds, $context);
+            return $this->doEnrichLocked($epgId, $playlistIds, $context, $progress);
         } finally {
             flock($lock, LOCK_UN);
             fclose($lock);
@@ -754,24 +778,83 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
+     * Check the existing per-source lock before an otherwise read-only census. The
+     * lock is released immediately; the subsequent apply pass retains its own lock.
+     */
+    private function epgLockIsAvailable(int $epgId): bool
+    {
+        $disk = Storage::disk('local');
+        $disk->makeDirectory('plugin-data/epg-enricher');
+        $lock = fopen($disk->path("plugin-data/epg-enricher/epg-{$epgId}.lock"), 'c');
+        if ($lock === false) {
+            return false;
+        }
+        $available = flock($lock, LOCK_EX | LOCK_NB);
+        if ($available) {
+            flock($lock, LOCK_UN);
+        }
+        fclose($lock);
+
+        return $available;
+    }
+
+    /**
      * Run enrichment while the caller holds the EPG-specific lock.
      *
      * @param  array<int>  $playlistIds
      */
-    private function doEnrichLocked(int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
+    private function doEnrichLocked(int $epgId, array $playlistIds, PluginExecutionContext $context, ?array &$progress = null): PluginActionResult
     {
         $epg = Epg::find($epgId);
         if (! $epg) {
             return PluginActionResult::failure("EPG [{$epgId}] not found.");
         }
 
-        return $this->enrichHostSnapshotPages($epg, $epgId, $playlistIds, $context);
+        return $this->enrichHostSnapshotPages($epg, $epgId, $playlistIds, $context, $progress);
+    }
+
+    /**
+     * Count a source using only bounded host snapshots. The count is intentionally a
+     * separate read pass: snapshot() has no total field and the rows are not retained.
+     */
+    private function censusHostSnapshotProgrammes(Epg $epg, PluginExecutionContext $context): PluginActionResult
+    {
+        try {
+            $service = app(EpgCacheEnrichmentService::class);
+        } catch (\Throwable) {
+            return PluginActionResult::failure('Host EPG enrichment API is unavailable; no cache files were accessed.');
+        }
+        if (! method_exists($service, 'snapshot')) {
+            return PluginActionResult::failure('Host EPG enrichment API is unavailable; no cache files were accessed.');
+        }
+
+        $afterId = 0;
+        $counted = 0;
+        do {
+            if ($context->cancellationRequested()) {
+                return PluginActionResult::cancelled('Enrichment cancelled during canonical host EPG census.', ['programmes_counted' => $counted]);
+            }
+            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
+            if (($snapshot['status'] ?? null) !== 'ok') {
+                return PluginActionResult::failure('Host EPG census snapshot rejected: '.($snapshot['status'] ?? 'unknown').'.', ['programmes_counted' => $counted]);
+            }
+            foreach (($snapshot['programmes'] ?? []) as $_row) {
+                if ($context->cancellationRequested()) {
+                    return PluginActionResult::cancelled('Enrichment cancelled during canonical host EPG census.', ['programmes_counted' => $counted]);
+                }
+                $counted++;
+            }
+            $context->heartbeat("Counting canonical host EPG snapshot: {$counted} programmes counted.");
+            $afterId = $snapshot['next'] ?? null;
+        } while ($afterId !== null);
+
+        return PluginActionResult::success('Canonical host EPG census complete.', ['programmes_counted' => $counted]);
     }
 
     /**
      * Enrich host-owned canonical programme snapshots and submit only conditional patches.
      */
-    private function enrichHostSnapshotPages(Epg $epg, int $epgId, array $playlistIds, PluginExecutionContext $context): PluginActionResult
+    private function enrichHostSnapshotPages(Epg $epg, int $epgId, array $playlistIds, PluginExecutionContext $context, ?array &$progress = null): PluginActionResult
     {
         try {
             $service = app(EpgCacheEnrichmentService::class);
@@ -867,6 +950,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
             }
             $stats = $pageStats;
+            if ($progress !== null) {
+                $progress['completed'] = (int) ($progress['completed'] ?? 0) + count($snapshot['programmes'] ?? []);
+                $progress['total'] = max((int) ($progress['total'] ?? 0), $progress['completed']);
+                $percentage = $progress['total'] > 0
+                    ? min(99, (int) floor(($progress['completed'] * 100) / $progress['total']))
+                    : 99;
+                $context->heartbeat(
+                    'EPG enrichment: '.$progress['completed'].'/'.$progress['total'].' canonical programmes visited; '
+                    .$stats['programmes_processed'].' mapped programmes processed.',
+                    $percentage,
+                );
+            }
             $afterId = $snapshot['next'] ?? null;
         } while ($afterId !== null);
         $this->saveTmdbCache($tmdbCache);
