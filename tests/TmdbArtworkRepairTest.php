@@ -1667,6 +1667,157 @@ namespace Tests {
     assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $boston['images'][0]['url'] ?? null, 'Boston landscape artwork should be the first images entry.');
     assertTrueValue(in_array('https://provider.invalid/boston-portrait.jpg', array_column($boston['images'], 'url'), true), 'Boston source portrait artwork should remain available after the backdrop.');
 
+    // Regression: a source image labelled poster/orient=P but actually square
+    // (or landscape) must not be trusted as a usable portrait and must not
+    // suppress a confident TMDB poster lookup.
+    $squarePoster = [
+        'title' => 'Boston',
+        'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
+        'category' => 'Documentary',
+        'icon' => 'https://provider.invalid/boston-square-poster.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/boston-square-poster.jpg',
+            'type' => 'poster',
+            'orient' => 'P',
+            'width' => 1400,
+            'height' => 1400,
+            'scope' => 'programme',
+        ]],
+    ];
+    $squarePosterCache = [];
+    enrich($plugin, $method, $squarePoster, new TmdbService('boston'), $squarePosterCache);
+    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $squarePoster['icon'], 'A square source poster must not block a confident TMDB landscape primary.');
+    assertTrueValue(in_array('https://fixture.invalid/boston-poster.jpg', array_column($squarePoster['images'], 'url'), true), 'A square source poster with a confident TMDB match must recover a real TMDB portrait poster.');
+    assertTrueValue(in_array('https://provider.invalid/boston-square-poster.jpg', array_column($squarePoster['images'], 'url'), true), 'A rejected square source poster should remain as secondary artwork.');
+
+    // Regression: a source image labelled poster/orient=P but actually
+    // landscape must also be rejected from trusted portrait use.
+    $landscapePoster = [
+        'title' => 'Boston',
+        'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
+        'category' => 'Documentary',
+        'icon' => 'https://provider.invalid/boston-landscape-poster.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/boston-landscape-poster.jpg',
+            'type' => 'poster',
+            'orient' => 'P',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+        ]],
+    ];
+    $landscapePosterCache = [];
+    enrich($plugin, $method, $landscapePoster, new TmdbService('boston'), $landscapePosterCache);
+    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $landscapePoster['icon'], 'A landscape source poster must not block a confident TMDB landscape primary.');
+    assertTrueValue(in_array('https://fixture.invalid/boston-poster.jpg', array_column($landscapePoster['images'], 'url'), true), 'A landscape source poster with a confident TMDB match must recover a real TMDB portrait poster.');
+    assertTrueValue(in_array('https://provider.invalid/boston-landscape-poster.jpg', array_column($landscapePoster['images'], 'url'), true), 'A rejected landscape source poster should remain as secondary artwork.');
+
+    // Regression: an unscoped source image labelled poster/orient=P must not be
+    // trusted as a usable portrait, even if its geometry is plausible.
+    $unscopedPortrait = [
+        'title' => 'Boston',
+        'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
+        'category' => 'Documentary',
+        'icon' => 'https://provider.invalid/boston-unscoped-poster.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/boston-unscoped-poster.jpg',
+            'type' => 'poster',
+            'orient' => 'P',
+            'width' => 500,
+            'height' => 750,
+        ]],
+    ];
+    $unscopedPortraitCache = [];
+    enrich($plugin, $method, $unscopedPortrait, new TmdbService('boston'), $unscopedPortraitCache);
+    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $unscopedPortrait['icon'], 'An unscoped source poster must not block a confident TMDB landscape primary.');
+    assertTrueValue(in_array('https://fixture.invalid/boston-poster.jpg', array_column($unscopedPortrait['images'], 'url'), true), 'An unscoped source poster with a confident TMDB match must recover a real TMDB portrait poster.');
+    assertTrueValue(in_array('https://provider.invalid/boston-unscoped-poster.jpg', array_column($unscopedPortrait['images'], 'url'), true), 'A rejected unscoped source poster should remain as secondary artwork.');
+
+    // Counter-regression: a genuinely scoped portrait source poster must remain
+    // trusted and must not trigger an unnecessary TMDB lookup. We disable both
+    // poster and backdrop enrichment to ensure the fast-path is taken.
+    $validPortraitSource = [
+        'title' => 'Boston',
+        'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
+        'category' => 'Documentary',
+        'icon' => 'https://provider.invalid/boston-valid-portrait.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/boston-valid-portrait.jpg',
+            'type' => 'poster',
+            'orient' => 'P',
+            'width' => 500,
+            'height' => 750,
+            'scope' => 'programme',
+        ]],
+    ];
+    $validPortraitSourceCache = [];
+    $tmpSeason = [];
+    $tmpImages = [];
+    $validPortraitSourceTmdb = new TmdbService('none');
+    $validPortraitSourceBefore = $validPortraitSource;
+    $validPortraitSourceResult = $method->invokeArgs($plugin, [
+        &$validPortraitSource,
+        $validPortraitSourceTmdb,
+        &$validPortraitSourceCache,
+        false,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        &$tmpSeason,
+        &$tmpImages,
+        [],
+    ]);
+    assertSameValue($validPortraitSourceBefore, $validPortraitSource, 'A valid portrait source poster without a trusted landscape should be left unchanged.');
+    assertSameValue(false, $validPortraitSourceResult['lookup'] ?? null, 'A valid portrait source poster should not trigger an unnecessary TMDB lookup.');
+
+    // Boundary: a source poster with no confident TMDB match must not invent a
+    // portrait. The rejected source image stays and no TMDB poster appears.
+    // Poster enrichment is disabled here so the code does not attempt to recover
+    // a TMDB poster it cannot find.
+    $noMatchPortrait = [
+        'title' => 'Boston',
+        'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
+        'category' => 'Documentary',
+        'icon' => 'https://provider.invalid/boston-no-match.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/boston-no-match.jpg',
+            'type' => 'poster',
+            'orient' => 'P',
+            'width' => 1400,
+            'height' => 1400,
+            'scope' => 'programme',
+        ]],
+    ];
+    $noMatchPortraitCache = [];
+    $noMatchPortraitSeason = [];
+    $noMatchPortraitImages = [];
+    $noMatchPortraitTmdb = new TmdbService('none');
+    $noMatchPortraitBefore = $noMatchPortrait;
+    $method->invokeArgs($plugin, [
+        &$noMatchPortrait,
+        $noMatchPortraitTmdb,
+        &$noMatchPortraitCache,
+        false,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        &$noMatchPortraitSeason,
+        &$noMatchPortraitImages,
+        [],
+    ]);
+    assertSameValue($noMatchPortraitBefore, $noMatchPortrait, 'A rejected source poster without a TMDB match should be left unchanged.');
+    assertSameValue(0, $noMatchPortraitTmdb->tvSearches + $noMatchPortraitTmdb->movieSearches, 'A rejected source poster must not trigger an unnecessary TMDB lookup for this fixture.');
+
     $posterOnly = [
         'title' => 'Poster Only',
         'desc' => 'A 2026 programme without landscape artwork.',

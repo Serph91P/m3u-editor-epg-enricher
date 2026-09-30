@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.15-tmdb-contract-normalization';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.30-poster-geometry-trust';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -2030,6 +2030,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      * A portrait role is complete only when an actual poster entry exists. The
      * generic programme icon is deliberately not used here: it can be a channel
      * logo or a backdrop and must not suppress poster enrichment.
+     *
+     * Source images may carry type='poster' with orient='P' while actually being
+     * square or landscape (e.g. square EPG channel branding or incorrectly
+     * labelled fanart). Those are not genuine portrait artwork and must not
+     * suppress a confident TMDB poster lookup.
      */
     private function hasTrustedPoster(array $programme): bool
     {
@@ -2041,12 +2046,52 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             if (strtolower(trim((string) ($image['type'] ?? ''))) !== 'poster') {
                 continue;
             }
-            if (is_string($image['url'] ?? null) && trim($image['url']) !== '') {
+            if (! is_string($image['url'] ?? null) || trim($image['url']) === '') {
+                continue;
+            }
+            if ($this->isTrustedPortraitImage($image)) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * A portrait image is trusted only when it has a non-empty URL, carries an
+     * explicit portrait orientation, and is not square or landscape. We require
+     * either known TMDB poster provenance or an explicit programme/media scope,
+     * because untyped source icons are often backdrops or logos mislabelled as
+     * posters.
+     */
+    private function isTrustedPortraitImage(array $image): bool
+    {
+        $type = strtolower(trim((string) ($image['type'] ?? '')));
+        $orient = strtoupper(trim((string) ($image['orient'] ?? '')));
+        $source = strtolower(trim((string) ($image['source'] ?? '')));
+        $scope = strtolower(trim((string) ($image['scope'] ?? '')));
+
+        if ($type !== 'poster' || $orient !== 'P' || empty($image['url'])) {
+            return false;
+        }
+
+        $width = $image['width'] ?? null;
+        $height = $image['height'] ?? null;
+        if (is_numeric($width) && is_numeric($height)
+            && (float) $width > 0 && (float) $height > 0) {
+            $aspect = (float) $width / (float) $height;
+            // Strictly portrait: height must exceed width. Square-ish poster
+            // roles (aspect >= 1.0) are treated as geometry-unverified.
+            if ($aspect >= 1.0) {
+                return false;
+            }
+        }
+
+        // Trust TMDB-sourced posters, and source posters scoped to a specific
+        // programme, movie, series, or episode. Untrusted unscoped images are
+        // not accepted as posters even when orient='P'.
+        return $source === 'tmdb'
+            || in_array($scope, ['programme', 'movie', 'series', 'episode'], true);
     }
 
     private function hasTrustedNonTmdbLandscapeIcon(array $programme): bool
