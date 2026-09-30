@@ -1687,7 +1687,10 @@ namespace Tests {
     $squarePosterCache = [];
     enrich($plugin, $method, $squarePoster, new TmdbService('boston'), $squarePosterCache);
     assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $squarePoster['icon'], 'A square source poster must not block a confident TMDB landscape primary.');
-    assertTrueValue(in_array('https://fixture.invalid/boston-poster.jpg', array_column($squarePoster['images'], 'url'), true), 'A square source poster with a confident TMDB match must recover a real TMDB portrait poster.');
+    $recoveredSquarePoster = array_values(array_filter($squarePoster['images'], static fn (array $image): bool => ($image['url'] ?? null) === 'https://fixture.invalid/boston-poster.jpg'))[0] ?? [];
+    assertSameValue('poster', $recoveredSquarePoster['type'] ?? null, 'A recovered TMDB portrait must use the canonical poster role.');
+    assertSameValue('P', $recoveredSquarePoster['orient'] ?? null, 'A recovered TMDB portrait must use portrait orientation.');
+    assertTrueValue(($recoveredSquarePoster['width'] ?? 0) < ($recoveredSquarePoster['height'] ?? 0), 'A recovered TMDB poster must have strictly portrait geometry.');
     assertTrueValue(in_array('https://provider.invalid/boston-square-poster.jpg', array_column($squarePoster['images'], 'url'), true), 'A rejected square source poster should remain as secondary artwork.');
 
     // Regression: a source image labelled poster/orient=P but actually
@@ -1709,7 +1712,10 @@ namespace Tests {
     $landscapePosterCache = [];
     enrich($plugin, $method, $landscapePoster, new TmdbService('boston'), $landscapePosterCache);
     assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $landscapePoster['icon'], 'A landscape source poster must not block a confident TMDB landscape primary.');
-    assertTrueValue(in_array('https://fixture.invalid/boston-poster.jpg', array_column($landscapePoster['images'], 'url'), true), 'A landscape source poster with a confident TMDB match must recover a real TMDB portrait poster.');
+    $recoveredLandscapePoster = array_values(array_filter($landscapePoster['images'], static fn (array $image): bool => ($image['url'] ?? null) === 'https://fixture.invalid/boston-poster.jpg'))[0] ?? [];
+    assertSameValue('poster', $recoveredLandscapePoster['type'] ?? null, 'A recovered TMDB portrait must use the canonical poster role after landscape rejection.');
+    assertSameValue('P', $recoveredLandscapePoster['orient'] ?? null, 'A recovered TMDB portrait must use portrait orientation after landscape rejection.');
+    assertTrueValue(($recoveredLandscapePoster['width'] ?? 0) < ($recoveredLandscapePoster['height'] ?? 0), 'A recovered TMDB poster must retain strictly portrait geometry after landscape rejection.');
     assertTrueValue(in_array('https://provider.invalid/boston-landscape-poster.jpg', array_column($landscapePoster['images'], 'url'), true), 'A rejected landscape source poster should remain as secondary artwork.');
 
     // Host-roundtrip regression: source/scope are not retained by the canonical
