@@ -60,13 +60,19 @@ namespace App\Plugins\Support {
             'enrich_from_tmdb' => false,
         ];
         public object $user;
+        public array $messages = [];
+        public array $progresses = [];
 
         public function __construct()
         {
             $this->user = new \App\Models\User(1);
         }
 
-        public function heartbeat(string $message, ?int $progress = null): void {}
+        public function heartbeat(string $message, ?int $progress = null): void
+        {
+            $this->messages[] = $message;
+            $this->progresses[] = $progress;
+        }
     }
 }
 
@@ -182,7 +188,7 @@ namespace App\Models {
                 throw new \RuntimeException('Fixture exception');
             }
 
-            return $id === 4 ? new self() : null;
+            return in_array($id, [1, 4], true) ? new self() : null;
         }
     }
 
@@ -309,6 +315,21 @@ namespace Tests {
     $manualResult = $plugin->runAction('enrich_epg', ['playlist_id' => 10], $context);
     assertTrueValue($manualResult->success, 'A competing manual run should skip successfully.');
     assertTrueValue(str_contains(strtolower($manualResult->summary), 'already in progress'), 'The manual busy result should clearly explain the skip.');
+
+    $busySourceMethod = new ReflectionMethod($plugin, 'doEnrich');
+    $busySourceMethod->setAccessible(true);
+    $busySourceResult = $busySourceMethod->invoke($plugin, 1, [10], $context);
+    assertTrueValue(($busySourceResult->data['skipped_busy'] ?? 0) === 1, 'A lock race must identify a busy source for the collection caller.');
+
+    $progressContext = new PluginExecutionContext();
+    $progressContext->settings['enrich_from_tmdb'] = true;
+    $busyCollectionResult = $plugin->runAction('enrich_epg', ['playlist_id' => 10], $progressContext);
+    assertTrueValue($busyCollectionResult->success, 'A locked source collection should return an accurate busy result.');
+    assertTrueValue(str_contains(strtolower($busyCollectionResult->summary), 'already in progress'), 'A pre-census lock must remain visible in the collection result.');
+    assertTrueValue(! in_array(100, $progressContext->progresses, true), 'A locked source collection must not report terminal 100 progress.');
+    foreach ($progressContext->messages as $message) {
+        assertTrueValue(! str_contains(strtolower($message), 'finished'), 'A locked source collection must not report finished enrichment.');
+    }
 
     $differentEpgResult = $plugin->runHook('epg.cache.generated', [
         'epg_id' => 2,

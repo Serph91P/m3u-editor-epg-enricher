@@ -625,12 +625,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $context->heartbeat("Starting EPG enrichment for {$playlistLabel} ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
 
         $progress = ['total' => 0, 'completed' => 0];
+        $busyEpgIds = [];
         if ($context->settings['enrich_from_tmdb'] ?? true) {
             foreach ($epgIds as $epgId) {
                 if ($this->resolveTargetChannelIds((int) $epgId, $playlistIds) === []) {
                     continue;
                 }
                 if (! $this->epgLockIsAvailable((int) $epgId)) {
+                    $busyEpgIds[(int) $epgId] = true;
+
                     continue;
                 }
                 $epg = Epg::find((int) $epgId);
@@ -656,7 +659,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return $result;
             }
 
+            unset($busyEpgIds[(int) $epgId]);
+
             if (empty($result->data)) {
+                $notices[] = $result->summary;
+
+                continue;
+            }
+
+            if (($result->data['skipped_busy'] ?? 0) > 0) {
+                $busyEpgIds[(int) $epgId] = true;
                 $notices[] = $result->summary;
 
                 continue;
@@ -676,6 +688,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $notice = implode(' ', array_unique($notices));
+        if ($busyEpgIds !== []) {
+            $context->heartbeat('EPG enrichment is already in progress for one or more sources.');
+
+            return PluginActionResult::success("Enrichment is already in progress for {$playlistLabel}. {$notice}");
+        }
+
         if (empty($combinedStats)) {
             $context->heartbeat('EPG enrichment finished.', 100);
             return PluginActionResult::success("Enrichment finished for {$playlistLabel}: {$notice}");
@@ -766,7 +784,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (! flock($lock, LOCK_EX | LOCK_NB)) {
             fclose($lock);
 
-            return PluginActionResult::success("Enrichment for EPG [{$epgId}] is already in progress - skipping.");
+            return PluginActionResult::success("Enrichment for EPG [{$epgId}] is already in progress - skipping.", ['skipped_busy' => 1]);
         }
 
         try {
