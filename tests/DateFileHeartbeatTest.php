@@ -105,13 +105,13 @@ namespace Tests {
     same(2, count($staleHost->snapshots), 'Stale handling must re-snapshot once.');
     same(2, count($staleHost->applies), 'Stale handling must re-apply once without a file fallback.');
     same(1, $stale->data['programmes_updated'] ?? null, 'Only an accepted retry may count a mutation.');
-    same(['Processing canonical host EPG snapshot.', 'Host EPG patch batch published.'], array_column($staleContext->heartbeats, 'message'), 'The published heartbeat must remain after accepted host apply only.');
+    same(['Checking programme details and artwork.', 'Saving updates.'], array_column($staleContext->heartbeats, 'message'), 'The status must describe checking details and saving updates without host internals.');
 
     [$cancelled, $cancelledHost, $cancelledContext] = run($changePage, ['applied'], 1);
     same('cancelled', $cancelled->status, 'Abort protection must remain observable during canonical snapshot processing.');
     same(0, count($cancelledHost->applies), 'Aborted work must not conditionally apply a partial patch batch.');
     same(0, $cancelled->data['programmes_updated'] ?? 0, 'Aborted work must not report unpublished updates.');
-    same(['Processing canonical host EPG snapshot.'], array_column($cancelledContext->heartbeats, 'message'), 'Abort must preserve the processing heartbeat but not a publish heartbeat.');
+    same(['Checking programme details and artwork.'], array_column($cancelledContext->heartbeats, 'message'), 'Abort must preserve the checking heartbeat but not claim saving updates.');
 
     $cursorPages = [
         ['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],

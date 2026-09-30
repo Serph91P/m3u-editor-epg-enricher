@@ -133,7 +133,7 @@ namespace Tests {
     assertSameValue(1, $host->applies[0]['patches'][0]['id'] ?? null, 'Patch must preserve the host programme id.');
     assertSameValue('hash-1', $host->applies[0]['patches'][0]['hash'] ?? null, 'Patch must preserve the host programme hash.');
     assertSameValue('Sports', $host->applies[0]['patches'][0]['changes']['category'] ?? null, 'Canonical patch must carry the enriched category.');
-    assertSameValue(['Processing canonical host EPG snapshot.', 'Host EPG patch batch published.'], $context->messages, 'Host-boundary heartbeats must remain observable.');
+    assertSameValue(['Checking programme details and artwork.', 'Saving updates.'], $context->messages, 'End-user heartbeats must describe the current work without host internals.');
 
     [$pagedResult, $pagedHost] = runFixture(['applied', 'applied'], [], PHP_INT_MAX, [
         ['programmes' => [['id' => 1, 'hash' => 'page-1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],
@@ -175,6 +175,7 @@ namespace Tests {
     [$cancelledResult, $cancelledHost] = runFixture(['applied'], [], 1);
     assertSameValue('cancelled', $cancelledResult->status, 'Cancellation before host apply must propagate.');
     assertSameValue(0, count($cancelledHost->applies), 'Cancellation must not mutate host-owned EPG data.');
+    assertSameValue('Enrichment cancelled before saving updates.', $cancelledResult->summary, 'Cancellation must use an end-user message without host implementation terms.');
 
     $censusHost = new EpgCacheEnrichmentService();
     $censusHost->pages = [
@@ -193,7 +194,7 @@ namespace Tests {
         ['afterId' => 2, 'limit' => 100],
     ], $censusHost->snapshots, 'The census must use the host cursor and bounded pages.');
     assertSameValue([], $censusHost->applies, 'The census must never apply mutations.');
-    assertSameValue('Counting canonical host EPG snapshot: 2 programmes counted.', $censusContext->messages[0] ?? null, 'The census must visibly report a count rather than a fabricated percentage.');
+    assertSameValue('Finding programmes: 2 found.', $censusContext->messages[0] ?? null, 'The census must visibly report a count rather than a fabricated percentage.');
     assertSameValue(true, array_key_exists(0, $censusContext->progresses), 'The census must emit a visible heartbeat.');
     assertSameValue(null, $censusContext->progresses[0], 'The census must not fabricate percentage progress.');
 
@@ -210,6 +211,19 @@ namespace Tests {
     $progressMethod->invokeArgs(new Plugin(), [new \App\Models\Epg(1), 1, [1], $progressContext, &$progress]);
     assertSameValue(['total' => 2, 'completed' => 2], $progress, 'Completed page counts must accumulate against the bounded census total.');
     assertSameValue([50, 99], array_values(array_filter($progressContext->progresses, fn ($value): bool => $value !== null)), 'Progress must be monotonic after accepted pages and reserve 100 for the terminal heartbeat.');
+    assertSameValue([
+        'Checking programme details and artwork: 0/2 checked.',
+        'Saving updates: 0/2 checked.',
+        'Checking programme details and artwork: 1/2 checked.',
+        'Checking programme details and artwork: 1/2 checked.',
+        'Saving updates: 1/2 checked.',
+        'Checking programme details and artwork: 2/2 checked.',
+    ], $progressContext->messages, 'Page heartbeats must be bounded, show the current end-user phase, and never reveal host implementation terms.');
+    foreach ($progressContext->messages as $message) {
+        foreach (['canonical', 'host snapshot', 'patch', 'hash', 'mapped'] as $internalTerm) {
+            assertSameValue(false, str_contains(strtolower($message), $internalTerm), "Progress message must not expose {$internalTerm}.");
+        }
+    }
 
     $manifest = json_decode(file_get_contents(__DIR__.'/../plugin.json'), true, flags: JSON_THROW_ON_ERROR);
     assertSameValue('1.0.0', $manifest['api_version'] ?? null, 'The plugin manifest must match the host validator API version.');

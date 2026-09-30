@@ -677,7 +677,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $notice = implode(' ', array_unique($notices));
         if (empty($combinedStats)) {
-            $context->heartbeat('EPG enrichment finished without mapped programme changes.', 100);
+            $context->heartbeat('EPG enrichment finished.', 100);
             return PluginActionResult::success("Enrichment finished for {$playlistLabel}: {$notice}");
         }
 
@@ -689,7 +689,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $summary .= " {$notice}";
         }
 
-        $context->heartbeat('EPG enrichment complete: '.$progress['completed'].' canonical programmes visited.', 100);
+        $context->heartbeat('EPG enrichment finished: '.$progress['completed'].' programmes checked.', 100);
 
         return PluginActionResult::success($summary, $combinedStats);
     }
@@ -832,23 +832,23 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $counted = 0;
         do {
             if ($context->cancellationRequested()) {
-                return PluginActionResult::cancelled('Enrichment cancelled during canonical host EPG census.', ['programmes_counted' => $counted]);
+                return PluginActionResult::cancelled('Enrichment cancelled while finding programmes.', ['programmes_counted' => $counted]);
             }
             $snapshot = $service->snapshot($context, $epg, $afterId, 100);
             if (($snapshot['status'] ?? null) !== 'ok') {
-                return PluginActionResult::failure('Host EPG census snapshot rejected: '.($snapshot['status'] ?? 'unknown').'.', ['programmes_counted' => $counted]);
+                return PluginActionResult::failure('Could not read programme information.', ['programmes_counted' => $counted]);
             }
             foreach (($snapshot['programmes'] ?? []) as $_row) {
                 if ($context->cancellationRequested()) {
-                    return PluginActionResult::cancelled('Enrichment cancelled during canonical host EPG census.', ['programmes_counted' => $counted]);
+                    return PluginActionResult::cancelled('Enrichment cancelled while finding programmes.', ['programmes_counted' => $counted]);
                 }
                 $counted++;
             }
-            $context->heartbeat("Counting canonical host EPG snapshot: {$counted} programmes counted.");
+            $context->heartbeat("Finding programmes: {$counted} found.");
             $afterId = $snapshot['next'] ?? null;
         } while ($afterId !== null);
 
-        return PluginActionResult::success('Canonical host EPG census complete.', ['programmes_counted' => $counted]);
+        return PluginActionResult::success('Programme count finished.', ['programmes_counted' => $counted]);
     }
 
     /**
@@ -890,14 +890,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         do {
             $snapshot = $service->snapshot($context, $epg, $afterId, 100);
             if (($snapshot['status'] ?? null) !== 'ok') {
-                return PluginActionResult::failure('Host EPG snapshot rejected: '.($snapshot['status'] ?? 'unknown').'.', $stats);
+                return PluginActionResult::failure('Could not read programme information.', $stats);
             }
-            $context->heartbeat('Processing canonical host EPG snapshot.');
+            $context->heartbeat($this->endUserProgressMessage('Checking programme details and artwork', $progress));
             $patches = [];
             $pageStats = $stats;
             foreach (($snapshot['programmes'] ?? []) as $row) {
                 if ($context->cancellationRequested()) {
-                    return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
+                    return PluginActionResult::cancelled('Enrichment cancelled before saving updates.', $stats);
                 }
                 $programme = $row['programme'] ?? null;
                 if (! is_array($programme) || ! in_array($programme['channel'] ?? null, $targetChannels, true)) {
@@ -919,24 +919,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
             if ($patches !== []) {
                 if ($context->cancellationRequested()) {
-                    return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
+                    return PluginActionResult::cancelled('Enrichment cancelled before saving updates.', $stats);
                 }
+                $context->heartbeat($this->endUserProgressMessage('Saving updates', $progress));
                 $appliedPatches = $patches;
                 $apply = $service->apply($context, $epg, $patches);
                 $status = $apply['status'] ?? 'unknown';
                 if ($status === 'stale') {
                     if ($context->cancellationRequested()) {
-                        return PluginActionResult::cancelled('Enrichment cancelled before host retry.', $stats);
+                        return PluginActionResult::cancelled('Enrichment cancelled before checking programme details.', $stats);
                     }
                     $retry = $service->snapshot($context, $epg, $afterId, 100);
                     if (($retry['status'] ?? null) !== 'ok') {
-                        return PluginActionResult::failure('Host EPG retry snapshot rejected: '.($retry['status'] ?? 'unknown').'.', $stats);
+                        return PluginActionResult::failure('Could not read programme information.', $stats);
                     }
                     $retryPatches = array_map(fn (array $retryRow): array => ['id' => $retryRow['id'] ?? 0, 'hash' => $retryRow['hash'] ?? '', 'changes' => $this->canonicalHostChanges($retryRow['programme'] ?? [], $this->enrichCopy($retryRow['programme'] ?? [], $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage))], array_filter($retry['programmes'] ?? [], fn (array $retryRow): bool => in_array(($retryRow['programme']['channel'] ?? null), $targetChannels, true)));
                     $retryPatches = array_values(array_filter($retryPatches, fn (array $patch): bool => $patch['changes'] !== []));
                     $appliedPatches = $retryPatches;
                     if ($retryPatches !== [] && $context->cancellationRequested()) {
-                        return PluginActionResult::cancelled('Enrichment cancelled before host apply.', $stats);
+                        return PluginActionResult::cancelled('Enrichment cancelled before saving updates.', $stats);
                     }
                     $apply = $retryPatches === [] ? ['status' => 'noop'] : $service->apply($context, $epg, $retryPatches);
                     $status = $apply['status'] ?? 'unknown';
@@ -944,9 +945,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
                 if ($status === 'applied') {
                     $pageStats['programmes_updated'] += count($appliedPatches);
-                    $context->heartbeat('Host EPG patch batch published.');
                 } elseif ($status !== 'noop') {
-                    return PluginActionResult::failure('Host EPG apply rejected: '.$status.'. No updates were reported.', $stats);
+                    return PluginActionResult::failure('Could not save programme updates.', $stats);
                 }
             }
             $stats = $pageStats;
@@ -956,11 +956,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $percentage = $progress['total'] > 0
                     ? min(99, (int) floor(($progress['completed'] * 100) / $progress['total']))
                     : 99;
-                $context->heartbeat(
-                    'EPG enrichment: '.$progress['completed'].'/'.$progress['total'].' canonical programmes visited; '
-                    .$stats['programmes_processed'].' mapped programmes processed.',
-                    $percentage,
-                );
+                $context->heartbeat($this->endUserProgressMessage('Checking programme details and artwork', $progress), $percentage);
             }
             $afterId = $snapshot['next'] ?? null;
         } while ($afterId !== null);
@@ -968,6 +964,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $this->saveTmdbSeasonCache($tmdbSeasonCache);
         $this->saveTmdbImagesCache($imagesCache);
         return PluginActionResult::success("Enrichment complete for '{$epg->name}': {$stats['programmes_updated']}/{$stats['programmes_processed']} programmes updated.", $stats);
+    }
+
+    /**
+     * Keep execution status understandable without exposing host implementation details.
+     */
+    private function endUserProgressMessage(string $phase, ?array $progress): string
+    {
+        if ($progress === null) {
+            return $phase.'.';
+        }
+
+        return $phase.': '.(int) ($progress['completed'] ?? 0).'/'.(int) ($progress['total'] ?? 0).' checked.';
     }
 
     private function enrichCopy(array $programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage): array
