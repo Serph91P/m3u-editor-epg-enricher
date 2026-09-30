@@ -1712,53 +1712,32 @@ namespace Tests {
     assertTrueValue(in_array('https://fixture.invalid/boston-poster.jpg', array_column($landscapePoster['images'], 'url'), true), 'A landscape source poster with a confident TMDB match must recover a real TMDB portrait poster.');
     assertTrueValue(in_array('https://provider.invalid/boston-landscape-poster.jpg', array_column($landscapePoster['images'], 'url'), true), 'A rejected landscape source poster should remain as secondary artwork.');
 
-    // Regression: an unscoped source image labelled poster/orient=P must not be
-    // trusted as a usable portrait, even if its geometry is plausible.
-    $unscopedPortrait = [
+    // Host-roundtrip regression: source/scope are not retained by the canonical
+    // host image contract. A persisted 500x750 poster therefore remains trusted
+    // on the next pass using only url/type/orient/width/height and must not cause
+    // a TMDB lookup or any mutation.
+    $hostRoundTrippedPortrait = [
         'title' => 'Boston',
         'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
         'category' => 'Documentary',
-        'icon' => 'https://provider.invalid/boston-unscoped-poster.jpg',
+        'icon' => 'https://provider.invalid/boston-host-roundtrip-poster.jpg',
         'images' => [[
-            'url' => 'https://provider.invalid/boston-unscoped-poster.jpg',
+            'url' => 'https://provider.invalid/boston-host-roundtrip-poster.jpg',
             'type' => 'poster',
             'orient' => 'P',
             'width' => 500,
             'height' => 750,
         ]],
     ];
-    $unscopedPortraitCache = [];
-    enrich($plugin, $method, $unscopedPortrait, new TmdbService('boston'), $unscopedPortraitCache);
-    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $unscopedPortrait['icon'], 'An unscoped source poster must not block a confident TMDB landscape primary.');
-    assertTrueValue(in_array('https://fixture.invalid/boston-poster.jpg', array_column($unscopedPortrait['images'], 'url'), true), 'An unscoped source poster with a confident TMDB match must recover a real TMDB portrait poster.');
-    assertTrueValue(in_array('https://provider.invalid/boston-unscoped-poster.jpg', array_column($unscopedPortrait['images'], 'url'), true), 'A rejected unscoped source poster should remain as secondary artwork.');
-
-    // Counter-regression: a genuinely scoped portrait source poster must remain
-    // trusted and must not trigger an unnecessary TMDB lookup. We disable both
-    // poster and backdrop enrichment to ensure the fast-path is taken.
-    $validPortraitSource = [
-        'title' => 'Boston',
-        'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
-        'category' => 'Documentary',
-        'icon' => 'https://provider.invalid/boston-valid-portrait.jpg',
-        'images' => [[
-            'url' => 'https://provider.invalid/boston-valid-portrait.jpg',
-            'type' => 'poster',
-            'orient' => 'P',
-            'width' => 500,
-            'height' => 750,
-            'scope' => 'programme',
-        ]],
-    ];
-    $validPortraitSourceCache = [];
+    $hostRoundTrippedPortraitCache = [];
     $tmpSeason = [];
     $tmpImages = [];
-    $validPortraitSourceTmdb = new TmdbService('none');
-    $validPortraitSourceBefore = $validPortraitSource;
-    $validPortraitSourceResult = $method->invokeArgs($plugin, [
-        &$validPortraitSource,
-        $validPortraitSourceTmdb,
-        &$validPortraitSourceCache,
+    $hostRoundTrippedPortraitTmdb = new TmdbService('none');
+    $hostRoundTrippedPortraitBefore = $hostRoundTrippedPortrait;
+    $hostRoundTrippedPortraitResult = $method->invokeArgs($plugin, [
+        &$hostRoundTrippedPortrait,
+        $hostRoundTrippedPortraitTmdb,
+        &$hostRoundTrippedPortraitCache,
         false,
         true,
         true,
@@ -1772,8 +1751,9 @@ namespace Tests {
         &$tmpImages,
         [],
     ]);
-    assertSameValue($validPortraitSourceBefore, $validPortraitSource, 'A valid portrait source poster without a trusted landscape should be left unchanged.');
-    assertSameValue(false, $validPortraitSourceResult['lookup'] ?? null, 'A valid portrait source poster should not trigger an unnecessary TMDB lookup.');
+    assertSameValue($hostRoundTrippedPortraitBefore, $hostRoundTrippedPortrait, 'A host-round-tripped canonical portrait poster should be left unchanged.');
+    assertSameValue(false, $hostRoundTrippedPortraitResult['lookup'] ?? null, 'A host-round-tripped canonical portrait poster should not trigger a TMDB lookup.');
+    assertSameValue(0, $hostRoundTrippedPortraitTmdb->tvSearches + $hostRoundTrippedPortraitTmdb->movieSearches, 'A host-round-tripped canonical portrait poster must not query TMDB again.');
 
     // Boundary: a source poster with no confident TMDB match must not invent a
     // portrait. The rejected source image stays and no TMDB poster appears.
