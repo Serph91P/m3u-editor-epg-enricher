@@ -1755,10 +1755,9 @@ namespace Tests {
     assertSameValue(false, $hostRoundTrippedPortraitResult['lookup'] ?? null, 'A host-round-tripped canonical portrait poster should not trigger a TMDB lookup.');
     assertSameValue(0, $hostRoundTrippedPortraitTmdb->tvSearches + $hostRoundTrippedPortraitTmdb->movieSearches, 'A host-round-tripped canonical portrait poster must not query TMDB again.');
 
-    // Boundary: a source poster with no confident TMDB match must not invent a
-    // portrait. The rejected source image stays and no TMDB poster appears.
-    // Poster enrichment is disabled here so the code does not attempt to recover
-    // a TMDB poster it cannot find.
+    // Boundary: an invalid square source poster with poster enrichment enabled
+    // must attempt TMDB recovery, but a no-match result must not invent a portrait.
+    // The rejected source image remains the safe fallback.
     $noMatchPortrait = [
         'title' => 'Boston',
         'desc' => 'Dokumentation aus dem Jahr 2017 über den Anschlag auf den Boston-Marathon.',
@@ -1785,7 +1784,7 @@ namespace Tests {
         false,
         true,
         true,
-        false,
+        true,
         false,
         false,
         false,
@@ -1795,8 +1794,10 @@ namespace Tests {
         &$noMatchPortraitImages,
         [],
     ]);
-    assertSameValue($noMatchPortraitBefore, $noMatchPortrait, 'A rejected source poster without a TMDB match should be left unchanged.');
-    assertSameValue(0, $noMatchPortraitTmdb->tvSearches + $noMatchPortraitTmdb->movieSearches, 'A rejected source poster must not trigger an unnecessary TMDB lookup for this fixture.');
+    assertSameValue($noMatchPortraitBefore, $noMatchPortrait, 'An invalid source poster without a TMDB match should be left unchanged.');
+    assertTrueValue($noMatchPortraitTmdb->tvSearches + $noMatchPortraitTmdb->movieSearches > 0, 'An invalid source poster with enrichment enabled must attempt TMDB recovery.');
+    assertTrueValue(in_array('https://provider.invalid/boston-no-match.jpg', array_column($noMatchPortrait['images'], 'url'), true), 'An invalid source poster without a TMDB match must remain as the safe fallback.');
+    assertSameValue(1, count($noMatchPortrait['images']), 'An invalid source poster without a TMDB match must not fabricate a poster.');
 
     $posterOnly = [
         'title' => 'Poster Only',
