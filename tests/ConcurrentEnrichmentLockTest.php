@@ -68,6 +68,11 @@ namespace App\Plugins\Support {
             $this->user = new \App\Models\User(1);
         }
 
+        public function cancellationRequested(): bool
+        {
+            return false;
+        }
+
         public function heartbeat(string $message, ?int $progress = null): void
         {
             $this->messages[] = $message;
@@ -182,13 +187,15 @@ namespace App\Models {
     {
         public string $name = 'Fixture EPG';
 
+        public function __construct(public int $id = 1) {}
+
         public static function find(int $id): ?self
         {
             if ($id === 3) {
                 throw new \RuntimeException('Fixture exception');
             }
 
-            return in_array($id, [1, 4], true) ? new self() : null;
+            return in_array($id, [1, 4], true) ? new self($id) : null;
         }
     }
 
@@ -228,8 +235,20 @@ namespace App\Services {
     class TmdbService {}
     class EpgCacheEnrichmentService
     {
+        public static bool $lockAfterCensus = false;
+        public static $raceLockHandle = null;
+
         public function snapshot(object $context, object $epg, int $afterId = 0, int $limit = 500): array
         {
+            if (self::$lockAfterCensus) {
+                self::$lockAfterCensus = false;
+                $path = \Illuminate\Support\Facades\Storage::$root."/plugin-data/epg-enricher/epg-{$epg->id}.lock";
+                self::$raceLockHandle = fopen($path, 'c');
+                if (self::$raceLockHandle === false || ! flock(self::$raceLockHandle, LOCK_EX | LOCK_NB)) {
+                    throw new \RuntimeException('Could not establish the census-to-enrichment lock race fixture.');
+                }
+            }
+
             return ['status' => 'ok', 'programmes' => [], 'next' => null];
         }
 
@@ -340,6 +359,20 @@ namespace Tests {
 
     flock($epgOneLock, LOCK_UN);
     fclose($epgOneLock);
+
+    \App\Services\EpgCacheEnrichmentService::$lockAfterCensus = true;
+    $raceContext = new PluginExecutionContext();
+    $raceContext->settings['enrich_from_tmdb'] = true;
+    $raceCollectionResult = $plugin->runAction('enrich_epg', ['playlist_id' => 10], $raceContext);
+    assertTrueValue($raceCollectionResult->success, 'A census-to-enrichment lock race should return an accurate busy result.');
+    assertTrueValue(str_contains(strtolower($raceCollectionResult->summary), 'already in progress'), 'A census-to-enrichment lock race must remain visible in the collection result.');
+    assertTrueValue(! in_array(100, $raceContext->progresses, true), 'A census-to-enrichment lock race must not report terminal 100 progress.');
+    foreach ($raceContext->messages as $message) {
+        assertTrueValue(! str_contains(strtolower($message), 'finished'), 'A census-to-enrichment lock race must not report finished enrichment.');
+    }
+    flock(\App\Services\EpgCacheEnrichmentService::$raceLockHandle, LOCK_UN);
+    fclose(\App\Services\EpgCacheEnrichmentService::$raceLockHandle);
+    \App\Services\EpgCacheEnrichmentService::$raceLockHandle = null;
 
     $method = new ReflectionMethod($plugin, 'doEnrich');
     $method->setAccessible(true);
