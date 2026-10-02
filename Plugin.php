@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.10.02-generic-year-tv-abstain';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.09.30-poster-geometry-trust';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1214,6 +1214,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         $forcedMediaType = $hasStrongSeriesSignals ? 'tv' : null;
         $description = trim((string) ($programme['desc'] ?? ''));
+        $episodeIdentity = [
+            'season' => $seriesSignals['season'],
+            'episode' => $seriesSignals['episode'],
+            'subtitle' => trim((string) ($programme['subtitle'] ?? '')),
+        ];
         $existingTmdbId = $programme['tmdb_id'] ?? null;
         $existingTmdbId = is_scalar($existingTmdbId) ? trim((string) $existingTmdbId) : null;
         $cacheScope = [
@@ -1237,16 +1242,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'season' => $seriesSignals['season'],
             'episode' => $seriesSignals['episode'],
         ];
+        $episodeTitleEvidence = $this->normalizeIdentityText($episodeIdentity['subtitle']);
+        $hasEpisodeTitleEvidence = $seriesSignals['season'] !== null
+            && $seriesSignals['episode'] !== null
+            && $episodeTitleEvidence !== '';
+        if ($hasEpisodeTitleEvidence) {
+            // Keep the cache change scoped to the new episode-validated matcher.
+            $lookupEvidence['episode_title'] = $episodeTitleEvidence;
+        }
         $evidenceHash = hash('sha256', json_encode($lookupEvidence, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
         $fullCacheKey = $this->normalizeCacheKey($title).'|'.$evidenceHash;
         $baseCacheKey = ($baseTitle !== $title) ? $this->normalizeCacheKey($baseTitle).'|'.$evidenceHash : null;
+        $seriesBaseEvidence = [
+            'logic' => self::ENRICHMENT_LOGIC_VERSION,
+            'scope' => $cacheScope,
+            'base_title' => $this->normalizeCacheKey($baseTitle),
+            'year' => $year,
+        ];
+        if ($hasEpisodeTitleEvidence) {
+            $seriesBaseEvidence['episode_title'] = $episodeTitleEvidence;
+        }
         $seriesBaseCacheKey = ($baseTitle !== $title && $hasStrongSeriesSignals)
-            ? '__series_base|'.hash('sha256', json_encode([
-                'logic' => self::ENRICHMENT_LOGIC_VERSION,
-                'scope' => $cacheScope,
-                'base_title' => $this->normalizeCacheKey($baseTitle),
-                'year' => $year,
-            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES))
+            ? '__series_base|'.hash('sha256', json_encode($seriesBaseEvidence, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES))
             : null;
 
         // Keep description-sensitive entries isolated. Only strongly episodic records may
@@ -1282,6 +1299,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $year,
                 $description,
                 $compoundIdentity,
+                null,
+                $episodeIdentity,
             );
             $matchedViaBase = false;
 
@@ -1295,6 +1314,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $description,
                     $unusedCompoundIdentity,
                     $compoundIdentity,
+                    $episodeIdentity,
                 );
                 $matchedViaBase = $tmdbData !== null;
             }
@@ -2575,6 +2595,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         string $description = '',
         ?array &$provisionalCompoundIdentity = null,
         ?array $requiredCompoundIdentity = null,
+        ?array $episodeIdentity = null,
     ): ?array
     {
         $provisionalCompoundIdentity = null;
@@ -2608,6 +2629,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             $best = $this->selectTmdbIdentityWinner($candidates);
+            if ($best === null) {
+                $best = $this->selectEpisodeValidatedTvWinner($tmdb, $candidates, $forceMediaType, $episodeIdentity);
+            }
             if ($requiredCompoundIdentity !== null) {
                 $best = $this->confirmedCompoundIdentityCandidate(
                     $candidates,
@@ -2817,6 +2841,67 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return $best;
+    }
+
+    /**
+     * Resolve an otherwise ambiguous TV-title match only when typed episode data
+     * identifies exactly one candidate through a matching TMDB episode title.
+     * XMLTV NS numbering is normalized by detectSeriesSignals before this call.
+     */
+    private function selectEpisodeValidatedTvWinner(
+        TmdbService $tmdb,
+        array $candidates,
+        ?string $forceMediaType,
+        ?array $episodeIdentity,
+    ): ?array {
+        $season = $episodeIdentity['season'] ?? null;
+        $episode = $episodeIdentity['episode'] ?? null;
+        $subtitle = $this->normalizeIdentityText((string) ($episodeIdentity['subtitle'] ?? ''));
+        if ($forceMediaType !== 'tv'
+            || ! is_int($season) || $season <= 0
+            || ! is_int($episode) || $episode <= 0
+            || $subtitle === '') {
+            return null;
+        }
+
+        usort($candidates, fn (array $a, array $b): int => $b['_identity_score'] <=> $a['_identity_score']);
+        $topScore = $candidates[0]['_identity_score'] ?? null;
+        if (! is_numeric($topScore)) {
+            return null;
+        }
+
+        $matches = [];
+        foreach ($candidates as $candidate) {
+            if (($candidate['_media_type'] ?? null) !== 'tv'
+                || ($candidate['_identity_valid'] ?? false) !== true
+                || ! is_int($candidate['tmdb_id'] ?? null)
+                || $candidate['_identity_score'] < 76.0
+                || ((float) $topScore - (float) $candidate['_identity_score']) >= 8.0) {
+                continue;
+            }
+
+            try {
+                $seasonData = $tmdb->getSeasonDetails($candidate['tmdb_id'], $season);
+            } catch (\Throwable) {
+                return null;
+            }
+            if (! is_array($seasonData) || ! is_array($seasonData['episodes'] ?? null)) {
+                continue;
+            }
+            foreach ($seasonData['episodes'] as $episodeData) {
+                if (! is_array($episodeData)
+                    || ($episodeData['episode_number'] ?? null) !== $episode
+                    || ! is_string($episodeData['name'] ?? null)) {
+                    continue;
+                }
+                if ($this->normalizeIdentityText($episodeData['name']) === $subtitle) {
+                    $matches[] = $candidate;
+                }
+                break;
+            }
+        }
+
+        return count($matches) === 1 ? $matches[0] : null;
     }
 
     private function scoreTmdbCandidate(

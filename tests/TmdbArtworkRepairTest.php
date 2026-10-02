@@ -443,6 +443,8 @@ namespace App\Services {
             private bool $throwOnMovieCandidates = false,
             private array $tvCandidatesByQuery = [],
             private array $movieCandidatesByQuery = [],
+            private array $seasonDetails = [],
+            private bool $throwOnSeasonDetails = false,
         ) {
             parent::__construct('candidate-api');
         }
@@ -487,6 +489,16 @@ namespace App\Services {
             $this->movieDetailsRequests++;
 
             return $this->movieDetails[$tmdbId] ?? null;
+        }
+
+        public function getSeasonDetails(int $tmdbId, int $season): ?array
+        {
+            $this->seasonRequests++;
+            if ($this->throwOnSeasonDetails) {
+                throw new \RuntimeException('synthetic season request failure');
+            }
+
+            return $this->seasonDetails["{$tmdbId}:{$season}"] ?? null;
         }
 
         public function getTvAlternativeTitles(int $tmdbId): array
@@ -1099,6 +1111,79 @@ namespace Tests {
         assertSameValue($maliciousYearBefore, $maliciousYearProgramme, 'Malformed or unknown source year fields must not break a same-title identity tie.');
         assertSameValue([0, 0], [$maliciousYearTmdb->tvDetailsRequests, $maliciousYearTmdb->movieDetailsRequests], 'Malformed or unknown source year fields must not load a candidate.');
     }
+
+    // A typed XMLTV NS episode number and matching programme subtitle can validate
+    // one otherwise tied TV candidate. The number is zero-based in XMLTV NS, so
+    // 0.4. must request TMDB season 1, episode 5 rather than S00E04.
+    $episodeValidatedTmdb = new CandidateTmdbService(
+        tvCandidates: $ambiguousSeriesCandidates,
+        tvDetails: [681 => normalizedTvDetailsFixture(
+            681,
+            'Twin Horizon',
+            'The validated synthetic series.',
+            'https://image.tmdb.org/t/p/w500/twin-horizon-poster.jpg',
+            'https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg',
+        )],
+        seasonDetails: [
+            '681:1' => ['episodes' => [[
+                'episode_number' => 5,
+                'name' => 'Signal Fire',
+                'overview' => 'A synthetic episode.',
+            ]],],
+            '682:1' => ['episodes' => []],
+        ],
+    );
+    $episodeValidatedProgramme = [
+        'title' => 'Twin Horizon',
+        'subtitle' => 'Signal Fire',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.4.']],
+    ];
+    $episodeValidatedCache = [];
+    enrich($plugin, $method, $episodeValidatedProgramme, $episodeValidatedTmdb, $episodeValidatedCache);
+    assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $episodeValidatedProgramme['icon'] ?? null, 'A unique matching typed episode must resolve an otherwise tied TV identity.');
+    assertSameValue(1, $episodeValidatedTmdb->tvDetailsRequests, 'Only the episode-validated TV candidate may load series details.');
+    assertSameValue(2, $episodeValidatedTmdb->seasonRequests, 'Episode validation must inspect every tied candidate exactly once.');
+    $episodeValidatedReplay = [
+        'title' => 'Twin Horizon',
+        'subtitle' => 'Signal Fire',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.4.']],
+    ];
+    $episodeValidatedReplayTmdb = new CandidateTmdbService();
+    enrich($plugin, $method, $episodeValidatedReplay, $episodeValidatedReplayTmdb, $episodeValidatedCache);
+    assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $episodeValidatedReplay['icon'] ?? null, 'An exact episode-validated replay should retain the validated artwork.');
+    assertSameValue([0, 0, 0], [$episodeValidatedReplayTmdb->tvCandidateSearches, $episodeValidatedReplayTmdb->tvDetailsRequests, $episodeValidatedReplayTmdb->seasonRequests], 'An exact episode-validated cache hit must not amplify TMDB requests.');
+
+    foreach ([
+        'ambiguous episode title' => [
+            '681:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Signal Fire']]],
+            '682:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Signal Fire']]],
+        ],
+        'contradictory episode title' => [
+            '681:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Different Episode']]],
+            '682:1' => ['episodes' => [],],
+        ],
+    ] as $label => $seasonDetails) {
+        $episodeAbstentionTmdb = new CandidateTmdbService(
+            tvCandidates: $ambiguousSeriesCandidates,
+            seasonDetails: $seasonDetails,
+        );
+        $episodeAbstentionProgramme = $episodeValidatedProgramme;
+        $episodeAbstentionBefore = $episodeAbstentionProgramme;
+        $episodeAbstentionCache = [];
+        enrich($plugin, $method, $episodeAbstentionProgramme, $episodeAbstentionTmdb, $episodeAbstentionCache);
+        assertSameValue($episodeAbstentionBefore, $episodeAbstentionProgramme, "A {$label} must leave the programme unchanged.");
+        assertSameValue(0, $episodeAbstentionTmdb->tvDetailsRequests, "A {$label} must not load series details.");
+    }
+    $episodeNetworkTmdb = new CandidateTmdbService(
+        tvCandidates: $ambiguousSeriesCandidates,
+        throwOnSeasonDetails: true,
+    );
+    $episodeNetworkProgramme = $episodeValidatedProgramme;
+    $episodeNetworkBefore = $episodeNetworkProgramme;
+    $episodeNetworkCache = [];
+    enrich($plugin, $method, $episodeNetworkProgramme, $episodeNetworkTmdb, $episodeNetworkCache);
+    assertSameValue($episodeNetworkBefore, $episodeNetworkProgramme, 'A season lookup failure must fail closed without a candidate details request.');
+    assertSameValue(0, $episodeNetworkTmdb->tvDetailsRequests, 'A season lookup failure must not load series details.');
 
     $malformedTmdb = new CandidateTmdbService(tvCandidates: [
         ['tmdb_id' => 651, 'name' => 'Malformed Target', 'original_name' => 'Malformed Target', 'first_air_date' => '2024-01-01', 'overview' => 'Valid candidate.'],
