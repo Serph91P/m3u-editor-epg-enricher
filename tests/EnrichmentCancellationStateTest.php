@@ -1,541 +1,71 @@
 <?php
 
 namespace {
-    function app(string $class): object
-    {
-        return $class === App\Services\EpgCacheService::class
-            ? new App\Services\EpgCacheService()
-            : new App\Services\TmdbService();
-    }
-
-    function now(): object
-    {
-        return new class
-        {
-            public function toIso8601String(): string
-            {
-                return '2026-07-11T12:00:00+00:00';
-            }
-        };
-    }
-
-    function storage_path(string $path = ''): string
-    {
-        return Illuminate\Support\Facades\Storage::$root.($path === '' ? '' : '/'.$path);
-    }
+    function app(string $class): object { return $GLOBALS['cancellationServices'][$class] ?? throw new \RuntimeException("Missing service {$class}"); }
+    function storage_path(string $path = ''): string { return sys_get_temp_dir().'/epg-enricher-cancellation'; }
 }
-
-namespace App\Plugins\Contracts {
-    interface EpgProcessorPluginInterface {}
-    interface HookablePluginInterface {}
-
-    interface PluginSelectOptionsProviderInterface
-    {
-        public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array;
-    }
-}
-
+namespace App\Plugins\Contracts { interface EpgProcessorPluginInterface {} interface HookablePluginInterface {} interface PluginSelectOptionsProviderInterface { public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array; } }
 namespace App\Plugins\Support {
     class PluginSelectOptionsContext {}
-
-    class PluginActionResult
-    {
-        public function __construct(
-            public readonly string $status,
-            public readonly bool $success,
-            public readonly string $summary,
-            public readonly array $data = [],
-        ) {}
-
-        public static function success(string $summary, array $data = []): self
-        {
-            return new self('completed', true, $summary, $data);
-        }
-
-        public static function failure(string $summary, array $data = []): self
-        {
-            return new self('failed', false, $summary, $data);
-        }
-
-        public static function cancelled(string $summary, array $data = []): self
-        {
-            return new self('cancelled', false, $summary, $data);
-        }
-    }
-
-    class PluginExecutionContext
-    {
-        public array $settings = [
-            'enrich_from_tmdb' => true,
-            'overwrite_existing' => false,
-            'enrich_categories' => true,
-            'enrich_descriptions' => false,
-            'enrich_posters' => false,
-            'enrich_backdrops' => false,
-            'map_genres_to_epg_categories' => true,
-            'map_genres_to_kodi_guide_genres' => false,
-            'keyword_category_detection' => true,
-            'enrich_episode_details' => false,
-        ];
-        public int $cancellationChecks = 0;
-        public int $cancelAfterChecks = PHP_INT_MAX;
-        public array $messages = [];
-
-        public function cancellationRequested(): bool
-        {
-            $this->cancellationChecks++;
-
-            return $this->cancellationChecks >= $this->cancelAfterChecks;
-        }
-
-        public function heartbeat(string $message, ?int $progress = null): void
-        {
-            $this->messages[] = $message;
-        }
-
-        public function info(string $message): void
-        {
-            $this->messages[] = $message;
-        }
-
-        public function warning(string $message): void
-        {
-            $this->messages[] = $message;
-        }
-    }
+    class PluginActionResult { public function __construct(public readonly string $status, public readonly bool $success, public readonly string $summary, public readonly array $data = []) {} public static function success(string $s, array $d = []): self { return new self('completed', true, $s, $d); } public static function failure(string $s, array $d = []): self { return new self('failed', false, $s, $d); } public static function cancelled(string $s, array $d = []): self { return new self('cancelled', false, $s, $d); } }
+    class PluginExecutionContext { public array $settings = ['enrich_from_tmdb' => true, 'enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'map_genres_to_epg_categories' => true, 'map_genres_to_kodi_guide_genres' => false, 'keyword_category_detection' => true, 'enrich_episode_details' => false]; public array $messages = []; public int $checks = 0; public int $cancelAfter = PHP_INT_MAX; public function cancellationRequested(): bool { return ++$this->checks >= $this->cancelAfter; } public function heartbeat(string $m, ?int $p = null): void { $this->messages[] = $m; } public function info(string $m): void { $this->messages[] = $m; } public function warning(string $m): void { $this->messages[] = $m; } }
 }
-
-namespace App\Models {
-    class FakeCollection
-    {
-        public function __construct(private array $values) {}
-
-        public function filter(): self
-        {
-            return new self(array_values(array_filter($this->values)));
-        }
-
-        public function unique(): self
-        {
-            return new self(array_values(array_unique($this->values)));
-        }
-
-        public function values(): self
-        {
-            return $this;
-        }
-
-        public function all(): array
-        {
-            return $this->values;
-        }
-    }
-
-    class FakeQuery
-    {
-        public function __construct(private string $model) {}
-
-        public function __call(string $name, array $arguments): self
-        {
-            return $this;
-        }
-
-        public function pluck(string $column): FakeCollection
-        {
-            return new FakeCollection($this->model === Channel::class ? [1] : ['target']);
-        }
-    }
-
-    class Channel
-    {
-        public static function query(): FakeQuery
-        {
-            return new FakeQuery(self::class);
-        }
-    }
-
-    class EpgChannel
-    {
-        public static function query(): FakeQuery
-        {
-            return new FakeQuery(self::class);
-        }
-    }
-
-    class Epg
-    {
-        public string $name = 'Cancellation fixture';
-        public string $uuid = 'cancel-fixture';
-
-        public static function find(int $id): self
-        {
-            return new self();
-        }
-    }
-
-    class Playlist {}
-}
-
-namespace App\Services {
-    class EpgCacheService
-    {
-        public function isCacheValid(object $epg): bool
-        {
-            return true;
-        }
-    }
-
-    class TmdbService
-    {
-        public function isConfigured(): bool
-        {
-            return true;
-        }
-    }
-}
-
-namespace App\Settings {
-    class GeneralSettings {}
-}
-
-namespace Carbon {
-    class Carbon
-    {
-        private function __construct(private \DateTimeImmutable $date) {}
-
-        public static function parse(string $date): self
-        {
-            return new self(new \DateTimeImmutable($date));
-        }
-
-        public function diffInDays(self $other): int
-        {
-            return (int) $this->date->diff($other->date)->days;
-        }
-
-        public function lte(self $other): bool
-        {
-            return $this->date <= $other->date;
-        }
-
-        public function format(string $format): string
-        {
-            return $this->date->format($format);
-        }
-
-        public function addDay(): self
-        {
-            $this->date = $this->date->modify('+1 day');
-
-            return $this;
-        }
-    }
-}
-
-namespace Illuminate\Support\Facades {
-    use RuntimeException;
-
-    class Storage
-    {
-        public static string $root;
-        public static ?string $throwOnExistsPath = null;
-        public static ?string $failPutPath = null;
-
-        public static function disk(string $name): self
-        {
-            return new self();
-        }
-
-        public function path(string $path): string
-        {
-            return self::$root.'/'.$path;
-        }
-
-        public function exists(string $path): bool
-        {
-            if ($path === self::$throwOnExistsPath) {
-                throw new RuntimeException('Simulated worker termination before the next date file.');
-            }
-
-            return file_exists($this->path($path));
-        }
-
-        public function get(string $path): string
-        {
-            return (string) file_get_contents($this->path($path));
-        }
-
-        public function put(string $path, string $contents): bool
-        {
-            if ($path === self::$failPutPath) {
-                return false;
-            }
-
-            return file_put_contents($this->path($path), $contents) !== false;
-        }
-
-        public function delete(string $path): void
-        {
-            @unlink($this->path($path));
-        }
-
-        public function makeDirectory(string $path): void
-        {
-            if (! is_dir($this->path($path))) {
-                mkdir($this->path($path), 0777, true);
-            }
-        }
-    }
-
-    class Http {}
-    class Log {}
-}
-
+namespace App\Models { class Values { public function __construct(private array $v) {} public function filter(): self { return $this; } public function unique(): self { return $this; } public function values(): self { return $this; } public function all(): array { return $this->v; } } class Query { public function __construct(private bool $channel) {} public function __call(string $m, array $a): self { return $this; } public function pluck(string $c): Values { return new Values($this->channel ? ['target'] : [1]); } } class Channel { public static function query(): Query { return new Query(false); } } class EpgChannel { public static function query(): Query { return new Query(true); } } class Epg { public string $name = 'Cancellation fixture'; public static function find(int $id): self { return new self(); } } class Playlist {} }
+namespace App\Services { class EpgCacheService { public function isCacheValid(object $epg): bool { return true; } } class TmdbService { protected string $language = ''; public function isConfigured(): bool { return true; } } class EpgCacheEnrichmentService { public array $applies = []; public array $snapshotStatuses = []; public array $applyStatuses = ['applied']; public function snapshot(object $c, object $e, int $afterId = 0, int $limit = 500): array { if (($status = array_shift($this->snapshotStatuses)) !== null) return ['status' => $status]; return ['status' => 'ok', 'programmes' => [['id' => 1, 'hash' => 'cancel-hash', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null]; } public function apply(object $c, object $e, array $patches): array { $this->applies[] = compact('patches'); return ['status' => array_shift($this->applyStatuses) ?? 'applied']; } } }
+namespace App\Settings { class GeneralSettings { public string $tmdb_language = 'de-DE'; } }
+namespace Illuminate\Support\Facades { class Storage { public static function disk(string $n): self { return new self(); } public function makeDirectory(string $p): void {} public function path(string $p): string { return sys_get_temp_dir().'/'.$p; } public function exists(string $p): bool { return false; } public function get(string $p): string { return '{}'; } public function put(string $p, string $v): bool { return true; } public function delete(string $p): bool { return true; } } class Http {} class Log {} }
 namespace Tests {
     require_once __DIR__.'/../Plugin.php';
+    use App\Plugins\Support\PluginExecutionContext; use App\Services\{EpgCacheEnrichmentService, EpgCacheService, TmdbService}; use App\Settings\GeneralSettings; use AppLocalPlugins\EpgEnricher\Plugin; use ReflectionMethod;
+    function same(mixed $e, mixed $a, string $m): void { if ($e !== $a) { fwrite(STDERR, "$m\nExpected: ".var_export($e, true)."\nActual: ".var_export($a, true)."\n"); exit(1); } }
+    function execute(array $applyStatuses = ['applied'], array $snapshotStatuses = [], int $cancelAfter = PHP_INT_MAX): array { $host = new EpgCacheEnrichmentService(); $host->applyStatuses = $applyStatuses; $host->snapshotStatuses = $snapshotStatuses; $GLOBALS['cancellationServices'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => new TmdbService(), GeneralSettings::class => new GeneralSettings()]; $context = new PluginExecutionContext(); $context->cancelAfter = $cancelAfter; $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true); return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context]; }
+    // This is the migrated cancellation/state contract: the canonical snapshot is
+    // immutable to the plugin, and only an accepted host apply may publish a patch.
+    [$cancelled, $cancelledHost, $cancelledContext] = execute(['applied'], [], 1);
+    same('cancelled', $cancelled->status, 'Cancellation must remain visible at the host snapshot boundary.');
+    same(false, $cancelled->success, 'Cancelled work must not report success.');
+    same(1, $cancelled->data['channels_targeted'] ?? null, 'Cancellation must retain selected-channel scope.');
+    same(0, count($cancelledHost->applies), 'Cancellation must not apply host-owned EPG data.');
+    same(0, $cancelled->data['programmes_processed'] ?? 0, 'Cancellation before the first programme must not count processing.');
+    same(0, $cancelled->data['programmes_updated'] ?? 0, 'Cancellation must not count unpublished updates.');
+    same(['Checking programme details and artwork.'], $cancelledContext->messages, 'Cancellation must occur before saving updates.');
 
-    use App\Plugins\Support\PluginExecutionContext;
-    use AppLocalPlugins\EpgEnricher\Plugin;
-    use Illuminate\Support\Facades\Storage;
-    use ReflectionMethod;
-    use RuntimeException;
+    [$cancelledAtApplyBoundary, $cancelledAtApplyBoundaryHost, $cancelledAtApplyBoundaryContext] = execute(['applied'], [], 2);
+    same('cancelled', $cancelledAtApplyBoundary->status, 'Cancellation after the final programme must remain visible at the host apply boundary.');
+    same(false, $cancelledAtApplyBoundary->success, 'Cancellation at the host apply boundary must not report success.');
+    same(0, count($cancelledAtApplyBoundaryHost->applies), 'Cancellation after programme processing must not publish a host patch.');
+    same(0, $cancelledAtApplyBoundary->data['programmes_processed'] ?? 0, 'Cancelled page work must not be committed to the aggregate counters.');
+    same(0, $cancelledAtApplyBoundary->data['programmes_updated'] ?? 0, 'Cancellation at the host apply boundary must not count updates.');
+    same(['Checking programme details and artwork.'], $cancelledAtApplyBoundaryContext->messages, 'Cancellation at the save boundary must not claim success.');
 
-    function assertSameValue(mixed $expected, mixed $actual, string $message): void
-    {
-        if ($expected !== $actual) {
-            fwrite(STDERR, $message."\nExpected: ".var_export($expected, true)."\nActual: ".var_export($actual, true)."\n");
-            exit(1);
-        }
+    [$cancelledAfterRetrySnapshot, $cancelledAfterRetrySnapshotHost, $cancelledAfterRetrySnapshotContext] = execute(['stale', 'applied'], [], 3);
+    same('cancelled', $cancelledAfterRetrySnapshot->status, 'Cancellation after a stale retry snapshot must remain visible at the second host apply boundary.');
+    same(false, $cancelledAfterRetrySnapshot->success, 'Cancellation after a stale retry snapshot must not report success.');
+    same(1, count($cancelledAfterRetrySnapshotHost->applies), 'Cancellation after a stale retry snapshot must stop before the retry publication.');
+    same(0, $cancelledAfterRetrySnapshot->data['programmes_processed'] ?? 0, 'Cancelled retry work must not be committed to the aggregate counters.');
+    same(0, $cancelledAfterRetrySnapshot->data['programmes_updated'] ?? 0, 'Cancelled retry work must not count updates.');
+    same(['Checking programme details and artwork.', 'Saving updates.'], $cancelledAfterRetrySnapshotContext->messages, 'Cancelled retry work must not claim success.');
+
+    // Each host rejection retains the previous “no unintended cache/state write”
+    // safety property, without recreating the removed direct-cache adapter.
+    foreach (['busy', 'unavailable', 'denied', 'invalid_request'] as $outcome) {
+        [$result, $host, $context] = execute([$outcome]);
+        same('failed', $result->status, "$outcome must fail rather than report completion.");
+        same(false, $result->success, "$outcome must fail closed.");
+        same(0, $result->data['programmes_processed'] ?? 0, "$outcome must not report an uncommitted page as completed work.");
+        same(0, $result->data['programmes_updated'] ?? 0, "$outcome must not count updates.");
+        same(1, count($host->applies), "$outcome must not fall back to direct storage.");
+        same(1, $host->applies[0]['patches'][0]['id'] ?? null, "$outcome must remain bound to its programme id.");
+        same(['Checking programme details and artwork.', 'Saving updates.'], $context->messages, "$outcome must not claim a completed save.");
     }
 
-    $tempDir = sys_get_temp_dir().'/epg-enricher-cancel-state-'.bin2hex(random_bytes(6));
-    $cacheDir = $tempDir.'/epg-cache/cancel-fixture/v2';
-    $stateDir = $tempDir.'/plugin-data/epg-enricher';
-    mkdir($cacheDir, 0777, true);
-    mkdir($stateDir, 0777, true);
-    Storage::$root = $tempDir;
-
-    file_put_contents($cacheDir.'/metadata.json', json_encode([
-        'programme_date_range' => [
-            'min_date' => '2026-07-11',
-            'max_date' => '2026-07-11',
-        ],
-    ]));
-    $source = json_encode([
-        'channel' => 'target',
-        'programme' => ['title' => 'Wimbledon'],
-    ], JSON_UNESCAPED_SLASHES)."\n".json_encode([
-        'channel' => 'other',
-        'programme' => ['title' => 'Untargeted'],
-    ], JSON_UNESCAPED_SLASHES)."\n";
-    $dateFile = $cacheDir.'/programmes-2026-07-11.jsonl';
-    file_put_contents($dateFile, $source);
-
-    $legacySettingsHash = md5(json_encode([
-        'logic_version' => '2026.08.21-v1.13.8-icon-order',
-        'enrich_from_tmdb' => true,
-        'overwrite_existing' => false,
-        'enrich_categories' => true,
-        'enrich_descriptions' => false,
-        'enrich_posters' => false,
-        'enrich_backdrops' => false,
-        'map_genres_to_epg_categories' => true,
-        'map_genres_to_kodi_guide_genres' => false,
-        'keyword_category_detection' => true,
-        'enrich_episode_details' => false,
-        'tmdb_language' => '',
-    ]));
-
-    $priorState = [
-        'source_hash' => 'prior-source',
-        'enriched_hash' => 'prior-enriched',
-        'enriched_at' => '2026-07-10T12:00:00+00:00',
-        'programmes_updated' => 1,
-    ];
-    file_put_contents($stateDir.'/enrichment-state.json', json_encode([
-        'epg_1' => [
-            'settings_hash' => $legacySettingsHash,
-            'channels_hash' => md5(json_encode(['target'])),
-            'files' => [
-                'programmes-2026-07-10.jsonl' => $priorState,
-                'programmes-2026-07-11.jsonl' => [
-                    'source_hash' => md5_file($dateFile),
-                    'enriched_hash' => md5_file($dateFile),
-                    'enriched_at' => '2026-07-10T12:00:00+00:00',
-                    'programmes_updated' => 0,
-                ],
-            ],
-        ],
-    ]));
-
-    $plugin = new Plugin();
-    $method = new ReflectionMethod($plugin, 'doEnrich');
-    $method->setAccessible(true);
-
-    $settingsHashMethod = new ReflectionMethod($plugin, 'computeSettingsHash');
-    $settingsHashMethod->setAccessible(true);
-    assertSameValue(
-        true,
-        $legacySettingsHash !== $settingsHashMethod->invoke($plugin, (new PluginExecutionContext())->settings),
-        'The title-card quality logic version must invalidate a previously processed state hash.'
-    );
-
-    $cancelContext = new PluginExecutionContext();
-    $cancelContext->cancelAfterChecks = 3;
-    $cancelResult = $method->invoke($plugin, 1, [1], $cancelContext);
-
-    $stateAfterCancellation = json_decode(file_get_contents($stateDir.'/enrichment-state.json'), true);
-    assertSameValue($source, file_get_contents($dateFile), 'Cancellation should leave source JSONL bytes unchanged.');
-    assertSameValue(
-        false,
-        isset($stateAfterCancellation['epg_1']['files']['programmes-2026-07-11.jsonl']),
-        'A cancelled date file must not be recorded as complete.'
-    );
-    assertSameValue(
-        false,
-        isset($stateAfterCancellation['epg_1']['files']['programmes-2026-07-10.jsonl']),
-        'A changed logic version should invalidate all previously completed file states.'
-    );
-    assertSameValue('cancelled', $cancelResult->status, 'Cancellation inside a date file should propagate to doEnrich.');
-    assertSameValue(1, $cancelResult->data['programmes_updated'] ?? null, 'The fixture should modify a programme in memory before cancellation.');
-
-    $retryContext = new PluginExecutionContext();
-    $retryResult = $method->invoke($plugin, 1, [1], $retryContext);
-    assertSameValue(1, $retryResult->data['programmes_updated'] ?? null, 'A subsequent run should process the cancelled date file.');
-    assertSameValue(false, $source === file_get_contents($dateFile), 'The subsequent run should write the enrichment.');
-
-    $checkpointTempDir = sys_get_temp_dir().'/epg-enricher-day-checkpoint-'.bin2hex(random_bytes(6));
-    $checkpointCacheDir = $checkpointTempDir.'/epg-cache/cancel-fixture/v2';
-    $checkpointStateDir = $checkpointTempDir.'/plugin-data/epg-enricher';
-    mkdir($checkpointCacheDir, 0777, true);
-    mkdir($checkpointStateDir, 0777, true);
-    Storage::$root = $checkpointTempDir;
-
-    file_put_contents($checkpointCacheDir.'/metadata.json', json_encode([
-        'programme_date_range' => [
-            'min_date' => '2026-07-11',
-            'max_date' => '2026-07-12',
-        ],
-    ]));
-    file_put_contents($checkpointCacheDir.'/programmes-2026-07-11.jsonl', json_encode([
-        'channel' => 'target',
-        'programme' => ['title' => 'Wimbledon'],
-    ], JSON_UNESCAPED_SLASHES)."\n");
-    file_put_contents($checkpointCacheDir.'/programmes-2026-07-12.jsonl', json_encode([
-        'channel' => 'target',
-        'programme' => ['title' => 'Wimbledon'],
-    ], JSON_UNESCAPED_SLASHES)."\n");
-
-    Storage::$throwOnExistsPath = 'epg-cache/cancel-fixture/v2/programmes-2026-07-12.jsonl';
-
-    try {
-        $method->invoke($plugin, 1, [1], new PluginExecutionContext());
-        fwrite(STDERR, "Expected simulated worker termination.\n");
-        exit(1);
-    } catch (RuntimeException $exception) {
-        assertSameValue(
-            'Simulated worker termination before the next date file.',
-            $exception->getMessage(),
-            'The fixture should stop immediately before the second date file.'
-        );
-    }
-
-    $checkpointPath = $checkpointStateDir.'/enrichment-checkpoint-epg_1.json';
-    $checkpoint = json_decode((string) file_get_contents($checkpointPath), true);
-    assertSameValue(
-        true,
-        isset($checkpoint['epg_1']['files']['programmes-2026-07-11.jsonl']),
-        'A completed date file should be checkpointed before the next date starts.'
-    );
-    assertSameValue(
-        false,
-        isset($checkpoint['epg_1']['files']['programmes-2026-07-12.jsonl']),
-        'An unstarted date file must not be checkpointed.'
-    );
-    assertSameValue(
-        false,
-        file_exists($checkpointStateDir.'/enrichment-state.json'),
-        'A hard-stop checkpoint must not replace the canonical cross-EPG state file.'
-    );
-
-    Storage::$throwOnExistsPath = null;
-    $checkpointRetry = $method->invoke($plugin, 1, [1], new PluginExecutionContext());
-    assertSameValue(1, $checkpointRetry->data['days_skipped'] ?? null, 'A retry should skip the checkpointed first date file.');
-    assertSameValue(1, $checkpointRetry->data['programmes_processed'] ?? null, 'A retry should process only the remaining date file.');
-    assertSameValue(false, file_exists($checkpointPath), 'A successful retry should remove its per-EPG checkpoint.');
-
-    file_put_contents($checkpointPath, '{}');
-    $clearMethod = new ReflectionMethod($plugin, 'clearEnrichmentState');
-    $clearMethod->setAccessible(true);
-    $clearMethod->invoke($plugin, new PluginExecutionContext());
-    assertSameValue(false, file_exists($checkpointPath), 'Clearing enrichment state should remove stale per-EPG checkpoints.');
-
-    $saveEpgStateMethod = new ReflectionMethod($plugin, 'saveEpgEnrichmentState');
-    $saveEpgStateMethod->setAccessible(true);
-    $saveEpgStateMethod->invoke($plugin, 'epg_1', ['files' => ['first.jsonl' => ['source_hash' => 'first']]]);
-    $saveEpgStateMethod->invoke($plugin, 'epg_2', ['files' => ['second.jsonl' => ['source_hash' => 'second']]]);
-    $mergedState = json_decode((string) file_get_contents($checkpointStateDir.'/enrichment-state.json'), true);
-    assertSameValue(
-        ['epg_1', 'epg_2'],
-        array_keys($mergedState),
-        'Canonical state writes should merge independently completed EPG sources.'
-    );
-
-    @unlink($checkpointStateDir.'/enrichment-state.json');
-    file_put_contents($checkpointCacheDir.'/metadata.json', json_encode([
-        'programme_date_range' => [
-            'min_date' => '2026-07-11',
-            'max_date' => '2026-07-11',
-        ],
-    ]));
-    file_put_contents($checkpointCacheDir.'/programmes-2026-07-11.jsonl', json_encode([
-        'channel' => 'target',
-        'programme' => ['title' => 'Wimbledon'],
-    ], JSON_UNESCAPED_SLASHES)."\n");
-    Storage::$failPutPath = 'plugin-data/epg-enricher/enrichment-state.json';
-    try {
-        $method->invoke($plugin, 1, [1], new PluginExecutionContext());
-        fwrite(STDERR, "Expected canonical state write failure.\n");
-        exit(1);
-    } catch (RuntimeException $exception) {
-        assertSameValue(
-            'Could not persist enrichment state.',
-            $exception->getMessage(),
-            'A failed canonical state write should abort completion.'
-        );
-    }
-    assertSameValue(true, file_exists($checkpointPath), 'A failed canonical state write must preserve the per-EPG checkpoint.');
-    Storage::$failPutPath = null;
-
-    $priorCheckpoint = '{"prior":true}';
-    file_put_contents($checkpointPath, $priorCheckpoint);
-    Storage::$failPutPath = 'plugin-data/epg-enricher/enrichment-checkpoint-epg_1.json';
-    $saveCheckpointMethod = new ReflectionMethod($plugin, 'saveEnrichmentCheckpoint');
-    $saveCheckpointMethod->setAccessible(true);
-    try {
-        $saveCheckpointMethod->invoke($plugin, 'epg_1', ['files' => []]);
-        fwrite(STDERR, "Expected checkpoint write failure.\n");
-        exit(1);
-    } catch (RuntimeException $exception) {
-        assertSameValue(
-            'Could not persist enrichment checkpoint.',
-            $exception->getMessage(),
-            'A failed checkpoint write should abort progress.'
-        );
-    }
-    assertSameValue($priorCheckpoint, file_get_contents($checkpointPath), 'A failed checkpoint write must preserve the prior checkpoint bytes.');
-    Storage::$failPutPath = null;
-
-    foreach ([$tempDir, $checkpointTempDir] as $directory) {
-        $files = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::CHILD_FIRST,
-        );
-        foreach ($files as $file) {
-            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
-        }
-        rmdir($directory);
-    }
-
+    [$unavailable, $unavailableHost, $unavailableContext] = execute(['applied'], ['unavailable']);
+    same('failed', $unavailable->status, 'An unavailable host snapshot must fail closed.');
+    same(false, $unavailable->success, 'An unavailable host snapshot must not report success.');
+    same(0, count($unavailableHost->applies), 'An unavailable host snapshot must not attempt a file fallback.');
+    same(0, $unavailable->data['programmes_updated'] ?? 0, 'An unavailable host snapshot must not report updates.');
+    same([], $unavailableContext->messages, 'A rejected snapshot must not claim processing or publication.');
+    $source = (string) file_get_contents(__DIR__.'/../Plugin.php'); foreach (['tmdb-cache.json', 'tmdb-season-cache.json', 'tmdb-images-cache.json'] as $owned) { same(true, str_contains($source, $owned), "Plugin-owned lookup state $owned must remain available."); } foreach (['enrichment-state.json', 'enrichment-checkpoint', 'programmes-', 'metadata.json'] as $forbidden) { same(false, str_contains($source, $forbidden), "Host EPG state marker $forbidden must not return."); }
+    $reflection = new \ReflectionClass(Plugin::class); foreach (['saveEpgEnrichmentState', 'saveEnrichmentCheckpoint', 'loadEnrichmentState', 'loadEnrichmentCheckpoint'] as $removed) { same(false, $reflection->hasMethod($removed), "Legacy state method $removed must not be callable."); }
     echo "Enrichment cancellation state tests passed.\n";
 }
