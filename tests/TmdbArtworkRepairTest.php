@@ -1283,6 +1283,91 @@ namespace Tests {
     assertSameValue(0, $episodeMalformedEntryTmdb->tvDetailsRequests, 'A malformed tied competitor episode must not load candidate details.');
     assertSameValue(2, $episodeMalformedEntryTmdb->seasonRequests, 'A malformed tied competitor episode must be checked before abstaining.');
 
+    // Every entry for the requested episode is identity evidence. A duplicate must
+    // therefore be fully inspectable and normalized consistently before a candidate
+    // can be selected; a first matching entry cannot decide the result on its own.
+    $duplicateEpisodeDetails = normalizedTvDetailsFixture(
+        681,
+        'Twin Horizon',
+        'The validated synthetic series.',
+        null,
+        'https://image.tmdb.org/t/p/original/twin-horizon-duplicate.jpg',
+    );
+    $duplicateEpisodeCases = [
+        'malformed duplicate after matching target' => [
+            'episodes' => [
+                ['episode_number' => 5, 'name' => 'Signal Fire'],
+                ['episode_number' => 5, 'name' => ['Signal Fire']],
+            ],
+            'expectedIcon' => null,
+        ],
+        'malformed duplicate before matching target' => [
+            'episodes' => [
+                ['episode_number' => 5, 'name' => ['Signal Fire']],
+                ['episode_number' => 5, 'name' => 'Signal Fire'],
+            ],
+            'expectedIcon' => null,
+        ],
+        'conflicting valid duplicates with matching target first' => [
+            'episodes' => [
+                ['episode_number' => 5, 'name' => 'Signal Fire'],
+                ['episode_number' => 5, 'name' => 'Different Signal'],
+            ],
+            'expectedIcon' => null,
+        ],
+        'conflicting valid duplicates with matching target last' => [
+            'episodes' => [
+                ['episode_number' => 5, 'name' => 'Different Signal'],
+                ['episode_number' => 5, 'name' => 'Signal Fire'],
+            ],
+            'expectedIcon' => null,
+        ],
+        // Explicit policy: repeated structurally valid entries with one normalized
+        // title are consistent evidence and are equivalent to one such entry.
+        'consistent valid duplicates' => [
+            'episodes' => [
+                ['episode_number' => 5, 'name' => 'Signal Fire'],
+                ['episode_number' => 5, 'name' => ' signal-fire '],
+            ],
+            'expectedIcon' => 'https://image.tmdb.org/t/p/original/twin-horizon-duplicate.jpg',
+        ],
+        'valid unique match control' => [
+            'episodes' => [
+                ['episode_number' => 5, 'name' => 'Signal Fire'],
+            ],
+            'expectedIcon' => 'https://image.tmdb.org/t/p/original/twin-horizon-duplicate.jpg',
+        ],
+    ];
+    foreach ($duplicateEpisodeCases as $label => $case) {
+        $duplicateEpisodeTmdb = new CandidateTmdbService(
+            tvCandidates: $ambiguousSeriesCandidates,
+            tvDetails: [681 => $duplicateEpisodeDetails],
+            seasonDetails: [
+                '681:1' => ['episodes' => $case['episodes']],
+                '682:1' => ['episodes' => []],
+            ],
+        );
+        $duplicateEpisodeProgramme = [
+            'title' => 'Twin Horizon',
+            'subtitle' => 'Signal Fire',
+            'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.4.']],
+        ];
+        $duplicateEpisodeBefore = $duplicateEpisodeProgramme;
+        $duplicateEpisodeCache = [];
+        enrich($plugin, $method, $duplicateEpisodeProgramme, $duplicateEpisodeTmdb, $duplicateEpisodeCache);
+        assertSameValue($case['expectedIcon'], $duplicateEpisodeProgramme['icon'] ?? null, "A {$label} must have the declared identity result.");
+        assertTrueValue(
+            $duplicateEpisodeTmdb->seasonRequests >= 1 && $duplicateEpisodeTmdb->seasonRequests <= 2,
+            "A {$label} must use bounded season reads."
+        );
+        if ($case['expectedIcon'] === null) {
+            assertSameValue($duplicateEpisodeBefore, $duplicateEpisodeProgramme, "A {$label} must leave the programme unchanged.");
+            assertSameValue(0, $duplicateEpisodeTmdb->tvDetailsRequests, "A {$label} must not load selected details.");
+        } else {
+            assertSameValue(1, $duplicateEpisodeTmdb->tvDetailsRequests, "A {$label} must load only the selected details.");
+        }
+    }
+
     $malformedTmdb = new CandidateTmdbService(tvCandidates: [
         ['tmdb_id' => 651, 'name' => 'Malformed Target', 'original_name' => 'Malformed Target', 'first_air_date' => '2024-01-01', 'overview' => 'Valid candidate.'],
         ['name' => 'Missing Identity'],

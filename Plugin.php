@@ -2902,6 +2902,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 // false identity proof.
                 return null;
             }
+            $targetTitles = [];
             foreach ($seasonData['episodes'] as $episodeData) {
                 if (! is_array($episodeData) || ! is_int($episodeData['episode_number'] ?? null)) {
                     return null;
@@ -2912,10 +2913,20 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if (! is_string($episodeData['name'] ?? null)) {
                     return null;
                 }
-                if ($this->normalizeIdentityText($episodeData['name']) === $subtitle) {
-                    $matches[] = $candidate;
+                $targetTitle = $this->normalizeIdentityText($episodeData['name']);
+                if ($targetTitle === '') {
+                    return null;
                 }
-                break;
+                $targetTitles[$targetTitle] = true;
+            }
+            // A season can contain duplicate requested-episode entries. They are
+            // trustworthy only when all normalize to one title; otherwise neither
+            // a first hit nor an arbitrary ordering may prove this candidate.
+            if (count($targetTitles) > 1) {
+                return null;
+            }
+            if (isset($targetTitles[$subtitle])) {
+                $matches[] = $candidate;
             }
         }
 
