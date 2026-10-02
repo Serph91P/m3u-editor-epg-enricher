@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.30-poster-geometry-trust';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.10.02-generic-year-tv-abstain';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1195,15 +1195,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Extract the base show name for fallback TMDB search.
         $baseExtracted = $this->extractBaseTitle($title);
         $baseTitle = $baseExtracted['title'];
-        $titleYear = $baseExtracted['year'];
-        $productionYear = $this->trustedProgrammeProductionYear($programme);
-        $hasConflictingYearEvidence = $titleYear !== null
-            && $productionYear !== null
-            && $titleYear !== $productionYear;
-        $year = $hasConflictingYearEvidence
-            ? null
-            : ($productionYear ?? $titleYear);
-        if ($year === null && ! $hasConflictingYearEvidence) {
+        $year = $baseExtracted['year'];
+        if ($year === null) {
             $desc = trim((string) ($programme['desc'] ?? ''));
             if ($desc !== '') {
                 // Look for a 4-digit year token anywhere in desc.
@@ -2555,28 +2548,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return ['title' => $cleaned, 'year' => $year];
     }
 
-    /**
-     * Accept only the host's structured source production year. A programme air
-     * time, episode number, or arbitrary extra DTO field is not series-debut
-     * evidence and must not influence an identity tie-break.
-     */
-    private function trustedProgrammeProductionYear(array $programme): ?int
-    {
-        $year = $programme['production_year'] ?? null;
-        if (is_int($year)) {
-            $candidate = $year;
-        } elseif (is_string($year) && preg_match('/^\d{4}$/', $year)) {
-            $candidate = (int) $year;
-        } else {
-            return null;
-        }
-
-        $currentYear = (int) date('Y');
-
-        return $candidate >= 1900 && $candidate <= $currentYear + 2
-            ? $candidate
-            : null;
-    }
 
     private function stripRecognizedEpisodeTitleSuffix(string $title): string
     {

@@ -1070,47 +1070,28 @@ namespace Tests {
     assertSameValue(null, validatedSearch($plugin, $searchMethod, $marginTmdb, 'Margin Target', 'tv', 2024, 'Shared alpha description.'), 'An insufficient winner margin should abstain.');
     assertSameValue(0, $marginTmdb->tvDetailsRequests, 'Margin abstention must not load candidate details.');
 
-    // A structured source production year can disambiguate otherwise identical
-    // exact-title TV candidates. This exercises the public enrichment path rather
-    // than selecting a matcher helper directly.
-    $trustedYearCandidates = [
+    // XMLTV <programme><date> is projected by the host as generic production_year.
+    // It may be an episode/programme date, not a series debut. Even a syntactically
+    // valid value must therefore not select either same-title TV candidate.
+    $ambiguousSeriesCandidates = [
         ['tmdb_id' => 681, 'name' => 'Twin Horizon', 'original_name' => 'Twin Horizon', 'first_air_date' => '2007-01-01', 'overview' => 'An earlier synthetic series.'],
         ['tmdb_id' => 682, 'name' => 'Twin Horizon', 'original_name' => 'Twin Horizon', 'first_air_date' => '2018-01-01', 'overview' => 'A later synthetic series.'],
     ];
-    $trustedYearTmdb = new CandidateTmdbService(
-        tvCandidates: $trustedYearCandidates,
-        tvDetails: [
-            682 => normalizedTvDetailsFixture(682, 'Twin Horizon', 'A later synthetic series.', backdropUrl: 'https://image.tmdb.org/t/p/original/twin-horizon-2018.jpg'),
-        ],
-    );
-    $trustedYearProgramme = ['title' => 'Twin Horizon', 'episode_num' => '0.0', 'production_year' => 2018];
-    $trustedYearCache = [];
-    enrich($plugin, $method, $trustedYearProgramme, $trustedYearTmdb, $trustedYearCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-2018.jpg', $trustedYearProgramme['icon'] ?? null, 'A validated structured production year must select the matching same-title series through enrichProgrammeFromTmdb.');
-    assertSameValue([1, 0], [$trustedYearTmdb->tvDetailsRequests, $trustedYearTmdb->movieDetailsRequests], 'A structured year must load only the selected TV details.');
-    $trustedYearReplay = ['title' => 'Twin Horizon', 'episode_num' => '0.0', 'production_year' => 2018];
-    $trustedYearReplayResult = enrich($plugin, $method, $trustedYearReplay, $trustedYearTmdb, $trustedYearCache);
-    assertSameValue(true, $trustedYearReplayResult['cache_hit'] ?? null, 'The same validated structured year must replay from its evidence-specific cache entry.');
-    assertSameValue([1, 0], [$trustedYearTmdb->tvDetailsRequests, $trustedYearTmdb->movieDetailsRequests], 'A structured-year cache replay must not amplify TMDB detail requests.');
-
-    $missingStructuredYearTmdb = new CandidateTmdbService(tvCandidates: $trustedYearCandidates);
-    $missingStructuredYearProgramme = ['title' => 'Twin Horizon', 'episode_num' => '0.0'];
-    $missingStructuredYearBefore = $missingStructuredYearProgramme;
-    $missingStructuredYearCache = [];
-    enrich($plugin, $method, $missingStructuredYearProgramme, $missingStructuredYearTmdb, $missingStructuredYearCache);
-    assertSameValue($missingStructuredYearBefore, $missingStructuredYearProgramme, 'Same-title series without trusted year evidence must remain ambiguous.');
-    assertSameValue([0, 0], [$missingStructuredYearTmdb->tvDetailsRequests, $missingStructuredYearTmdb->movieDetailsRequests], 'Missing structured year evidence must not load a tied candidate.');
-
-    $conflictingYearTmdb = new CandidateTmdbService(tvCandidates: $trustedYearCandidates);
-    $conflictingYearProgramme = ['title' => 'Twin Horizon (2007)', 'episode_num' => '0.0', 'production_year' => 2018];
-    $conflictingYearBefore = $conflictingYearProgramme;
-    $conflictingYearCache = [];
-    enrich($plugin, $method, $conflictingYearProgramme, $conflictingYearTmdb, $conflictingYearCache);
-    assertSameValue($conflictingYearBefore, $conflictingYearProgramme, 'Conflicting title and structured production years must fail closed instead of selecting either same-title series.');
-    assertSameValue([0, 0], [$conflictingYearTmdb->tvDetailsRequests, $conflictingYearTmdb->movieDetailsRequests], 'Conflicting year evidence must not load a candidate.');
+    $episodicProductionYearTmdb = new CandidateTmdbService(tvCandidates: $ambiguousSeriesCandidates);
+    $episodicProductionYearProgramme = [
+        'title' => 'Twin Horizon',
+        'episode_num' => '0.4.',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.4.']],
+        'production_year' => 2018,
+    ];
+    $episodicProductionYearBefore = $episodicProductionYearProgramme;
+    $episodicProductionYearCache = [];
+    enrich($plugin, $method, $episodicProductionYearProgramme, $episodicProductionYearTmdb, $episodicProductionYearCache);
+    assertSameValue($episodicProductionYearBefore, $episodicProductionYearProgramme, 'An episodic generic production_year must not be treated as a TV series first-air year.');
+    assertSameValue([0, 0], [$episodicProductionYearTmdb->tvDetailsRequests, $episodicProductionYearTmdb->movieDetailsRequests], 'An episodic generic production_year tie must abstain without requesting details.');
 
     foreach ([2018.0, '2018.0', ['2018'], 9999] as $untrustedProductionYear) {
-        $maliciousYearTmdb = new CandidateTmdbService(tvCandidates: $trustedYearCandidates);
+        $maliciousYearTmdb = new CandidateTmdbService(tvCandidates: $ambiguousSeriesCandidates);
         $maliciousYearProgramme = ['title' => 'Twin Horizon', 'episode_num' => '0.0', 'production_year' => $untrustedProductionYear, 'provider_year' => 2018];
         $maliciousYearBefore = $maliciousYearProgramme;
         $maliciousYearCache = [];
