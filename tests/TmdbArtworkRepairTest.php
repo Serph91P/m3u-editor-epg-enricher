@@ -2265,13 +2265,13 @@ namespace Tests {
 
     // Regression: current host details add logo_url and cast_list. They must not turn
     // a validated candidate into a false miss, while invalid known additions remain rejected.
-    $shapeMethod = $reflection->getMethod('hasValidTmdbDetailsShape');
-    $shapeMethod->setAccessible(true);
+    $projectionMethod = $reflection->getMethod('projectKnownHostTmdbDetailsExtras');
+    $projectionMethod->setAccessible(true);
     $hostMovieDetails = normalizedMovieDetailsFixture(801, 'Host Contract Movie', 'Host contract fixture.');
     $hostMovieDetails['logo_url'] = 'https://image.tmdb.org/t/p/w500/host-logo.png';
     $hostMovieDetails['cast_list'] = [['id' => 1, 'name' => 'Fixture Actor', 'character' => 'Lead', 'photo' => null]];
     $hostMovieDetails['_media_type'] = 'movie';
-    assertSameValue(true, $shapeMethod->invoke($plugin, $hostMovieDetails, 'movie'), 'Additive movie details from the current host must remain valid.');
+    assertSameValue(true, is_array($projectionMethod->invoke($plugin, $hostMovieDetails, 'movie')), 'Additive movie details from the current host must remain valid.');
     $hostMovieCandidate = [
         'tmdb_id' => 801,
         'title' => 'Host Contract Movie',
@@ -2288,15 +2288,15 @@ namespace Tests {
 
     $hostTvDetails = normalizedTvDetailsFixture(802, 'Host Contract TV', 'Host TV contract fixture.');
     $hostTvDetails['logo_url'] = 'https://image.tmdb.org/t/p/w500/host-tv-logo.png';
-    $hostTvDetails['cast_list'] = [['id' => 2, 'name' => 'Fixture Actor']];
+    $hostTvDetails['cast_list'] = [['id' => 2, 'name' => 'Fixture Actor', 'character' => 'Lead', 'photo' => null]];
     $hostTvDetails['_media_type'] = 'tv';
-    assertSameValue(true, $shapeMethod->invoke($plugin, $hostTvDetails, 'tv'), 'Additive TV details from the current host must remain valid.');
+    assertSameValue(true, is_array($projectionMethod->invoke($plugin, $hostTvDetails, 'tv')), 'Additive TV details from the current host must remain valid.');
     $invalidKnownAddition = $hostTvDetails;
     $invalidKnownAddition['logo_url'] = 'https://untrusted.invalid/logo.png';
-    assertSameValue(false, $shapeMethod->invoke($plugin, $invalidKnownAddition, 'tv'), 'An invalid known image field must still be rejected.');
+    assertSameValue(null, $projectionMethod->invoke($plugin, $invalidKnownAddition, 'tv'), 'An invalid known image field must still be rejected.');
     $wrongType = $hostMovieDetails;
     $wrongType['_media_type'] = 'tv';
-    assertSameValue(false, $shapeMethod->invoke($plugin, $wrongType, 'movie'), 'A contradictory media type must still be rejected.');
+    assertSameValue(null, $projectionMethod->invoke($plugin, $wrongType, 'movie'), 'A contradictory media type must still be rejected.');
 
     echo "TMDB artwork repair tests passed.\n";
     echo json_encode([

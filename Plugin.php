@@ -2965,21 +2965,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ],
         ];
         $schema = $schemas[$mediaType] ?? null;
-        if ($schema === null || array_diff_key($schema, $tmdbData) !== []) {
+        if ($schema === null || ! $this->hasExactKeys($tmdbData, array_keys($schema))) {
             return false;
-        }
-
-        // Host detail responses are additive. Validate the stable contract and the
-        // optional fields we know about, but do not turn a harmless future field
-        // into a false TMDB miss. Unknown keys are discarded before persistence.
-        $optionalSchema = [
-            'logo_url' => 'tmdb-image-url-null',
-            'cast_list' => 'structured-list',
-        ];
-        foreach ($optionalSchema as $field => $type) {
-            if (array_key_exists($field, $tmdbData) && ! $this->isValidTmdbDetailValue($tmdbData[$field], $type)) {
-                return false;
-            }
         }
 
         foreach ($schema as $field => $type) {

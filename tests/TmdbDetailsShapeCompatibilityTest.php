@@ -176,6 +176,8 @@ namespace Tests {
     $reflection = new ReflectionClass($plugin);
     $search = $reflection->getMethod('searchTmdbWithValidation');
     $search->setAccessible(true);
+    $cacheShape = $reflection->getMethod('isValidTmdbCacheEntry');
+    $cacheShape->setAccessible(true);
 
     foreach (['tv' => tvDetails(), 'movie' => movieDetails()] as $mediaType => $details) {
         $result = validatedSearch($plugin, $search, $mediaType, $details);
@@ -190,6 +192,14 @@ namespace Tests {
     $baselineMovieDetails = movieDetails();
     unset($baselineMovieDetails['logo_url'], $baselineMovieDetails['cast_list'], $baselineMovieDetails['certification'], $baselineMovieDetails['studios'], $baselineMovieDetails['recommendations']);
     assertSameValue(true, is_array(validatedSearch($plugin, $search, 'movie', $baselineMovieDetails)), 'The previous exact plugin DTO shape must remain compatible.');
+
+    foreach (['tv' => tvDetails(), 'movie' => movieDetails()] as $mediaType => $details) {
+        $projected = validatedSearch($plugin, $search, $mediaType, $details);
+        assertSameValue(true, $cacheShape->invokeArgs($plugin, [$projected, false]), "Projected {$mediaType} details must be accepted as a cache entry.");
+        $withUnknownCacheField = $projected;
+        $withUnknownCacheField['unknown_host_extra'] = true;
+        assertSameValue(false, $cacheShape->invokeArgs($plugin, [$withUnknownCacheField, false]), "Unknown persisted {$mediaType} cache fields must fail closed.");
+    }
 
     assertSameValue(null, validatedSearch($plugin, $search, 'tv', tvDetails(['unexpected_field' => 'reject'])), 'Unknown host details keys must still be rejected.');
     $missingRequired = tvDetails();
