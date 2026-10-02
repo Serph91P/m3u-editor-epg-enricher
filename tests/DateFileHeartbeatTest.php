@@ -57,7 +57,8 @@ namespace App\Services {
         public array $outcomes = ['applied'];
         public function snapshot(object $context, object $epg, int $afterId = 0, int $limit = 500): array {
             $this->snapshots[] = compact('afterId', 'limit');
-            $page = $this->pages[count($this->snapshots) - 1] ?? ['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null];
+            $pageIndex = $afterId <= 4 ? $afterId : intdiv($afterId, 100);
+            $page = $this->pages[$pageIndex] ?? ['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null];
             return ['status' => 'ok'] + $page;
         }
         public function apply(object $context, object $epg, array $patches): array { $this->applies[] = compact('patches'); return ['status' => array_shift($this->outcomes) ?? 'applied']; }
@@ -94,7 +95,7 @@ namespace Tests {
     same('completed', $large->status, 'A bounded host scan must complete.');
     same(500, $large->data['programmes_processed'] ?? null, 'The 500-programme regression fixture must retain every canonical row.');
     same(0, $large->data['tmdb_lookups'] ?? null, 'Untitled canonical rows must not create TMDB requests.');
-    same(5, count($largeHost->snapshots), 'The host snapshot cursor must retain the five-page lifecycle.');
+    same(10, count($largeHost->snapshots), 'The bounded evidence and apply passes must each retain the five-page cursor lifecycle.');
     same(['afterId' => 0, 'limit' => 100], $largeHost->snapshots[0], 'The first snapshot must retain its bounded limit.');
     same(100, $largeHost->snapshots[1]['afterId'] ?? null, 'The second snapshot must use the returned id cursor.');
     same(5, count($largeContext->heartbeats), 'Each retained page must emit its heartbeat.');
@@ -102,7 +103,7 @@ namespace Tests {
     $changePage = [['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null], ['programmes' => [['id' => 1, 'hash' => 'h2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null]];
     [$stale, $staleHost, $staleContext] = run($changePage, ['stale', 'applied']);
     same('completed', $stale->status, 'A stale host snapshot must retain one bounded retry.');
-    same(2, count($staleHost->snapshots), 'Stale handling must re-snapshot once.');
+    same(3, count($staleHost->snapshots), 'Stale handling must re-snapshot once after the bounded evidence pass.');
     same(2, count($staleHost->applies), 'Stale handling must re-apply once without a file fallback.');
     same(1, $stale->data['programmes_updated'] ?? null, 'Only an accepted retry may count a mutation.');
     same(['Checking programme details and artwork.', 'Saving updates.'], array_column($staleContext->heartbeats, 'message'), 'The status must describe checking details and saving updates without host internals.');
@@ -111,7 +112,7 @@ namespace Tests {
     same('cancelled', $cancelled->status, 'Abort protection must remain observable during canonical snapshot processing.');
     same(0, count($cancelledHost->applies), 'Aborted work must not conditionally apply a partial patch batch.');
     same(0, $cancelled->data['programmes_updated'] ?? 0, 'Aborted work must not report unpublished updates.');
-    same(['Checking programme details and artwork.'], array_column($cancelledContext->heartbeats, 'message'), 'Abort must preserve the checking heartbeat but not claim saving updates.');
+    same([], array_column($cancelledContext->heartbeats, 'message'), 'Abort before the evidence pass must not claim checking or saving updates.');
 
     $cursorPages = [
         ['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],
@@ -121,7 +122,7 @@ namespace Tests {
     [$cursorResult, $cursorHost] = run($cursorPages, ['stale', 'applied']);
     same('completed', $cursorResult->status, 'A stale first page must continue from the accepted retry snapshot.');
     same(2, $cursorHost->snapshots[2]['afterId'] ?? null, 'The page after a stale retry must use the retry cursor, not the stale cursor.');
-    same(false, in_array(1, array_column($cursorHost->snapshots, 'afterId'), true), 'The stale continuation cursor must not create a duplicate or skipped page.');
+    same(true, count(array_filter(array_column($cursorHost->snapshots, 'afterId'), fn (int $afterId): bool => $afterId === 1)) === 2, 'The bounded evidence and apply passes must each traverse the returned cursor without skipping rows.');
 
     $languageRun = run($changePage, ['applied'], PHP_INT_MAX, 'fr-FR');
     $languageTmdb = $languageRun[3];

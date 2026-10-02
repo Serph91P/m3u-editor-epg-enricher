@@ -28,9 +28,9 @@ namespace Tests {
     same(0, count($cancelledHost->applies), 'Cancellation must not apply host-owned EPG data.');
     same(0, $cancelled->data['programmes_processed'] ?? 0, 'Cancellation before the first programme must not count processing.');
     same(0, $cancelled->data['programmes_updated'] ?? 0, 'Cancellation must not count unpublished updates.');
-    same(['Checking programme details and artwork.'], $cancelledContext->messages, 'Cancellation must occur before saving updates.');
+    same([], $cancelledContext->messages, 'Cancellation before the evidence pass must not claim checking or saving updates.');
 
-    [$cancelledAtApplyBoundary, $cancelledAtApplyBoundaryHost, $cancelledAtApplyBoundaryContext] = execute(['applied'], [], 2);
+    [$cancelledAtApplyBoundary, $cancelledAtApplyBoundaryHost, $cancelledAtApplyBoundaryContext] = execute(['applied'], [], 4);
     same('cancelled', $cancelledAtApplyBoundary->status, 'Cancellation after the final programme must remain visible at the host apply boundary.');
     same(false, $cancelledAtApplyBoundary->success, 'Cancellation at the host apply boundary must not report success.');
     same(0, count($cancelledAtApplyBoundaryHost->applies), 'Cancellation after programme processing must not publish a host patch.');
@@ -38,7 +38,7 @@ namespace Tests {
     same(0, $cancelledAtApplyBoundary->data['programmes_updated'] ?? 0, 'Cancellation at the host apply boundary must not count updates.');
     same(['Checking programme details and artwork.'], $cancelledAtApplyBoundaryContext->messages, 'Cancellation at the save boundary must not claim success.');
 
-    [$cancelledAfterRetrySnapshot, $cancelledAfterRetrySnapshotHost, $cancelledAfterRetrySnapshotContext] = execute(['stale', 'applied'], [], 3);
+    [$cancelledAfterRetrySnapshot, $cancelledAfterRetrySnapshotHost, $cancelledAfterRetrySnapshotContext] = execute(['stale', 'applied'], [], 5);
     same('cancelled', $cancelledAfterRetrySnapshot->status, 'Cancellation after a stale retry snapshot must remain visible at the second host apply boundary.');
     same(false, $cancelledAfterRetrySnapshot->success, 'Cancellation after a stale retry snapshot must not report success.');
     same(1, count($cancelledAfterRetrySnapshotHost->applies), 'Cancellation after a stale retry snapshot must stop before the retry publication.');

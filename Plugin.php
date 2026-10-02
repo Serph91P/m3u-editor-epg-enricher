@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.09.30-poster-geometry-trust';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.10.02-provider-series-provenance';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -903,6 +903,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
         $imagesCache = $this->loadTmdbImagesCache();
+        $seriesBindings = $this->collectFreshSeriesBindings($service, $epg, $epgId, $targetChannels, $context, $settings, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $tmdbLanguage);
+        if ($seriesBindings instanceof PluginActionResult) {
+            return $seriesBindings;
+        }
         $stats = ['programmes_processed' => 0, 'programmes_updated' => 0, 'programmes_already_enriched' => 0, 'posters_added' => 0, 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
         $afterId = 0;
         do {
@@ -922,7 +926,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     continue;
                 }
                 $pageStats['programmes_processed']++;
-                $result = $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage]);
+                $result = $this->enrichProgrammeWithSettings($programme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
+                $seriesKey = $this->providerSeriesBindingKey($programme, (string) $epgId, $tmdbLanguage);
+                if ($seriesKey !== null && isset($seriesBindings[$seriesKey]) && $this->applyFreshSeriesArtworkBinding($programme, $seriesBindings[$seriesKey], (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true))) {
+                    $result['changed'] = true;
+                    $result['poster'] = true;
+                }
                 $pageStats['tmdb_lookups'] += $result['lookup'] ? 1 : 0;
                 $pageStats['tmdb_cache_hits'] += $result['cache_hit'] ? 1 : 0;
                 $changes = $this->canonicalHostChanges($row['programme'], $programme);
@@ -998,8 +1007,118 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
     private function enrichCopy(array $programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage): array
     {
-        $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage]);
+        $this->enrichProgrammeWithSettings($programme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
         return $programme;
+    }
+
+    private function enrichProgrammeWithSettings(array &$programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage): array
+    {
+        return $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage]);
+    }
+
+    /** @return array<string, array>|PluginActionResult */
+    private function collectFreshSeriesBindings(object $service, Epg $epg, int $epgId, array $targetChannels, PluginExecutionContext $context, array $settings, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, string $tmdbLanguage): array|PluginActionResult
+    {
+        $fresh = [];
+        $afterId = 0;
+        do {
+            if ($context->cancellationRequested()) {
+                return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
+            }
+            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
+            if (($snapshot['status'] ?? null) !== 'ok') {
+                return PluginActionResult::failure('Could not read programme information.', []);
+            }
+            foreach (($snapshot['programmes'] ?? []) as $row) {
+                if ($context->cancellationRequested()) {
+                    return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
+                }
+                $programme = $row['programme'] ?? null;
+                if (! is_array($programme) || ! in_array($programme['channel'] ?? null, $targetChannels, true)) {
+                    continue;
+                }
+                $result = $this->enrichProgrammeWithSettings($programme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
+                if (isset($result['fresh_series_binding']) && is_array($result['fresh_series_binding'])) {
+                    $fresh[] = $result['fresh_series_binding'];
+                }
+            }
+            $afterId = $snapshot['next'] ?? null;
+        } while ($afterId !== null);
+
+        return $this->buildFreshSeriesBindings($fresh);
+    }
+
+    private function providerSeriesBindingKey(array $programme, string $epgSourceId, string $tmdbLanguage): ?string
+    {
+        $values = [];
+        foreach ((array) ($programme['episode_nums'] ?? []) as $entry) {
+            if (! is_array($entry) || mb_strtolower(trim((string) ($entry['system'] ?? ''))) !== 'm3u-editor:series-id') {
+                continue;
+            }
+            if (! is_string($entry['value'] ?? null)) {
+                return null;
+            }
+            $value = trim($entry['value']);
+            if (preg_match('/\Agracenote:SH\d{8,}0000\z/D', $value) !== 1) {
+                return null;
+            }
+            $values[] = $value;
+        }
+        if (count($values) !== 1 || trim($epgSourceId) === '' || trim($tmdbLanguage) === '') {
+            return null;
+        }
+
+        return trim($epgSourceId).'|'.mb_strtolower(trim($tmdbLanguage)).'|'.$values[0];
+    }
+
+    /** @return array<string, array{tmdb_id:int,media_type:string,poster_url:?string,backdrop_url:?string}> */
+    private function buildFreshSeriesBindings(array $fresh): array
+    {
+        $byKey = [];
+        foreach ($fresh as $candidate) {
+            if (! is_array($candidate)
+                || ($candidate['logic'] ?? null) !== self::ENRICHMENT_LOGIC_VERSION
+                || ($candidate['decision'] ?? null) !== 'fresh_episode_validated'
+                || ! is_string($candidate['series_key'] ?? null)
+                || ! is_string($candidate['cache_key'] ?? null)
+                || ! is_int($candidate['season'] ?? null)
+                || ! is_int($candidate['episode'] ?? null)
+                || ! is_string($candidate['subtitle'] ?? null)
+                || trim($candidate['subtitle']) === ''
+                || ! is_int($candidate['tmdb_id'] ?? null)
+                || ($candidate['media_type'] ?? null) !== 'tv') {
+                continue;
+            }
+            $byKey[$candidate['series_key']][(string) $candidate['tmdb_id']] = $candidate;
+        }
+        $bindings = [];
+        foreach ($byKey as $key => $candidates) {
+            if (count($candidates) !== 1) {
+                continue;
+            }
+            $binding = array_values($candidates)[0];
+            $bindings[$key] = ['tmdb_id' => $binding['tmdb_id'], 'media_type' => 'tv', 'poster_url' => is_string($binding['poster_url'] ?? null) ? $binding['poster_url'] : null, 'backdrop_url' => is_string($binding['backdrop_url'] ?? null) ? $binding['backdrop_url'] : null];
+        }
+        return $bindings;
+    }
+
+    private function applyFreshSeriesArtworkBinding(array &$programme, array $binding, bool $enrichPosters, bool $enrichBackdrops): bool
+    {
+        if (($binding['media_type'] ?? null) !== 'tv') {
+            return false;
+        }
+        $changed = false;
+        if ($enrichPosters && ! $this->hasTrustedPoster($programme) && is_string($binding['poster_url'] ?? null) && $binding['poster_url'] !== '') {
+            $programme['images'] = is_array($programme['images'] ?? null) ? $programme['images'] : [];
+            $programme['images'][] = ['url' => $binding['poster_url'], 'type' => 'poster', 'width' => 500, 'height' => 750, 'orient' => 'P', 'size' => 2, 'source' => 'tmdb', 'scope' => 'programme'];
+            $changed = true;
+        }
+        if ($enrichBackdrops && ! $this->hasTrustedLandscapeIcon($programme) && is_string($binding['backdrop_url'] ?? null) && $binding['backdrop_url'] !== '') {
+            $programme['images'] = is_array($programme['images'] ?? null) ? $programme['images'] : [];
+            $programme['images'][] = ['url' => $binding['backdrop_url'], 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 1, 'source' => 'tmdb', 'scope' => 'programme'];
+            $changed = true;
+        }
+        return $changed;
     }
 
     private function canonicalHostChanges(array $before, array $after): array
@@ -1355,6 +1474,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             return $result;
+        }
+
+        // A binding seed is deliberately emitted only from this invocation's fresh,
+        // episode-validated TV decision. Cached and base-reused DTOs never carry the
+        // candidate/episode proof required for cross-episode artwork reuse.
+        $providerSeriesKey = $this->providerSeriesBindingKey($programme, (string) ($lookupContext['epg_source_id'] ?? ''), (string) ($lookupContext['tmdb_language'] ?? ''));
+        if ($result['lookup'] && ! $result['cache_hit'] && $providerSeriesKey !== null
+            && $hasEpisodeTitleEvidence && $forcedMediaType === 'tv'
+            && ($tmdbData['_media_type'] ?? null) === 'tv' && is_int($tmdbData['tmdb_id'] ?? null)) {
+            $result['fresh_series_binding'] = [
+                'logic' => self::ENRICHMENT_LOGIC_VERSION,
+                'decision' => 'fresh_episode_validated',
+                'series_key' => $providerSeriesKey,
+                'cache_key' => $fullCacheKey,
+                'season' => $seriesSignals['season'],
+                'episode' => $seriesSignals['episode'],
+                'subtitle' => $episodeIdentity['subtitle'],
+                'tmdb_id' => $tmdbData['tmdb_id'],
+                'media_type' => 'tv',
+                'poster_url' => is_string($tmdbData['poster_url'] ?? null) ? $tmdbData['poster_url'] : null,
+                'backdrop_url' => is_string($tmdbData['backdrop_url'] ?? null) ? $tmdbData['backdrop_url'] : null,
+            ];
         }
 
         // Enrich poster/icon

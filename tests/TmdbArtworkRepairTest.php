@@ -2596,6 +2596,43 @@ namespace Tests {
     $wrongType['_media_type'] = 'tv';
     assertSameValue(null, $projectionMethod->invoke($plugin, $wrongType, 'movie'), 'A contradictory media type must still be rejected.');
 
+    $seriesBindingKeyMethod = $reflection->getMethod('providerSeriesBindingKey');
+    $seriesBindingKeyMethod->setAccessible(true);
+    $seriesBindingMethod = $reflection->getMethod('buildFreshSeriesBindings');
+    $seriesBindingMethod->setAccessible(true);
+    $seriesArtworkMethod = $reflection->getMethod('applyFreshSeriesArtworkBinding');
+    $seriesArtworkMethod->setAccessible(true);
+    $seriesId = ['system' => 'm3u-editor:series-id', 'value' => 'gracenote:SH123456780000'];
+    $bindingSeed = ['title' => 'Synthetic Series', 'subtitle' => 'Seed episode', 'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.1.'], $seriesId]];
+    $bindingTarget = ['title' => 'Synthetic Series', 'subtitle' => 'Missing episode', 'desc' => 'Target description', 'episode_num' => '4.1.', 'episode_nums' => [['system' => 'xmltv_ns', 'value' => '4.1.'], ['system' => 'm3u-editor:content-id', 'value' => 'gracenote:EP123456780001'], $seriesId], 'images' => [['url' => 'https://fixture.invalid/trusted-backdrop.jpg', 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'source' => 'trusted']]];
+    $bindingKey = $seriesBindingKeyMethod->invoke($plugin, $bindingSeed, 'source-a', 'de-DE');
+    assertSameValue('source-a|de-de|gracenote:SH123456780000', $bindingKey, 'A single typed Gracenote series ID must be scoped by source and normalized language.');
+    $duplicateSeriesId = $bindingSeed;
+    $duplicateSeriesId['episode_nums'][] = $seriesId;
+    assertSameValue(null, $seriesBindingKeyMethod->invoke($plugin, $duplicateSeriesId, 'source-a', 'de-DE'), 'Duplicate provider series IDs must not bind.');
+    $untrustedSeriesId = $bindingSeed;
+    $untrustedSeriesId['episode_nums'][1]['value'] = 'other:SH123456780000';
+    assertSameValue(null, $seriesBindingKeyMethod->invoke($plugin, $untrustedSeriesId, 'source-a', 'de-DE'), 'Unknown provider series namespaces must not bind.');
+    $freshSeed = ['series_key' => $bindingKey, 'logic' => '2026.10.02-provider-series-provenance', 'decision' => 'fresh_episode_validated', 'cache_key' => 'fresh-input-evidence', 'season' => 1, 'episode' => 2, 'subtitle' => 'Seed episode', 'tmdb_id' => 901, 'media_type' => 'tv', 'poster_url' => 'https://fixture.invalid/series-poster.jpg', 'backdrop_url' => 'https://fixture.invalid/series-backdrop.jpg'];
+    $bindings = $seriesBindingMethod->invoke($plugin, [$freshSeed]);
+    assertSameValue(901, $bindings[$bindingKey]['tmdb_id'] ?? null, 'Only a fresh episode-validated TV decision may produce a series binding.');
+    $conflictSeed = $freshSeed;
+    $conflictSeed['tmdb_id'] = 902;
+    assertSameValue([], $seriesBindingMethod->invoke($plugin, [$freshSeed, $conflictSeed]), 'Late conflicting fresh identities must poison the binding key.');
+    $legacySeed = $freshSeed;
+    $legacySeed['decision'] = 'cache_hit';
+    assertSameValue([], $seriesBindingMethod->invoke($plugin, [$legacySeed]), 'Legacy, cache-hit, or reused results must not seed bindings.');
+    $targetBeforeBinding = $bindingTarget;
+    $bound = $seriesArtworkMethod->invokeArgs($plugin, [&$bindingTarget, $bindings[$bindingKey], true, true]);
+    assertSameValue(true, $bound, 'A finalized fresh binding must add missing series artwork.');
+    assertSameValue($targetBeforeBinding['subtitle'], $bindingTarget['subtitle'], 'Series artwork binding must not copy the seed subtitle.');
+    assertSameValue($targetBeforeBinding['desc'], $bindingTarget['desc'], 'Series artwork binding must not copy the seed description.');
+    assertSameValue($targetBeforeBinding['episode_num'], $bindingTarget['episode_num'], 'Series artwork binding must not copy episode numbering.');
+    assertSameValue($targetBeforeBinding['episode_nums'], $bindingTarget['episode_nums'], 'Series artwork binding must preserve content and series identifiers.');
+    assertSameValue('https://fixture.invalid/trusted-backdrop.jpg', $bindingTarget['images'][0]['url'], 'Series artwork binding must retain trusted target backdrops.');
+    assertSameValue('poster', $bindingTarget['images'][1]['type'] ?? null, 'Series artwork binding must add a typed portrait poster atomically.');
+    assertSameValue([500, 750], [$bindingTarget['images'][1]['width'] ?? null, $bindingTarget['images'][1]['height'] ?? null], 'Series poster geometry must remain portrait and atomic.');
+
     echo "TMDB artwork repair tests passed.\n";
     echo json_encode([
         'first_last_boundary_parity' => $benchmarkParity,

@@ -81,11 +81,11 @@ namespace App\Services {
             if (($status = array_shift($this->snapshotStatuses)) !== null) {
                 return ['status' => $status];
             }
-            $page = $this->pages[count($this->snapshots) - 1] ?? null;
+            $page = $this->pages[$afterId === 0 ? 0 : 1] ?? null;
             if ($page !== null) {
                 return ['status' => 'ok', 'programmes' => $page['programmes'], 'next' => $page['next'] ?? null];
             }
-            return ['status' => 'ok', 'programmes' => [['id' => 1, 'hash' => 'hash-'.count($this->snapshots), 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']],], 'next' => null];
+            return ['status' => 'ok', 'programmes' => [['id' => 1, 'hash' => 'hash-stable', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']],], 'next' => null];
         }
         public function apply(object $context, object $epg, array $patches): array
         {
@@ -125,13 +125,13 @@ namespace Tests {
     }
 
     [$result, $host, $context] = runFixture();
-    assertSameValue(1, count($host->snapshots), 'Enrichment must request one bounded host snapshot.');
+    assertSameValue(2, count($host->snapshots), 'Enrichment must collect fresh binding evidence before its bounded apply pass.');
     assertSameValue(['afterId' => 0, 'limit' => 100], $host->snapshots[0], 'Snapshot reads must use the host id cursor and bounded page size.');
     assertSameValue(1, count($host->applies), 'A changed canonical programme must be conditionally applied once.');
     assertSameValue('completed', $result->status, 'Only an accepted host apply may report enrichment success.');
     assertSameValue(1, $result->data['programmes_updated'] ?? null, 'Accepted apply must count the changed programme.');
     assertSameValue(1, $host->applies[0]['patches'][0]['id'] ?? null, 'Patch must preserve the host programme id.');
-    assertSameValue('hash-1', $host->applies[0]['patches'][0]['hash'] ?? null, 'Patch must preserve the host programme hash.');
+    assertSameValue('hash-stable', $host->applies[0]['patches'][0]['hash'] ?? null, 'Patch must preserve the host programme hash.');
     assertSameValue('Sports', $host->applies[0]['patches'][0]['changes']['category'] ?? null, 'Canonical patch must carry the enriched category.');
     assertSameValue(['Checking programme details and artwork.', 'Saving updates.'], $context->messages, 'End-user heartbeats must describe the current work without host internals.');
 
@@ -142,12 +142,14 @@ namespace Tests {
     assertSameValue([
         ['afterId' => 0, 'limit' => 100],
         ['afterId' => 1, 'limit' => 100],
+        ['afterId' => 0, 'limit' => 100],
+        ['afterId' => 1, 'limit' => 100],
     ], $pagedHost->snapshots, 'Every host page must advance with its returned integer id cursor.');
     assertSameValue(2, count($pagedHost->applies), 'Every changed page must be submitted through the host API.');
     assertSameValue(2, $pagedResult->data['programmes_updated'] ?? null, 'Accepted pages must contribute to the total update count.');
 
     [$staleResult, $staleHost] = runFixture(['stale', 'applied']);
-    assertSameValue(2, count($staleHost->snapshots), 'A stale page must be re-read exactly once.');
+    assertSameValue(3, count($staleHost->snapshots), 'A stale page must be re-read exactly once after the bounded evidence pass.');
     assertSameValue(2, count($staleHost->applies), 'A stale page must be retried exactly once.');
     assertSameValue(1, $staleResult->data['programmes_updated'] ?? null, 'Only the accepted retry counts as an update.');
 
@@ -175,7 +177,7 @@ namespace Tests {
     [$cancelledResult, $cancelledHost] = runFixture(['applied'], [], 1);
     assertSameValue('cancelled', $cancelledResult->status, 'Cancellation before host apply must propagate.');
     assertSameValue(0, count($cancelledHost->applies), 'Cancellation must not mutate host-owned EPG data.');
-    assertSameValue('Enrichment cancelled before saving updates.', $cancelledResult->summary, 'Cancellation must use an end-user message without host implementation terms.');
+    assertSameValue('Enrichment cancelled while checking programme details.', $cancelledResult->summary, 'Cancellation must use an end-user message without host implementation terms.');
 
     $censusHost = new EpgCacheEnrichmentService();
     $censusHost->pages = [
