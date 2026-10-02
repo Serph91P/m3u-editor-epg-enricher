@@ -1265,6 +1265,24 @@ namespace Tests {
     assertSameValue(0, $episodeNullSeasonTmdb->tvDetailsRequests, 'A null competing season response must not load candidate details.');
     assertSameValue(2, $episodeNullSeasonTmdb->seasonRequests, 'A null competing season response must be observed for every tied candidate before abstaining.');
 
+    // A structurally invalid target episode on a tied competitor is likewise not
+    // evidence that the competitor lacks the programme. It must not promote the
+    // other positive subtitle match to a trusted series identity.
+    $episodeMalformedEntryTmdb = new CandidateTmdbService(
+        tvCandidates: $ambiguousSeriesCandidates,
+        seasonDetails: [
+            '681:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Signal Fire']]],
+            '682:1' => ['episodes' => [['episode_number' => 5, 'name' => ['Signal Fire']]]],
+        ],
+    );
+    $episodeMalformedEntryProgramme = $episodeValidatedProgramme;
+    $episodeMalformedEntryBefore = $episodeMalformedEntryProgramme;
+    $episodeMalformedEntryCache = [];
+    enrich($plugin, $method, $episodeMalformedEntryProgramme, $episodeMalformedEntryTmdb, $episodeMalformedEntryCache);
+    assertSameValue($episodeMalformedEntryBefore, $episodeMalformedEntryProgramme, 'A malformed tied competitor episode must leave an otherwise matching episode unchanged.');
+    assertSameValue(0, $episodeMalformedEntryTmdb->tvDetailsRequests, 'A malformed tied competitor episode must not load candidate details.');
+    assertSameValue(2, $episodeMalformedEntryTmdb->seasonRequests, 'A malformed tied competitor episode must be checked before abstaining.');
+
     $malformedTmdb = new CandidateTmdbService(tvCandidates: [
         ['tmdb_id' => 651, 'name' => 'Malformed Target', 'original_name' => 'Malformed Target', 'first_air_date' => '2024-01-01', 'overview' => 'Valid candidate.'],
         ['name' => 'Missing Identity'],

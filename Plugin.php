@@ -2903,10 +2903,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return null;
             }
             foreach ($seasonData['episodes'] as $episodeData) {
-                if (! is_array($episodeData)
-                    || ($episodeData['episode_number'] ?? null) !== $episode
-                    || ! is_string($episodeData['name'] ?? null)) {
+                if (! is_array($episodeData) || ! is_int($episodeData['episode_number'] ?? null)) {
+                    return null;
+                }
+                if ($episodeData['episode_number'] !== $episode) {
                     continue;
+                }
+                if (! is_string($episodeData['name'] ?? null)) {
+                    return null;
                 }
                 if ($this->normalizeIdentityText($episodeData['name']) === $subtitle) {
                     $matches[] = $candidate;
