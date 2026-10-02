@@ -2636,7 +2636,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     && $details['_media_type'] !== $selectedMediaType)) {
                 return null;
             }
-            $details = $this->normalizeTmdbDetails($details + ['_media_type' => $selectedMediaType], $selectedMediaType);
+            $details = $this->projectKnownHostTmdbDetailsExtras($details + ['_media_type' => $selectedMediaType], $selectedMediaType);
             if ($details === null) {
                 return null;
             }
@@ -3001,22 +3001,95 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Normalizes a host response for the on-disk title cache. Host additions are
-     * deliberately not persisted unless this plugin has an explicit consumer for
-     * them; known additions are still type-checked above.
+     * Validate known additive host DTO fields, then project them away before the
+     * plugin's exact cache schema is checked. Unknown additions fail closed.
      */
-    private function normalizeTmdbDetails(array $details, string $mediaType): ?array
+    private function projectKnownHostTmdbDetailsExtras(array $details, string $mediaType): ?array
     {
-        $details['_media_type'] = $mediaType;
-        if (! $this->hasValidTmdbDetailsShape($details, $mediaType)) {
-            return null;
-        }
-
-        $fields = $mediaType === 'tv'
+        $extraSchema = [
+            'logo_url' => 'image',
+            'cast_list' => 'cast',
+            'certification' => 'string',
+            'recommendations' => 'recommendations',
+            ...match ($mediaType) {
+                'tv' => ['networks' => 'companies'],
+                'movie' => ['studios' => 'companies'],
+                default => [],
+            },
+        ];
+        $canonical = $mediaType === 'tv'
             ? ['tmdb_id', '_media_type', 'tvdb_id', 'imdb_id', 'name', 'original_name', 'overview', 'poster_url', 'backdrop_url', 'first_air_date', 'genres', 'vote_average', 'vote_count', 'status', 'number_of_seasons', 'number_of_episodes', 'cast', 'director', 'youtube_trailer']
             : ['tmdb_id', '_media_type', 'imdb_id', 'title', 'original_title', 'overview', 'poster_url', 'backdrop_url', 'release_date', 'genres', 'vote_average', 'vote_count', 'runtime', 'status', 'cast', 'director', 'youtube_trailer'];
+        if (array_diff_key($details, array_fill_keys(array_merge($canonical, array_keys($extraSchema)), true)) !== []) {
+            return null;
+        }
+        $projected = array_diff_key($details, $extraSchema);
+        if (! $this->hasValidTmdbDetailsShape($projected, $mediaType)) {
+            return null;
+        }
+        foreach (array_diff_key($details, $projected) as $field => $value) {
+            $valid = match ($extraSchema[$field] ?? null) {
+                'image' => $value === null || (is_string($value) && $this->isTrustedTmdbImageUrl($value)),
+                'string' => is_string($value) || $value === null,
+                'cast' => $this->validHostCast($value),
+                'companies' => $this->validHostCompanies($value),
+                'recommendations' => $this->validHostRecommendations($value, $mediaType),
+                default => false,
+            };
+            if (! $valid) {
+                return null;
+            }
+        }
+        return $projected;
+    }
 
-        return array_intersect_key($details, array_flip($fields));
+    private function validHostCast(mixed $value): bool
+    {
+        if (! is_array($value) || ! array_is_list($value)) return false;
+        foreach ($value as $item) {
+            if (! is_array($item) || ! $this->hasExactKeys($item, ['id', 'name', 'character', 'photo'])
+                || (! is_int($item['id']) && $item['id'] !== null) || ! is_string($item['name'])
+                || ! is_string($item['character']) || (! is_string($item['photo']) && $item['photo'] !== null)
+                || (is_string($item['photo']) && ! $this->isTrustedTmdbImageUrl($item['photo']))) return false;
+        }
+        return true;
+    }
+
+    private function validHostCompanies(mixed $value): bool
+    {
+        if (! is_array($value) || ! array_is_list($value)) return false;
+        foreach ($value as $item) {
+            if (! is_array($item) || ! $this->hasExactKeys($item, ['id', 'name', 'logo'])
+                || ! is_int($item['id']) || $item['id'] <= 0 || ! is_string($item['name'])
+                || (! is_string($item['logo']) && $item['logo'] !== null)
+                || (is_string($item['logo']) && ! $this->isTrustedTmdbImageUrl($item['logo']))) return false;
+        }
+        return true;
+    }
+
+    private function validHostRecommendations(mixed $value, string $mediaType): bool
+    {
+        if (! is_array($value) || ! array_is_list($value)) return false;
+        foreach ($value as $item) {
+            if (! is_array($item) || ! $this->hasExactKeys($item, ['tmdb_id', 'title', 'poster_url', 'media_type'])
+                || ! is_int($item['tmdb_id']) || $item['tmdb_id'] <= 0 || ! is_string($item['title'])
+                || (! is_string($item['poster_url']) && $item['poster_url'] !== null)
+                || (is_string($item['poster_url']) && ! $this->isTrustedTmdbImageUrl($item['poster_url']))
+                || $item['media_type'] !== $mediaType) return false;
+        }
+        return true;
+    }
+
+    /** @param list<string> $keys */
+    private function hasExactKeys(array $value, array $keys): bool
+    {
+        $schema = array_fill_keys($keys, true);
+        return array_diff_key($schema, $value) === [] && array_diff_key($value, $schema) === [];
+    }
+
+    private function normalizeTmdbDetails(array $details, string $mediaType): ?array
+    {
+        return $this->projectKnownHostTmdbDetailsExtras($details, $mediaType);
     }
 
     private function isValidTmdbDetailValue(mixed $value, string $type, ?string $mediaType = null): bool

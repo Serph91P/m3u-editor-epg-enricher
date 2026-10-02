@@ -2269,8 +2269,7 @@ namespace Tests {
     $shapeMethod->setAccessible(true);
     $hostMovieDetails = normalizedMovieDetailsFixture(801, 'Host Contract Movie', 'Host contract fixture.');
     $hostMovieDetails['logo_url'] = 'https://image.tmdb.org/t/p/w500/host-logo.png';
-    $hostMovieDetails['cast_list'] = [['id' => 1, 'name' => 'Fixture Actor']];
-    $hostMovieDetails['future_host_field'] = ['safe' => 'ignored'];
+    $hostMovieDetails['cast_list'] = [['id' => 1, 'name' => 'Fixture Actor', 'character' => 'Lead', 'photo' => null]];
     $hostMovieDetails['_media_type'] = 'movie';
     assertSameValue(true, $shapeMethod->invoke($plugin, $hostMovieDetails, 'movie'), 'Additive movie details from the current host must remain valid.');
     $hostMovieCandidate = [
