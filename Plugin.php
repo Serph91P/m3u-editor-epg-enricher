@@ -903,9 +903,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
         $imagesCache = $this->loadTmdbImagesCache();
-        $seriesBindings = $this->collectFreshSeriesBindings($service, $epg, $epgId, $targetChannels, $context, $settings, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $tmdbLanguage);
-        if ($seriesBindings instanceof PluginActionResult) {
-            return $seriesBindings;
+        $seriesEvidence = $this->collectFreshSeriesBindings($service, $epg, $epgId, $targetChannels, $context, $settings, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $tmdbLanguage);
+        if ($seriesEvidence instanceof PluginActionResult) {
+            return $seriesEvidence;
+        }
+        $seriesBindings = $seriesEvidence['bindings'];
+        if ($seriesBindings !== [] && ! $this->freshSeriesBindingSnapshotStillMatches($service, $epg, $context, $seriesEvidence['snapshot'])) {
+            // Conditional target hashes do not establish that a separately read seed
+            // remains current. Drop all cross-row reuse when the bounded re-read drifts.
+            $seriesBindings = [];
         }
         $stats = ['programmes_processed' => 0, 'programmes_updated' => 0, 'programmes_already_enriched' => 0, 'posters_added' => 0, 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
         $afterId = 0;
@@ -1016,10 +1022,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage]);
     }
 
-    /** @return array<string, array>|PluginActionResult */
+    /** @return array{bindings: array<string, array>, snapshot: array<string, string>}|PluginActionResult */
     private function collectFreshSeriesBindings(object $service, Epg $epg, int $epgId, array $targetChannels, PluginExecutionContext $context, array $settings, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, string $tmdbLanguage): array|PluginActionResult
     {
         $fresh = [];
+        $snapshotIdentity = [];
+        $checked = 0;
         $afterId = 0;
         do {
             if ($context->cancellationRequested()) {
@@ -1029,13 +1037,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             if (($snapshot['status'] ?? null) !== 'ok') {
                 return PluginActionResult::failure('Could not read programme information.', []);
             }
+            $context->heartbeat('Checking programme details and artwork.');
             foreach (($snapshot['programmes'] ?? []) as $row) {
                 if ($context->cancellationRequested()) {
                     return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
                 }
                 $programme = $row['programme'] ?? null;
+                $snapshotIdentity[(string) ($row['id'] ?? '')] = (string) ($row['hash'] ?? '');
                 if (! is_array($programme) || ! in_array($programme['channel'] ?? null, $targetChannels, true)) {
                     continue;
+                }
+                if ((++$checked % 25) === 0) {
+                    $context->heartbeat('Checking programme details and artwork.');
                 }
                 $result = $this->enrichProgrammeWithSettings($programme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
                 if (isset($result['fresh_series_binding']) && is_array($result['fresh_series_binding'])) {
@@ -1045,7 +1058,30 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $afterId = $snapshot['next'] ?? null;
         } while ($afterId !== null);
 
-        return $this->buildFreshSeriesBindings($fresh);
+        ksort($snapshotIdentity);
+        return ['bindings' => $this->buildFreshSeriesBindings($fresh), 'snapshot' => $snapshotIdentity];
+    }
+
+    private function freshSeriesBindingSnapshotStillMatches(object $service, Epg $epg, PluginExecutionContext $context, array $expected): bool
+    {
+        $actual = [];
+        $afterId = 0;
+        do {
+            if ($context->cancellationRequested()) {
+                return false;
+            }
+            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
+            if (($snapshot['status'] ?? null) !== 'ok') {
+                return false;
+            }
+            foreach (($snapshot['programmes'] ?? []) as $row) {
+                $actual[(string) ($row['id'] ?? '')] = (string) ($row['hash'] ?? '');
+            }
+            $context->heartbeat('Checking programme details and artwork.');
+            $afterId = $snapshot['next'] ?? null;
+        } while ($afterId !== null);
+        ksort($actual);
+        return $actual === $expected;
     }
 
     private function providerSeriesBindingKey(array $programme, string $epgSourceId, string $tmdbLanguage): ?string
@@ -1071,7 +1107,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return trim($epgSourceId).'|'.mb_strtolower(trim($tmdbLanguage)).'|'.$values[0];
     }
 
-    /** @return array<string, array{tmdb_id:int,media_type:string,poster_url:?string,backdrop_url:?string}> */
+    /** @return array<string, array{tmdb_id:int,media_type:string,poster:?array,backdrop:?array}> */
     private function buildFreshSeriesBindings(array $fresh): array
     {
         $byKey = [];
@@ -1097,7 +1133,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 continue;
             }
             $binding = array_values($candidates)[0];
-            $bindings[$key] = ['tmdb_id' => $binding['tmdb_id'], 'media_type' => 'tv', 'poster_url' => is_string($binding['poster_url'] ?? null) ? $binding['poster_url'] : null, 'backdrop_url' => is_string($binding['backdrop_url'] ?? null) ? $binding['backdrop_url'] : null];
+            $bindings[$key] = ['tmdb_id' => $binding['tmdb_id'], 'media_type' => 'tv', 'poster' => $binding['poster'] ?? null, 'backdrop' => $binding['backdrop'] ?? null];
         }
         return $bindings;
     }
@@ -1108,17 +1144,27 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return false;
         }
         $changed = false;
-        if ($enrichPosters && ! $this->hasTrustedPoster($programme) && is_string($binding['poster_url'] ?? null) && $binding['poster_url'] !== '') {
+        if ($enrichPosters && ! $this->hasTrustedPoster($programme) && $this->isReusableSeriesArtwork($binding['poster'] ?? null, 'poster')) {
             $programme['images'] = is_array($programme['images'] ?? null) ? $programme['images'] : [];
-            $programme['images'][] = ['url' => $binding['poster_url'], 'type' => 'poster', 'width' => 500, 'height' => 750, 'orient' => 'P', 'size' => 2, 'source' => 'tmdb', 'scope' => 'programme'];
+            $programme['images'][] = $binding['poster'];
             $changed = true;
         }
-        if ($enrichBackdrops && ! $this->hasTrustedLandscapeIcon($programme) && is_string($binding['backdrop_url'] ?? null) && $binding['backdrop_url'] !== '') {
+        if ($enrichBackdrops && ! $this->hasTrustedLandscapeIcon($programme) && $this->isReusableSeriesArtwork($binding['backdrop'] ?? null, 'backdrop')) {
             $programme['images'] = is_array($programme['images'] ?? null) ? $programme['images'] : [];
-            $programme['images'][] = ['url' => $binding['backdrop_url'], 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 1, 'source' => 'tmdb', 'scope' => 'programme'];
+            $programme['images'][] = $binding['backdrop'];
             $changed = true;
         }
         return $changed;
+    }
+
+    private function isReusableSeriesArtwork(mixed $image, string $role): bool
+    {
+        if (! is_array($image) || ($image['type'] ?? null) !== $role || ($image['source'] ?? null) !== 'tmdb' || ($image['scope'] ?? null) !== 'programme'
+            || ! is_string($image['url'] ?? null) || ! is_numeric($image['width'] ?? null) || ! is_numeric($image['height'] ?? null)
+            || (float) $image['width'] <= 0 || (float) $image['height'] <= 0) {
+            return false;
+        }
+        return $role === 'poster' ? $this->isTrustedPortraitImage($image) : $this->isTrustedLandscapeImage($image);
     }
 
     private function canonicalHostChanges(array $before, array $after): array
@@ -1399,6 +1445,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $baseCacheKey,
             $seriesBaseCacheKey,
         ]);
+        $episodeValidationPath = null;
         if (isset($cache[$fullCacheKey])) {
             $result['cache_hit'] = true;
             $tmdbData = $cache[$fullCacheKey];
@@ -1418,6 +1465,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             // Strategy: try full title first (handles compound names like "CSI: Miami",
             // "NCIS: Los Angeles"), then fall back to base title if validation fails.
             $compoundIdentity = null;
+            $episodeValidationPath = null;
             $tmdbData = $this->searchTmdbWithValidation(
                 $tmdb,
                 $title,
@@ -1427,6 +1475,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $compoundIdentity,
                 null,
                 $episodeIdentity,
+                $episodeValidationPath,
             );
             $matchedViaBase = false;
 
@@ -1441,6 +1490,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $unusedCompoundIdentity,
                     $compoundIdentity,
                     $episodeIdentity,
+                    $episodeValidationPath,
                 );
                 $matchedViaBase = $tmdbData !== null;
             }
@@ -1476,27 +1526,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return $result;
         }
 
-        // A binding seed is deliberately emitted only from this invocation's fresh,
-        // episode-validated TV decision. Cached and base-reused DTOs never carry the
-        // candidate/episode proof required for cross-episode artwork reuse.
-        $providerSeriesKey = $this->providerSeriesBindingKey($programme, (string) ($lookupContext['epg_source_id'] ?? ''), (string) ($lookupContext['tmdb_language'] ?? ''));
-        if ($result['lookup'] && ! $result['cache_hit'] && $providerSeriesKey !== null
-            && $hasEpisodeTitleEvidence && $forcedMediaType === 'tv'
-            && ($tmdbData['_media_type'] ?? null) === 'tv' && is_int($tmdbData['tmdb_id'] ?? null)) {
-            $result['fresh_series_binding'] = [
-                'logic' => self::ENRICHMENT_LOGIC_VERSION,
-                'decision' => 'fresh_episode_validated',
-                'series_key' => $providerSeriesKey,
-                'cache_key' => $fullCacheKey,
-                'season' => $seriesSignals['season'],
-                'episode' => $seriesSignals['episode'],
-                'subtitle' => $episodeIdentity['subtitle'],
-                'tmdb_id' => $tmdbData['tmdb_id'],
-                'media_type' => 'tv',
-                'poster_url' => is_string($tmdbData['poster_url'] ?? null) ? $tmdbData['poster_url'] : null,
-                'backdrop_url' => is_string($tmdbData['backdrop_url'] ?? null) ? $tmdbData['backdrop_url'] : null,
-            ];
-        }
+        // Cross-episode artwork reuse is emitted only after the current invocation
+        // has produced explicit episode-validation provenance and verified artwork.
 
         // Enrich poster/icon
         $posterUrl = $tmdbData['poster_url'] ?? null;
@@ -1778,7 +1809,42 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $result['changed'] = true;
         }
 
+        $providerSeriesKey = $this->providerSeriesBindingKey($programme, (string) ($lookupContext['epg_source_id'] ?? ''), (string) ($lookupContext['tmdb_language'] ?? ''));
+        if ($result['lookup'] && ! $result['cache_hit'] && $providerSeriesKey !== null
+            && ($tmdbData['_media_type'] ?? null) === 'tv' && is_int($tmdbData['tmdb_id'] ?? null)
+            && is_array($episodeValidationPath)) {
+            $artwork = $this->freshSeriesArtworkFromProgramme($programme);
+            $result['fresh_series_binding'] = [
+                'logic' => self::ENRICHMENT_LOGIC_VERSION,
+                'decision' => 'fresh_episode_validated',
+                'validation_path' => $episodeValidationPath,
+                'series_key' => $providerSeriesKey,
+                'cache_key' => $fullCacheKey,
+                'season' => $seriesSignals['season'],
+                'episode' => $seriesSignals['episode'],
+                'subtitle' => $episodeIdentity['subtitle'],
+                'tmdb_id' => $tmdbData['tmdb_id'],
+                'media_type' => 'tv',
+                'poster' => $artwork['poster'],
+                'backdrop' => $artwork['backdrop'],
+            ];
+        }
+
         return $result;
+    }
+
+    private function freshSeriesArtworkFromProgramme(array $programme): array
+    {
+        $out = ['poster' => null, 'backdrop' => null];
+        foreach ((array) ($programme['images'] ?? []) as $image) {
+            if ($out['poster'] === null && $this->isReusableSeriesArtwork($image, 'poster')) {
+                $out['poster'] = $image;
+            }
+            if ($out['backdrop'] === null && $this->isReusableSeriesArtwork($image, 'backdrop')) {
+                $out['backdrop'] = $image;
+            }
+        }
+        return $out;
     }
 
     /**
@@ -2744,9 +2810,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?array &$provisionalCompoundIdentity = null,
         ?array $requiredCompoundIdentity = null,
         ?array $episodeIdentity = null,
+        ?array &$episodeValidationPath = null,
     ): ?array
     {
         $provisionalCompoundIdentity = null;
+        $episodeValidationPath = null;
         $searchNorm = mb_strtolower(trim($searchTitle));
         $candidates = [];
 
@@ -2777,8 +2845,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             $best = $this->selectTmdbIdentityWinner($candidates);
+            $episodeValidated = false;
             if ($best === null) {
                 $best = $this->selectEpisodeValidatedTvWinner($tmdb, $candidates, $forceMediaType, $episodeIdentity);
+                $episodeValidated = $best !== null;
             }
             if ($requiredCompoundIdentity !== null) {
                 $best = $this->confirmedCompoundIdentityCandidate(
@@ -2786,6 +2856,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $searchTitle,
                     $requiredCompoundIdentity,
                 );
+                $episodeValidated = false;
             }
             if ($best === null) {
                 $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
@@ -2822,6 +2893,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
             if (! $this->hasValidTmdbDetailsShape($best, $selectedMediaType)) {
                 return null;
+            }
+            if ($episodeValidated) {
+                $episodeValidationPath = [
+                    'path' => 'unique_episode_title',
+                    'season' => $episodeIdentity['season'] ?? null,
+                    'episode' => $episodeIdentity['episode'] ?? null,
+                    'subtitle' => $episodeIdentity['subtitle'] ?? null,
+                ];
             }
 
             return $best;

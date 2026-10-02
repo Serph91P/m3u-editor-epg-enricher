@@ -2613,7 +2613,7 @@ namespace Tests {
     $untrustedSeriesId = $bindingSeed;
     $untrustedSeriesId['episode_nums'][1]['value'] = 'other:SH123456780000';
     assertSameValue(null, $seriesBindingKeyMethod->invoke($plugin, $untrustedSeriesId, 'source-a', 'de-DE'), 'Unknown provider series namespaces must not bind.');
-    $freshSeed = ['series_key' => $bindingKey, 'logic' => '2026.10.02-provider-series-provenance', 'decision' => 'fresh_episode_validated', 'cache_key' => 'fresh-input-evidence', 'season' => 1, 'episode' => 2, 'subtitle' => 'Seed episode', 'tmdb_id' => 901, 'media_type' => 'tv', 'poster_url' => 'https://fixture.invalid/series-poster.jpg', 'backdrop_url' => 'https://fixture.invalid/series-backdrop.jpg'];
+    $freshSeed = ['series_key' => $bindingKey, 'logic' => '2026.10.02-provider-series-provenance', 'decision' => 'fresh_episode_validated', 'validation_path' => ['path' => 'unique_episode_title'], 'cache_key' => 'fresh-input-evidence', 'season' => 1, 'episode' => 2, 'subtitle' => 'Seed episode', 'tmdb_id' => 901, 'media_type' => 'tv', 'poster' => ['url' => 'https://image.tmdb.org/t/p/original/series-poster.jpg', 'type' => 'poster', 'width' => 640, 'height' => 1000, 'orient' => 'P', 'size' => 2, 'source' => 'tmdb', 'scope' => 'programme'], 'backdrop' => ['url' => 'https://image.tmdb.org/t/p/original/series-backdrop.jpg', 'type' => 'backdrop', 'width' => 1600, 'height' => 900, 'orient' => 'L', 'size' => 1, 'source' => 'tmdb', 'scope' => 'programme', 'artwork_quality' => 'tmdb_metadata_unrated']];
     $bindings = $seriesBindingMethod->invoke($plugin, [$freshSeed]);
     assertSameValue(901, $bindings[$bindingKey]['tmdb_id'] ?? null, 'Only a fresh episode-validated TV decision may produce a series binding.');
     $conflictSeed = $freshSeed;
@@ -2631,7 +2631,12 @@ namespace Tests {
     assertSameValue($targetBeforeBinding['episode_nums'], $bindingTarget['episode_nums'], 'Series artwork binding must preserve content and series identifiers.');
     assertSameValue('https://fixture.invalid/trusted-backdrop.jpg', $bindingTarget['images'][0]['url'], 'Series artwork binding must retain trusted target backdrops.');
     assertSameValue('poster', $bindingTarget['images'][1]['type'] ?? null, 'Series artwork binding must add a typed portrait poster atomically.');
-    assertSameValue([500, 750], [$bindingTarget['images'][1]['width'] ?? null, $bindingTarget['images'][1]['height'] ?? null], 'Series poster geometry must remain portrait and atomic.');
+    assertSameValue([640, 1000], [$bindingTarget['images'][1]['width'] ?? null, $bindingTarget['images'][1]['height'] ?? null], 'Series poster must preserve its verified source geometry atomically.');
+    $squareBinding = $bindings[$bindingKey];
+    $squareBinding['poster']['width'] = 1000;
+    $squareBinding['poster']['height'] = 1000;
+    $squareTarget = $targetBeforeBinding;
+    assertSameValue(false, $seriesArtworkMethod->invokeArgs($plugin, [&$squareTarget, $squareBinding, true, false]), 'Square, unverified poster geometry must not be propagated.');
 
     echo "TMDB artwork repair tests passed.\n";
     echo json_encode([

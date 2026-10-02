@@ -36,7 +36,7 @@ namespace Tests {
     same(0, count($cancelledAtApplyBoundaryHost->applies), 'Cancellation after programme processing must not publish a host patch.');
     same(0, $cancelledAtApplyBoundary->data['programmes_processed'] ?? 0, 'Cancelled page work must not be committed to the aggregate counters.');
     same(0, $cancelledAtApplyBoundary->data['programmes_updated'] ?? 0, 'Cancellation at the host apply boundary must not count updates.');
-    same(['Checking programme details and artwork.'], $cancelledAtApplyBoundaryContext->messages, 'Cancellation at the save boundary must not claim success.');
+    same(['Checking programme details and artwork.', 'Checking programme details and artwork.'], $cancelledAtApplyBoundaryContext->messages, 'Cancellation at the save boundary must not claim success after visible evidence and apply work.');
 
     [$cancelledAfterRetrySnapshot, $cancelledAfterRetrySnapshotHost, $cancelledAfterRetrySnapshotContext] = execute(['stale', 'applied'], [], 5);
     same('cancelled', $cancelledAfterRetrySnapshot->status, 'Cancellation after a stale retry snapshot must remain visible at the second host apply boundary.');
@@ -44,7 +44,7 @@ namespace Tests {
     same(1, count($cancelledAfterRetrySnapshotHost->applies), 'Cancellation after a stale retry snapshot must stop before the retry publication.');
     same(0, $cancelledAfterRetrySnapshot->data['programmes_processed'] ?? 0, 'Cancelled retry work must not be committed to the aggregate counters.');
     same(0, $cancelledAfterRetrySnapshot->data['programmes_updated'] ?? 0, 'Cancelled retry work must not count updates.');
-    same(['Checking programme details and artwork.', 'Saving updates.'], $cancelledAfterRetrySnapshotContext->messages, 'Cancelled retry work must not claim success.');
+    same(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], $cancelledAfterRetrySnapshotContext->messages, 'Cancelled retry work must not claim success.');
 
     // Each host rejection retains the previous “no unintended cache/state write”
     // safety property, without recreating the removed direct-cache adapter.
@@ -56,7 +56,7 @@ namespace Tests {
         same(0, $result->data['programmes_updated'] ?? 0, "$outcome must not count updates.");
         same(1, count($host->applies), "$outcome must not fall back to direct storage.");
         same(1, $host->applies[0]['patches'][0]['id'] ?? null, "$outcome must remain bound to its programme id.");
-        same(['Checking programme details and artwork.', 'Saving updates.'], $context->messages, "$outcome must not claim a completed save.");
+        same(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], $context->messages, "$outcome must not claim a completed save.");
     }
 
     [$unavailable, $unavailableHost, $unavailableContext] = execute(['applied'], ['unavailable']);

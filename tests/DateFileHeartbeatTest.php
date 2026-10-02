@@ -98,7 +98,7 @@ namespace Tests {
     same(10, count($largeHost->snapshots), 'The bounded evidence and apply passes must each retain the five-page cursor lifecycle.');
     same(['afterId' => 0, 'limit' => 100], $largeHost->snapshots[0], 'The first snapshot must retain its bounded limit.');
     same(100, $largeHost->snapshots[1]['afterId'] ?? null, 'The second snapshot must use the returned id cursor.');
-    same(5, count($largeContext->heartbeats), 'Each retained page must emit its heartbeat.');
+    same(30, count($largeContext->heartbeats), 'The evidence pass must provide throttled liveness during long page processing and the apply pass must remain visible.');
 
     $changePage = [['programmes' => [['id' => 1, 'hash' => 'h1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null], ['programmes' => [['id' => 1, 'hash' => 'h2', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null]];
     [$stale, $staleHost, $staleContext] = run($changePage, ['stale', 'applied']);
@@ -106,7 +106,7 @@ namespace Tests {
     same(3, count($staleHost->snapshots), 'Stale handling must re-snapshot once after the bounded evidence pass.');
     same(2, count($staleHost->applies), 'Stale handling must re-apply once without a file fallback.');
     same(1, $stale->data['programmes_updated'] ?? null, 'Only an accepted retry may count a mutation.');
-    same(['Checking programme details and artwork.', 'Saving updates.'], array_column($staleContext->heartbeats, 'message'), 'The status must describe checking details and saving updates without host internals.');
+    same(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], array_column($staleContext->heartbeats, 'message'), 'The status must describe both evidence and apply checking plus saving updates without host internals.');
 
     [$cancelled, $cancelledHost, $cancelledContext] = run($changePage, ['applied'], 1);
     same('cancelled', $cancelled->status, 'Abort protection must remain observable during canonical snapshot processing.');

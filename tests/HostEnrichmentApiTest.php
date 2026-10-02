@@ -133,7 +133,7 @@ namespace Tests {
     assertSameValue(1, $host->applies[0]['patches'][0]['id'] ?? null, 'Patch must preserve the host programme id.');
     assertSameValue('hash-stable', $host->applies[0]['patches'][0]['hash'] ?? null, 'Patch must preserve the host programme hash.');
     assertSameValue('Sports', $host->applies[0]['patches'][0]['changes']['category'] ?? null, 'Canonical patch must carry the enriched category.');
-    assertSameValue(['Checking programme details and artwork.', 'Saving updates.'], $context->messages, 'End-user heartbeats must describe the current work without host internals.');
+    assertSameValue(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], $context->messages, 'The evidence and apply passes must emit end-user heartbeats without host internals.');
 
     [$pagedResult, $pagedHost] = runFixture(['applied', 'applied'], [], PHP_INT_MAX, [
         ['programmes' => [['id' => 1, 'hash' => 'page-1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],
@@ -214,6 +214,8 @@ namespace Tests {
     assertSameValue(['total' => 2, 'completed' => 2], $progress, 'Completed page counts must accumulate against the bounded census total.');
     assertSameValue([50, 99], array_values(array_filter($progressContext->progresses, fn ($value): bool => $value !== null)), 'Progress must be monotonic after accepted pages and reserve 100 for the terminal heartbeat.');
     assertSameValue([
+        'Checking programme details and artwork.',
+        'Checking programme details and artwork.',
         'Checking programme details and artwork: 0/2 checked.',
         'Saving updates: 0/2 checked.',
         'Checking programme details and artwork: 1/2 checked.',

@@ -30,7 +30,7 @@ namespace Tests {
     same(1, $acceptedHost->applies[0]['patches'][0]['id'] ?? null, 'The host programme id must remain attached to its output patch.');
     same('output-hash', $acceptedHost->applies[0]['patches'][0]['hash'] ?? null, 'The host content hash must remain attached to its output patch.');
     same('Sports', $acceptedHost->applies[0]['patches'][0]['changes']['category'] ?? null, 'The enriched output category must be published through the host.');
-    same(['Checking programme details and artwork.', 'Saving updates.'], $acceptedContext->messages, 'End-user messages must remain tied to accepted output work.');
+    same(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], $acceptedContext->messages, 'End-user messages must cover evidence, apply, and accepted output work.');
 
     // A host no-op replaces the old “unchanged playlist output stays cached” case:
     // no direct XMLTV/cache action is available to the plugin.
@@ -41,7 +41,7 @@ namespace Tests {
     same(0, $noop->data['programmes_updated'] ?? null, 'A no-op must not advertise an XMLTV/output mutation.');
     same(1, count($noopHost->applies), 'The host, rather than a direct output cache, must decide a no-op.');
     same(1, $noopHost->applies[0]['patches'][0]['id'] ?? null, 'A no-op remains bound to the host programme id.');
-    same(['Checking programme details and artwork.', 'Saving updates.'], $noopContext->messages, 'No-op output must report the attempted save without claiming publication.');
+    same(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], $noopContext->messages, 'No-op output must report evidence and the attempted save without claiming publication.');
     $changes = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(new Plugin(), ['icon' => 'https://source.invalid/icon.png', 'images' => []], ['icon' => 'https://source.invalid/icon.png', 'images' => [['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10], ['url' => 'https://fixture.invalid/backdrop.jpg', 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 20], ['url' => 'https://fixture.invalid/still.jpg', 'type' => 'screenshot', 'width' => 1280, 'height' => 720, 'orient' => 'L', 'size' => 30], ['url' => 'https://fixture.invalid/logo.png', 'type' => 'logo', 'width' => 800, 'height' => 300, 'orient' => 'L', 'size' => 40]]]);
     same(['poster', 'fanart', 'banner', 'logo'], array_column($changes['images'] ?? [], 'type'), 'Poster, backdrop, still and logo retain separate canonical roles.');
     same(['https://fixture.invalid/poster.jpg', 'https://fixture.invalid/backdrop.jpg', 'https://fixture.invalid/still.jpg', 'https://fixture.invalid/logo.png'], array_column($changes['images'] ?? [], 'url'), 'Role-specific output URLs must be retained.');
