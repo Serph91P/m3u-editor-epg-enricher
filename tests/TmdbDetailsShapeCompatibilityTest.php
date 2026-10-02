@@ -15,6 +15,8 @@ namespace App\Plugins\Support {
 namespace App\Services {
     class TmdbService
     {
+        public static int $detailsCalls = 0;
+
         public function __construct(
             private readonly string $mediaType,
             private readonly array $details,
@@ -52,11 +54,13 @@ namespace App\Services {
 
         public function getTvSeriesDetails(int $tmdbId): array
         {
+            self::$detailsCalls++;
             return $this->details;
         }
 
         public function getMovieDetails(int $tmdbId): array
         {
+            self::$detailsCalls++;
             return $this->details;
         }
     }
@@ -218,6 +222,68 @@ namespace Tests {
     assertSameValue(null, validatedSearch($plugin, $search, 'movie', movieDetails(['recommendations' => [['tmdb_id' => 203, 'title' => 'Related Synthetic Movie', 'poster_url' => null, 'media_type' => 'movie', 'overview' => 'reject']]])), 'Unknown recommendation entry keys must be rejected.');
     assertSameValue(null, validatedSearch($plugin, $search, 'tv', tvDetails(['cast_list' => [['id' => 401, 'name' => 'Actor One', 'character' => 'Lead', 'photo' => 'https://fixture.invalid/photo.jpg']]])), 'Untrusted cast photo URLs must be rejected.');
     assertSameValue(null, validatedSearch($plugin, $search, 'movie', movieDetails(['tmdb_id' => 999])), 'TMDB identity mismatches must still be rejected.');
+
+    $enrich = $reflection->getMethod('enrichProgrammeFromTmdb');
+    $enrich->setAccessible(true);
+    foreach (['tv' => tvDetails(), 'movie' => movieDetails()] as $mediaType => $details) {
+        TmdbService::$detailsCalls = 0;
+        $cache = [];
+        $seasonCache = [];
+        $imagesCache = [];
+        $programme = [
+            'title' => $mediaType === 'tv' ? 'Synthetic Series' : 'Synthetic Movie',
+            'desc' => 'Synthetic fixture.',
+        ];
+        if ($mediaType === 'tv') {
+            $programme['episode_num'] = 'EP1';
+        }
+        $service = new TmdbService($mediaType, $details);
+        $arguments = [
+            &$programme, $service, &$cache,
+            true, true, true, false, false, false, false, false, false,
+            &$seasonCache, &$imagesCache, ['epg_source_id' => 'synthetic', 'tmdb_language' => 'en'],
+        ];
+        $first = $enrich->invokeArgs($plugin, $arguments);
+        assertSameValue(1, TmdbService::$detailsCalls, "The complete {$mediaType} host DTO must be fetched through enrichProgrammeFromTmdb.");
+        assertSameValue(false, $cache === [], "The {$mediaType} enrichment must persist a cache entry.");
+        foreach ($cache as $entry) {
+            assertSameValue(false, array_key_exists('logo_url', $entry), "Persisted {$mediaType} cache projection must omit host-only fields.");
+            assertSameValue(false, array_key_exists('unknown_host_extra', $entry), "Persisted {$mediaType} cache projection must omit unknown fields.");
+        }
+        $secondProgramme = [
+            'title' => $mediaType === 'tv' ? 'Synthetic Series' : 'Synthetic Movie',
+            'desc' => 'Synthetic fixture.',
+        ];
+        if ($mediaType === 'tv') {
+            $secondProgramme['episode_num'] = 'EP1';
+        }
+        $second = $enrich->invokeArgs($plugin, [
+            &$secondProgramme, $service, &$cache,
+            true, true, true, false, false, false, false, false, false,
+            &$seasonCache, &$imagesCache, ['epg_source_id' => 'synthetic', 'tmdb_language' => 'en'],
+        ]);
+        assertSameValue(true, $second['cache_hit'], "A persisted {$mediaType} projection must be reusable as a cache hit.");
+        assertSameValue(1, TmdbService::$detailsCalls, "A {$mediaType} cache hit must not fetch TMDB details again.");
+
+        foreach ($cache as &$entry) {
+            $entry['unknown_host_extra'] = true;
+        }
+        unset($entry);
+        $thirdProgramme = [
+            'title' => $mediaType === 'tv' ? 'Synthetic Series' : 'Synthetic Movie',
+            'desc' => 'Synthetic fixture.',
+        ];
+        if ($mediaType === 'tv') {
+            $thirdProgramme['episode_num'] = 'EP1';
+        }
+        $third = $enrich->invokeArgs($plugin, [
+            &$thirdProgramme, $service, &$cache,
+            true, true, true, false, false, false, false, false, false,
+            &$seasonCache, &$imagesCache, ['epg_source_id' => 'synthetic', 'tmdb_language' => 'en'],
+        ]);
+        assertSameValue(false, $third['cache_hit'], "An unknown persisted {$mediaType} cache field must invalidate the cache entry.");
+        assertSameValue(2, TmdbService::$detailsCalls, "An invalidated {$mediaType} cache entry must be fetched again.");
+    }
 
     echo "TMDB details shape compatibility tests passed.\n";
 }
