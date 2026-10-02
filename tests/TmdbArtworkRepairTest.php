@@ -1247,6 +1247,24 @@ namespace Tests {
     assertSameValue($episodeNetworkBefore, $episodeNetworkProgramme, 'A season lookup failure must fail closed without a candidate details request.');
     assertSameValue(0, $episodeNetworkTmdb->tvDetailsRequests, 'A season lookup failure must not load series details.');
 
+    // The supported facade returns null for 404s and request failures. A positive
+    // episode-title match cannot select a series while any tied competitor remains
+    // uninspectable, because null is not proof that the competitor lacks the episode.
+    $episodeNullSeasonTmdb = new CandidateTmdbService(
+        tvCandidates: $ambiguousSeriesCandidates,
+        seasonDetails: [
+            '681:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Signal Fire']]],
+            // Candidate 682 intentionally has no entry and therefore returns null.
+        ],
+    );
+    $episodeNullSeasonProgramme = $episodeValidatedProgramme;
+    $episodeNullSeasonBefore = $episodeNullSeasonProgramme;
+    $episodeNullSeasonCache = [];
+    enrich($plugin, $method, $episodeNullSeasonProgramme, $episodeNullSeasonTmdb, $episodeNullSeasonCache);
+    assertSameValue($episodeNullSeasonBefore, $episodeNullSeasonProgramme, 'A null competing season response must leave an otherwise matching episode unchanged.');
+    assertSameValue(0, $episodeNullSeasonTmdb->tvDetailsRequests, 'A null competing season response must not load candidate details.');
+    assertSameValue(2, $episodeNullSeasonTmdb->seasonRequests, 'A null competing season response must be observed for every tied candidate before abstaining.');
+
     $malformedTmdb = new CandidateTmdbService(tvCandidates: [
         ['tmdb_id' => 651, 'name' => 'Malformed Target', 'original_name' => 'Malformed Target', 'first_air_date' => '2024-01-01', 'overview' => 'Valid candidate.'],
         ['name' => 'Missing Identity'],

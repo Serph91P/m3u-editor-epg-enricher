@@ -2896,7 +2896,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return null;
             }
             if (! is_array($seasonData) || ! is_array($seasonData['episodes'] ?? null)) {
-                continue;
+                // A competitor that cannot be inspected is unresolved evidence, not
+                // evidence that it lacks the episode. Selecting the other candidate
+                // would turn a 404, malformed response, or network failure into a
+                // false identity proof.
+                return null;
             }
             foreach ($seasonData['episodes'] as $episodeData) {
                 if (! is_array($episodeData)
