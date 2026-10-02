@@ -908,15 +908,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return $seriesEvidence;
         }
         $seriesBindings = $seriesEvidence['bindings'];
-        if ($seriesBindings !== [] && ! $this->freshSeriesBindingSnapshotStillMatches($service, $epg, $context, $seriesEvidence['snapshot'])) {
-            // Conditional target hashes do not establish that a separately read seed
-            // remains current. Drop all cross-row reuse when the bounded re-read drifts.
-            $seriesBindings = [];
-        }
+        $seriesEvidenceToken = $seriesEvidence['evidence'];
         $stats = ['programmes_processed' => 0, 'programmes_updated' => 0, 'programmes_already_enriched' => 0, 'posters_added' => 0, 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
         $afterId = 0;
         do {
-            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
+            $snapshot = $seriesBindings !== []
+                ? $service->guardedSnapshot($context, $epg, $afterId, 100, $seriesEvidenceToken)
+                : $service->snapshot($context, $epg, $afterId, 100);
             if (($snapshot['status'] ?? null) !== 'ok') {
                 return PluginActionResult::failure('Could not read programme information.', $stats);
             }
@@ -956,9 +954,24 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
                 $context->heartbeat($this->endUserProgressMessage('Saving updates', $progress));
                 $appliedPatches = $patches;
-                $apply = $service->apply($context, $epg, $patches);
+                $apply = $seriesBindings !== []
+                    ? $service->guardedApply($context, $epg, $patches, $seriesEvidenceToken)
+                    : $service->apply($context, $epg, $patches);
                 $status = $apply['status'] ?? 'unknown';
+                if ($seriesBindings !== [] && in_array($status, ['applied', 'noop'], true)) {
+                    if (is_string($apply['evidence'] ?? null) && trim($apply['evidence']) !== '') {
+                        $seriesEvidenceToken = $apply['evidence'];
+                    } else {
+                        // The host accepted this page but classified it as evidence-changing.
+                        // Continue ordinary per-row work without reusing the consumed proof.
+                        $seriesBindings = [];
+                        $seriesEvidenceToken = null;
+                    }
+                }
                 if ($status === 'stale') {
+                    if ($seriesBindings !== []) {
+                        return PluginActionResult::failure('Could not save programme updates.', $stats);
+                    }
                     if ($context->cancellationRequested()) {
                         return PluginActionResult::cancelled('Enrichment cancelled before checking programme details.', $stats);
                     }
@@ -1022,28 +1035,34 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, (bool) ($settings['overwrite_existing'] ?? false), (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage]);
     }
 
-    /** @return array{bindings: array<string, array>, snapshot: array<string, string>}|PluginActionResult */
+    /** @return array{bindings: array<string, array>, evidence: ?string}|PluginActionResult */
     private function collectFreshSeriesBindings(object $service, Epg $epg, int $epgId, array $targetChannels, PluginExecutionContext $context, array $settings, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, string $tmdbLanguage): array|PluginActionResult
     {
+        // Cross-row reuse requires the additive host evidence capability. Older hosts
+        // retain ordinary per-row enrichment but cannot establish a safe binding.
+        if (! method_exists($service, 'guardedSnapshot') || ! method_exists($service, 'guardedApply')) {
+            return ['bindings' => [], 'evidence' => null];
+        }
+
         $fresh = [];
-        $snapshotIdentity = [];
         $checked = 0;
         $afterId = 0;
+        $evidence = null;
         do {
             if ($context->cancellationRequested()) {
                 return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
             }
-            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
-            if (($snapshot['status'] ?? null) !== 'ok') {
+            $snapshot = $service->guardedSnapshot($context, $epg, $afterId, 100, $evidence);
+            if (($snapshot['status'] ?? null) !== 'ok' || ! is_string($snapshot['evidence'] ?? null)) {
                 return PluginActionResult::failure('Could not read programme information.', []);
             }
+            $evidence = $snapshot['evidence'];
             $context->heartbeat('Checking programme details and artwork.');
             foreach (($snapshot['programmes'] ?? []) as $row) {
                 if ($context->cancellationRequested()) {
                     return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
                 }
                 $programme = $row['programme'] ?? null;
-                $snapshotIdentity[(string) ($row['id'] ?? '')] = (string) ($row['hash'] ?? '');
                 if (! is_array($programme) || ! in_array($programme['channel'] ?? null, $targetChannels, true)) {
                     continue;
                 }
@@ -1058,30 +1077,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $afterId = $snapshot['next'] ?? null;
         } while ($afterId !== null);
 
-        ksort($snapshotIdentity);
-        return ['bindings' => $this->buildFreshSeriesBindings($fresh), 'snapshot' => $snapshotIdentity];
-    }
-
-    private function freshSeriesBindingSnapshotStillMatches(object $service, Epg $epg, PluginExecutionContext $context, array $expected): bool
-    {
-        $actual = [];
-        $afterId = 0;
-        do {
-            if ($context->cancellationRequested()) {
-                return false;
-            }
-            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
-            if (($snapshot['status'] ?? null) !== 'ok') {
-                return false;
-            }
-            foreach (($snapshot['programmes'] ?? []) as $row) {
-                $actual[(string) ($row['id'] ?? '')] = (string) ($row['hash'] ?? '');
-            }
-            $context->heartbeat('Checking programme details and artwork.');
-            $afterId = $snapshot['next'] ?? null;
-        } while ($afterId !== null);
-        ksort($actual);
-        return $actual === $expected;
+        $bindings = $this->buildFreshSeriesBindings($fresh);
+        return ['bindings' => $bindings, 'evidence' => $bindings === [] ? null : $evidence];
     }
 
     private function providerSeriesBindingKey(array $programme, string $epgSourceId, string $tmdbLanguage): ?string
@@ -1115,6 +1112,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             if (! is_array($candidate)
                 || ($candidate['logic'] ?? null) !== self::ENRICHMENT_LOGIC_VERSION
                 || ($candidate['decision'] ?? null) !== 'fresh_episode_validated'
+                || ! is_array($candidate['validation_path'] ?? null)
+                || ($candidate['validation_path']['path'] ?? null) !== 'unique_episode_title'
+                || ! is_int($candidate['validation_path']['season'] ?? null)
+                || ! is_int($candidate['validation_path']['episode'] ?? null)
+                || ! is_string($candidate['validation_path']['subtitle'] ?? null)
                 || ! is_string($candidate['series_key'] ?? null)
                 || ! is_string($candidate['cache_key'] ?? null)
                 || ! is_int($candidate['season'] ?? null)
@@ -1160,6 +1162,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     private function isReusableSeriesArtwork(mixed $image, string $role): bool
     {
         if (! is_array($image) || ($image['type'] ?? null) !== $role || ($image['source'] ?? null) !== 'tmdb' || ($image['scope'] ?? null) !== 'programme'
+            || ($image['geometry_source'] ?? null) !== 'tmdb_dimensions'
             || ! is_string($image['url'] ?? null) || ! is_numeric($image['width'] ?? null) || ! is_numeric($image['height'] ?? null)
             || (float) $image['width'] <= 0 || (float) $image['height'] <= 0) {
             return false;
@@ -1526,8 +1529,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return $result;
         }
 
-        // Cross-episode artwork reuse is emitted only after the current invocation
-        // has produced explicit episode-validation provenance and verified artwork.
+        // Cross-row artwork may only use records selected from this identity's current
+        // TMDB images response; details URL fallbacks and prior programme images lack
+        // the required identity and geometry provenance.
+        $freshSeriesArtwork = ['poster' => null, 'backdrop' => null];
 
         // Enrich poster/icon
         $posterUrl = $tmdbData['poster_url'] ?? null;
@@ -1658,6 +1663,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                             continue;
                         }
 
+                        if ($freshSeriesArtwork[$img['type']] === null && in_array($img['type'], ['poster', 'backdrop'], true)
+                            && $this->isReusableSeriesArtwork($img, $img['type'])) {
+                            $freshSeriesArtwork[$img['type']] = $img;
+                        }
                         $programme['images'][] = $img;
                         $result['changed'] = true;
                     }
@@ -1813,7 +1822,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($result['lookup'] && ! $result['cache_hit'] && $providerSeriesKey !== null
             && ($tmdbData['_media_type'] ?? null) === 'tv' && is_int($tmdbData['tmdb_id'] ?? null)
             && is_array($episodeValidationPath)) {
-            $artwork = $this->freshSeriesArtworkFromProgramme($programme);
             $result['fresh_series_binding'] = [
                 'logic' => self::ENRICHMENT_LOGIC_VERSION,
                 'decision' => 'fresh_episode_validated',
@@ -1825,26 +1833,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'subtitle' => $episodeIdentity['subtitle'],
                 'tmdb_id' => $tmdbData['tmdb_id'],
                 'media_type' => 'tv',
-                'poster' => $artwork['poster'],
-                'backdrop' => $artwork['backdrop'],
+                'poster' => $freshSeriesArtwork['poster'],
+                'backdrop' => $freshSeriesArtwork['backdrop'],
             ];
         }
 
         return $result;
-    }
-
-    private function freshSeriesArtworkFromProgramme(array $programme): array
-    {
-        $out = ['poster' => null, 'backdrop' => null];
-        foreach ((array) ($programme['images'] ?? []) as $image) {
-            if ($out['poster'] === null && $this->isReusableSeriesArtwork($image, 'poster')) {
-                $out['poster'] = $image;
-            }
-            if ($out['backdrop'] === null && $this->isReusableSeriesArtwork($image, 'backdrop')) {
-                $out['backdrop'] = $image;
-            }
-        }
-        return $out;
     }
 
     /**
@@ -2157,11 +2151,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'artwork_quality' => $isDetailsFallback
                     ? 'tmdb_details_unrated_fallback'
                     : ($this->hasBackdropVoteEvidence($b) ? 'tmdb_vote_evidence' : 'tmdb_metadata_unrated'),
+                'geometry_source' => is_numeric($b['width'] ?? null) && is_numeric($b['height'] ?? null)
+                    ? 'tmdb_dimensions'
+                    : 'tmdb_aspect_ratio',
             ];
         }
 
         // Posters: user-lang bevorzugt (portrait, size=2)
-        $posters = $images['posters'] ?? [];
+        $posters = array_values(array_filter(
+            $images['posters'] ?? [],
+            fn (array $poster): bool => $this->isGenuinePortraitArtwork($poster)
+        ));
         $langPrioPoster = [$shortLang, null, 'en'];
         usort($posters, fn ($a, $b) => $sortBy($a, $b, $langPrioPoster));
         foreach (array_slice($posters, 0, 2) as $p) {
@@ -2172,13 +2172,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'url' => 'https://image.tmdb.org/t/p/w500'.$p['file_path'],
                 'type' => 'poster',
                 'width' => 500,
-                'height' => (int) round(500 / max($p['aspect_ratio'] ?? 0.667, 0.1)),
+                'height' => (int) round(500 / $this->tmdbImageAspect($p)),
                 'orient' => 'P',
                 'size' => 2,
                 'source' => 'tmdb',
                 'scope' => 'programme',
                 'language' => $p['iso_639_1'] ?? null,
                 'language_rank' => $rank($p, $langPrioPoster),
+                'geometry_source' => is_numeric($p['width'] ?? null) && is_numeric($p['height'] ?? null)
+                    ? 'tmdb_dimensions'
+                    : 'tmdb_aspect_ratio',
             ];
         }
 
@@ -2237,11 +2240,52 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && is_numeric($backdrop['height'] ?? null)
             && (float) $backdrop['width'] > 0
             && (float) $backdrop['height'] > 0) {
-            return (float) $backdrop['width'] > (float) $backdrop['height'];
+            $actualAspect = (float) $backdrop['width'] / (float) $backdrop['height'];
+            if ($actualAspect <= 1.0) {
+                return false;
+            }
+            return ! is_numeric($backdrop['aspect_ratio'] ?? null)
+                || abs((float) $backdrop['aspect_ratio'] - $actualAspect) <= 0.02;
         }
 
         return is_numeric($backdrop['aspect_ratio'] ?? null)
             && (float) $backdrop['aspect_ratio'] > 1.0;
+    }
+
+    private function isGenuinePortraitArtwork(array $poster): bool
+    {
+        if (! is_string($poster['file_path'] ?? null) || trim($poster['file_path']) === '') {
+            return false;
+        }
+        if (is_numeric($poster['width'] ?? null) && is_numeric($poster['height'] ?? null)
+            && (float) $poster['width'] > 0 && (float) $poster['height'] > 0) {
+            $actualAspect = (float) $poster['width'] / (float) $poster['height'];
+            if ($actualAspect >= 1.0) {
+                return false;
+            }
+            return ! is_numeric($poster['aspect_ratio'] ?? null)
+                || abs((float) $poster['aspect_ratio'] - $actualAspect) <= 0.02;
+        }
+
+        if (! array_key_exists('aspect_ratio', $poster)) {
+            // Legacy host/test facades may omit geometry. Keep ordinary image
+            // enrichment compatible, but geometry_source below prevents reuse.
+            return true;
+        }
+
+        return is_numeric($poster['aspect_ratio'])
+            && (float) $poster['aspect_ratio'] > 0
+            && (float) $poster['aspect_ratio'] < 1.0;
+    }
+
+    private function tmdbImageAspect(array $image): float
+    {
+        if (is_numeric($image['width'] ?? null) && is_numeric($image['height'] ?? null)
+            && (float) $image['width'] > 0 && (float) $image['height'] > 0) {
+            return (float) $image['width'] / (float) $image['height'];
+        }
+
+        return max((float) ($image['aspect_ratio'] ?? 0.667), 0.1);
     }
 
     private function hasTrustedLandscapeIcon(array $programme): bool

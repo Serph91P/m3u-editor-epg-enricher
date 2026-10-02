@@ -75,6 +75,20 @@ namespace App\Services {
         public array $applyStatuses = ['applied'];
         public array $snapshotStatuses = [];
         public array $pages = [];
+        public array $guardedSnapshots = [];
+        public array $guardedApplies = [];
+        public function guardedSnapshot(object $context, object $epg, int $afterId = 0, int $limit = 500, ?string $evidence = null): array
+        {
+            $this->guardedSnapshots[] = compact('afterId', 'limit', 'evidence');
+            $snapshot = $this->snapshot($context, $epg, $afterId, $limit);
+            return ($snapshot['status'] ?? null) === 'ok' ? $snapshot + ['evidence' => $evidence ?? 'fixture-evidence'] : $snapshot;
+        }
+        public function guardedApply(object $context, object $epg, array $patches, string $evidence): array
+        {
+            $this->guardedApplies[] = compact('patches', 'evidence');
+            $apply = $this->apply($context, $epg, $patches);
+            return in_array($apply['status'] ?? null, ['applied', 'noop'], true) ? $apply + ['evidence' => $evidence] : $apply;
+        }
         public function snapshot(object $context, object $epg, int $afterId = 0, int $limit = 500): array
         {
             $this->snapshots[] = compact('afterId', 'limit');
