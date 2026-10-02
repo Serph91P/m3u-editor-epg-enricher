@@ -1214,10 +1214,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         $forcedMediaType = $hasStrongSeriesSignals ? 'tv' : null;
         $description = trim((string) ($programme['desc'] ?? ''));
+        $episodeSubtitle = $programme['subtitle'] ?? null;
         $episodeIdentity = [
             'season' => $seriesSignals['season'],
             'episode' => $seriesSignals['episode'],
-            'subtitle' => trim((string) ($programme['subtitle'] ?? '')),
+            // Episode-title identity must come from a typed host string. Casting an
+            // arbitrary DTO value would let arrays become the literal title "Array".
+            'subtitle' => is_string($episodeSubtitle) ? trim($episodeSubtitle) : '',
         ];
         $existingTmdbId = $programme['tmdb_id'] ?? null;
         $existingTmdbId = is_scalar($existingTmdbId) ? trim((string) $existingTmdbId) : null;
@@ -1260,7 +1263,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'year' => $year,
         ];
         if ($hasEpisodeTitleEvidence) {
+            // A base-series result is reusable only for this exact episode identity.
+            // Repeated episode titles (for example "Pilot") occur across seasons.
             $seriesBaseEvidence['episode_title'] = $episodeTitleEvidence;
+            $seriesBaseEvidence['season'] = $seriesSignals['season'];
+            $seriesBaseEvidence['episode'] = $seriesSignals['episode'];
         }
         $seriesBaseCacheKey = ($baseTitle !== $title && $hasStrongSeriesSignals)
             ? '__series_base|'.hash('sha256', json_encode($seriesBaseEvidence, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES))
@@ -2856,7 +2863,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     ): ?array {
         $season = $episodeIdentity['season'] ?? null;
         $episode = $episodeIdentity['episode'] ?? null;
-        $subtitle = $this->normalizeIdentityText((string) ($episodeIdentity['subtitle'] ?? ''));
+        $rawSubtitle = $episodeIdentity['subtitle'] ?? null;
+        $subtitle = is_string($rawSubtitle)
+            ? $this->normalizeIdentityText($rawSubtitle)
+            : '';
         if ($forceMediaType !== 'tv'
             || ! is_int($season) || $season <= 0
             || ! is_int($episode) || $episode <= 0
@@ -3418,8 +3428,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function detectSeriesSignals(array $programme): array
     {
-        $subtitle = trim((string) ($programme['subtitle'] ?? ''));
-        $episodeNum = trim((string) ($programme['episode_num'] ?? ''));
+        $rawSubtitle = $programme['subtitle'] ?? null;
+        $rawEpisodeNum = $programme['episode_num'] ?? null;
+        $subtitle = is_string($rawSubtitle) ? trim($rawSubtitle) : '';
+        $episodeNum = is_string($rawEpisodeNum) ? trim($rawEpisodeNum) : '';
 
         $season = null;
         $episode = null;
@@ -3428,11 +3440,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             : [];
         foreach ($typedEpisodeNums as $typedEpisodeNum) {
             if (! is_array($typedEpisodeNum)
-                || strtolower(trim((string) ($typedEpisodeNum['system'] ?? ''))) !== 'xmltv_ns') {
+                || ! is_string($typedEpisodeNum['system'] ?? null)
+                || strtolower(trim($typedEpisodeNum['system'])) !== 'xmltv_ns'
+                || ! is_string($typedEpisodeNum['value'] ?? null)) {
                 continue;
             }
 
-            $value = trim((string) ($typedEpisodeNum['value'] ?? ''));
+            $value = trim($typedEpisodeNum['value']);
             if (preg_match('/^(\d+)\.(\d+)(?:\.\d*)?(?:\/\d+)?$/', $value, $matches)) {
                 $season = (int) $matches[1] + 1;
                 $episode = (int) $matches[2] + 1;
@@ -3445,7 +3459,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         $seFromText = false;
         if ($season === null && $episode === null) {
-            $haystack = $subtitle.' '.trim((string) ($programme['desc'] ?? ''));
+            $rawDescription = $programme['desc'] ?? null;
+            $description = is_string($rawDescription) ? trim($rawDescription) : '';
+            $haystack = $subtitle.' '.$description;
             if (trim($haystack) !== '') {
                 [$season, $episode] = $this->parseSeasonEpisodeFromText($haystack);
                 if ($season !== null || $episode !== null) {

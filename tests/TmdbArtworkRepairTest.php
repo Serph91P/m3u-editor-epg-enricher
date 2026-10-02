@@ -1153,6 +1153,68 @@ namespace Tests {
     assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $episodeValidatedReplay['icon'] ?? null, 'An exact episode-validated replay should retain the validated artwork.');
     assertSameValue([0, 0, 0], [$episodeValidatedReplayTmdb->tvCandidateSearches, $episodeValidatedReplayTmdb->tvDetailsRequests, $episodeValidatedReplayTmdb->seasonRequests], 'An exact episode-validated cache hit must not amplify TMDB requests.');
 
+    // A base-title cache entry validated for S01E05 must not leak to S02E05 merely
+    // because both rows have the common episode title "Pilot".
+    $baseScopedCandidates = [
+        ['tmdb_id' => 701, 'name' => 'Cache Scope Series', 'original_name' => 'Cache Scope Series', 'first_air_date' => '2010-01-01', 'overview' => 'First synthetic series.'],
+        ['tmdb_id' => 702, 'name' => 'Cache Scope Series', 'original_name' => 'Cache Scope Series', 'first_air_date' => '2020-01-01', 'overview' => 'Second synthetic series.'],
+    ];
+    $baseScopedCache = [];
+    $baseScopedSeedTmdb = new CandidateTmdbService(
+        tvCandidates: $baseScopedCandidates,
+        tvDetails: [701 => normalizedTvDetailsFixture(701, 'Cache Scope Series', 'First synthetic series.', null, 'https://image.tmdb.org/t/p/original/cache-scope-1.jpg')],
+        tvCandidatesByQuery: ['Cache Scope Series - Pilot One' => []],
+        seasonDetails: [
+            '701:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Pilot']]],
+            '702:1' => ['episodes' => []],
+        ],
+    );
+    $baseScopedSeed = [
+        'title' => 'Cache Scope Series - Pilot One',
+        'subtitle' => 'Pilot',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.4.']],
+    ];
+    enrich($plugin, $method, $baseScopedSeed, $baseScopedSeedTmdb, $baseScopedCache);
+    assertSameValue('https://image.tmdb.org/t/p/original/cache-scope-1.jpg', $baseScopedSeed['icon'] ?? null, 'The seed must use the base-title fallback and validate S01E05.');
+
+    $baseScopedReplayTmdb = new CandidateTmdbService(
+        tvCandidates: $baseScopedCandidates,
+        tvDetails: [702 => normalizedTvDetailsFixture(702, 'Cache Scope Series', 'Second synthetic series.', null, 'https://image.tmdb.org/t/p/original/cache-scope-2.jpg')],
+        tvCandidatesByQuery: ['Cache Scope Series - Pilot Two' => []],
+        seasonDetails: [
+            '701:2' => ['episodes' => []],
+            '702:2' => ['episodes' => [['episode_number' => 5, 'name' => 'Pilot']]],
+        ],
+    );
+    $baseScopedReplay = [
+        'title' => 'Cache Scope Series - Pilot Two',
+        'subtitle' => 'Pilot',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '1.4.']],
+    ];
+    enrich($plugin, $method, $baseScopedReplay, $baseScopedReplayTmdb, $baseScopedCache);
+    assertSameValue('https://image.tmdb.org/t/p/original/cache-scope-2.jpg', $baseScopedReplay['icon'] ?? null, 'A different season/episode must validate independently instead of reusing the S01E05 base entry.');
+    assertSameValue(2, $baseScopedReplayTmdb->seasonRequests, 'A different season/episode base fallback must inspect the bounded tied candidates.');
+
+    foreach ([['Array'], (object) ['subtitle' => 'Array']] as $invalidSubtitle) {
+        $invalidSubtitleTmdb = new CandidateTmdbService(
+            tvCandidates: $ambiguousSeriesCandidates,
+            seasonDetails: [
+                '681:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Array']]],
+                '682:1' => ['episodes' => []],
+            ],
+        );
+        $invalidSubtitleProgramme = [
+            'title' => 'Twin Horizon',
+            'subtitle' => $invalidSubtitle,
+            'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.4.']],
+        ];
+        $invalidSubtitleBefore = $invalidSubtitleProgramme;
+        $invalidSubtitleCache = [];
+        enrich($plugin, $method, $invalidSubtitleProgramme, $invalidSubtitleTmdb, $invalidSubtitleCache);
+        assertSameValue($invalidSubtitleBefore, $invalidSubtitleProgramme, 'Untyped subtitle evidence must not select a tempting TMDB episode identity.');
+        assertSameValue([0, 0, 0], [$invalidSubtitleTmdb->tvDetailsRequests, $invalidSubtitleTmdb->movieDetailsRequests, $invalidSubtitleTmdb->seasonRequests], 'Untyped subtitle evidence must not request candidate details or season data.');
+    }
+
     foreach ([
         'ambiguous episode title' => [
             '681:1' => ['episodes' => [['episode_number' => 5, 'name' => 'Signal Fire']]],
