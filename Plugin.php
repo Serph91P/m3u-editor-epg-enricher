@@ -909,12 +909,34 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         $seriesBindings = $seriesEvidence['bindings'];
         $seriesEvidenceToken = $seriesEvidence['evidence'];
-        $stats = ['programmes_processed' => 0, 'programmes_updated' => 0, 'programmes_already_enriched' => 0, 'posters_added' => 0, 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
+        $bindingStats = ['programmes_updated' => 0, 'posters_added' => 0];
+        if ($seriesBindings !== []) {
+            $bindingResult = $this->applyFreshSeriesArtworkBindings(
+                $service,
+                $epg,
+                (string) $epgId,
+                $tmdbLanguage,
+                $targetChannels,
+                $context,
+                $seriesBindings,
+                $seriesEvidenceToken,
+                (bool) ($settings['enrich_posters'] ?? true),
+                (bool) ($settings['enrich_backdrops'] ?? true),
+            );
+            if ($bindingResult instanceof PluginActionResult) {
+                return $bindingResult;
+            }
+            $bindingStats = $bindingResult;
+        }
+        // Binding artwork is applied in a complete evidence-neutral guarded pass.
+        // Ordinary metadata writes below intentionally use the legacy conditional API:
+        // Core consumes evidence for those writes and must never receive a reused token.
+        $seriesBindings = [];
+        $seriesEvidenceToken = null;
+        $stats = ['programmes_processed' => 0, 'programmes_updated' => $bindingStats['programmes_updated'], 'programmes_already_enriched' => 0, 'posters_added' => $bindingStats['posters_added'], 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
         $afterId = 0;
         do {
-            $snapshot = $seriesBindings !== []
-                ? $service->guardedSnapshot($context, $epg, $afterId, 100, $seriesEvidenceToken)
-                : $service->snapshot($context, $epg, $afterId, 100);
+            $snapshot = $service->snapshot($context, $epg, $afterId, 100);
             if (($snapshot['status'] ?? null) !== 'ok') {
                 return PluginActionResult::failure('Could not read programme information.', $stats);
             }
@@ -931,11 +953,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
                 $pageStats['programmes_processed']++;
                 $result = $this->enrichProgrammeWithSettings($programme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
-                $seriesKey = $this->providerSeriesBindingKey($programme, (string) $epgId, $tmdbLanguage);
-                if ($seriesKey !== null && isset($seriesBindings[$seriesKey]) && $this->applyFreshSeriesArtworkBinding($programme, $seriesBindings[$seriesKey], (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true))) {
-                    $result['changed'] = true;
-                    $result['poster'] = true;
-                }
                 $pageStats['tmdb_lookups'] += $result['lookup'] ? 1 : 0;
                 $pageStats['tmdb_cache_hits'] += $result['cache_hit'] ? 1 : 0;
                 $changes = $this->canonicalHostChanges($row['programme'], $programme);
@@ -954,24 +971,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
                 $context->heartbeat($this->endUserProgressMessage('Saving updates', $progress));
                 $appliedPatches = $patches;
-                $apply = $seriesBindings !== []
-                    ? $service->guardedApply($context, $epg, $patches, $seriesEvidenceToken)
-                    : $service->apply($context, $epg, $patches);
+                $apply = $service->apply($context, $epg, $patches);
                 $status = $apply['status'] ?? 'unknown';
-                if ($seriesBindings !== [] && in_array($status, ['applied', 'noop'], true)) {
-                    if (is_string($apply['evidence'] ?? null) && trim($apply['evidence']) !== '') {
-                        $seriesEvidenceToken = $apply['evidence'];
-                    } else {
-                        // The host accepted this page but classified it as evidence-changing.
-                        // Continue ordinary per-row work without reusing the consumed proof.
-                        $seriesBindings = [];
-                        $seriesEvidenceToken = null;
-                    }
-                }
                 if ($status === 'stale') {
-                    if ($seriesBindings !== []) {
-                        return PluginActionResult::failure('Could not save programme updates.', $stats);
-                    }
                     if ($context->cancellationRequested()) {
                         return PluginActionResult::cancelled('Enrichment cancelled before checking programme details.', $stats);
                     }
@@ -1045,6 +1047,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $fresh = [];
+        // Persisted DTO caches are useful for ordinary per-row enrichment but can never
+        // prove a current binding. These invocation-local caches force one fresh
+        // candidate/episode/image validation and only deduplicate work within this pass.
+        $freshTmdbCache = [];
+        $freshTmdbSeasonCache = [];
+        $freshImagesCache = [];
         $checked = 0;
         $afterId = 0;
         $evidence = null;
@@ -1053,6 +1061,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
             }
             $snapshot = $service->guardedSnapshot($context, $epg, $afterId, 100, $evidence);
+            if (($snapshot['status'] ?? null) === 'unsupported' && $afterId === 0 && $evidence === null) {
+                return ['bindings' => [], 'evidence' => null];
+            }
             if (($snapshot['status'] ?? null) !== 'ok' || ! is_string($snapshot['evidence'] ?? null)) {
                 return PluginActionResult::failure('Could not read programme information.', []);
             }
@@ -1069,7 +1080,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if ((++$checked % 25) === 0) {
                     $context->heartbeat('Checking programme details and artwork.');
                 }
-                $result = $this->enrichProgrammeWithSettings($programme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
+                $result = $this->enrichProgrammeWithSettings($programme, $tmdb, $freshTmdbCache, $freshTmdbSeasonCache, $freshImagesCache, $settings, $epgId, $tmdbLanguage);
                 if (isset($result['fresh_series_binding']) && is_array($result['fresh_series_binding'])) {
                     $fresh[] = $result['fresh_series_binding'];
                 }
@@ -1079,6 +1090,64 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $bindings = $this->buildFreshSeriesBindings($fresh);
         return ['bindings' => $bindings, 'evidence' => $bindings === [] ? null : $evidence];
+    }
+
+    /** @return array{programmes_updated:int,posters_added:int}|PluginActionResult */
+    private function applyFreshSeriesArtworkBindings(object $service, Epg $epg, string $epgSourceId, string $tmdbLanguage, array $targetChannels, PluginExecutionContext $context, array $bindings, string $evidence, bool $enrichPosters, bool $enrichBackdrops): array|PluginActionResult
+    {
+        $afterId = 0;
+        $updated = 0;
+        $postersAdded = 0;
+        do {
+            if ($context->cancellationRequested()) {
+                return PluginActionResult::cancelled('Enrichment cancelled before saving series artwork.', ['programmes_updated' => $updated]);
+            }
+            $snapshot = $service->guardedSnapshot($context, $epg, $afterId, 100, $evidence);
+            if (($snapshot['status'] ?? null) !== 'ok') {
+                return PluginActionResult::failure('Could not read programme information.', ['programmes_updated' => $updated]);
+            }
+            $context->heartbeat('Applying validated series artwork.');
+            $patches = [];
+            foreach (($snapshot['programmes'] ?? []) as $row) {
+                if ($context->cancellationRequested()) {
+                    return PluginActionResult::cancelled('Enrichment cancelled before saving series artwork.', ['programmes_updated' => $updated]);
+                }
+                $programme = $row['programme'] ?? null;
+                if (! is_array($programme) || ! in_array($programme['channel'] ?? null, $targetChannels, true)) {
+                    continue;
+                }
+                $seriesKey = $this->providerSeriesBindingKey($programme, $epgSourceId, $tmdbLanguage);
+                if ($seriesKey === null || ! isset($bindings[$seriesKey])
+                    || ! $this->applyFreshSeriesArtworkBinding($programme, $bindings[$seriesKey], $enrichPosters, $enrichBackdrops)) {
+                    continue;
+                }
+                $changes = $this->canonicalHostChanges($row['programme'], $programme);
+                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images']) !== []) {
+                    continue;
+                }
+                $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
+            }
+            if ($patches !== []) {
+                $context->heartbeat('Saving validated series artwork.');
+                $apply = $service->guardedApply($context, $epg, $patches, $evidence);
+                $status = $apply['status'] ?? 'unknown';
+                if (! in_array($status, ['applied', 'noop'], true)) {
+                    return PluginActionResult::failure('Could not save programme updates.', ['programmes_updated' => $updated]);
+                }
+                if ($status === 'applied') {
+                    $updated += count($patches);
+                    $postersAdded += count($patches);
+                }
+                if (! is_string($apply['evidence'] ?? null) || trim($apply['evidence']) === '') {
+                    // The accepted batch consumed the proof. Do not reuse it on another page.
+                    break;
+                }
+                $evidence = $apply['evidence'];
+            }
+            $afterId = $snapshot['next'] ?? null;
+        } while ($afterId !== null);
+
+        return ['programmes_updated' => $updated, 'posters_added' => $postersAdded];
     }
 
     private function providerSeriesBindingKey(array $programme, string $epgSourceId, string $tmdbLanguage): ?string

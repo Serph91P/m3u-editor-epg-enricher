@@ -228,6 +228,7 @@ namespace App\Services {
         public int $pageSize = 1;
         public ?int $mutateBeforeGuardedSnapshot = null;
         public ?int $mutateBeforeGuardedApply = null;
+        public ?int $forceUnsupportedGuardedSnapshotAt = null;
         public ?string $forcedGuardedSnapshotStatus = null;
         public ?string $forcedGuardedApplyStatus = null;
         public bool $omitEvidence = false;
@@ -246,6 +247,7 @@ namespace App\Services {
             $call = count($this->guardedSnapshots) + 1;
             if ($this->mutateBeforeGuardedSnapshot === $call) { $this->generation++; }
             $this->guardedSnapshots[] = compact('afterId', 'limit', 'evidence');
+            if ($this->forceUnsupportedGuardedSnapshotAt === $call) { return ['status' => 'unsupported']; }
             if ($this->forcedGuardedSnapshotStatus !== null) { return ['status' => $this->forcedGuardedSnapshotStatus]; }
             if ($evidence !== null && $evidence !== $this->token()) { return ['status' => 'stale']; }
             $page = $this->page($afterId);
@@ -268,7 +270,10 @@ namespace App\Services {
             if ($evidence !== $this->token()) { return ['status' => 'stale']; }
             $this->applyPatches($patches);
             $this->generation++;
-            return $this->omitApplyEvidence
+            $evidenceNeutral = array_all($patches, static function (array $patch): bool {
+                return array_diff(array_keys($patch['changes'] ?? []), ['icon', 'images']) === [];
+            });
+            return $this->omitApplyEvidence || ! $evidenceNeutral
                 ? ['status' => 'applied']
                 : ['status' => 'applied', 'evidence' => $this->token()];
         }
@@ -421,6 +426,20 @@ namespace Tests {
         same(true, count($context->messages) >= 4, 'Both passes must emit visible heartbeats.');
     }
 
+    // Normal metadata writes consume evidence in Core. Binding artwork must therefore
+    // finish in evidence-neutral guarded batches before those writes begin.
+    $normalContext = new PluginExecutionContext();
+    $normalContext->settings['enrich_descriptions'] = true;
+    [$normalResult, $normalHost] = execute([seed(1), target(2)], context: $normalContext);
+    same(true, $normalResult->success, 'Normal metadata enrichment alongside a binding must succeed.');
+    same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($normalHost->records[2]['programme']), true), 'A later target must retain safe reuse after an earlier normal metadata write consumes evidence.');
+    same(true, count($normalHost->applies) >= 1, 'Evidence-changing metadata must use the ordinary conditional apply path after binding artwork is complete.');
+    foreach ($normalHost->guardedApplies as $guardedApply) {
+        foreach ($guardedApply['patches'] as $patch) {
+            same([], array_values(array_diff(array_keys($patch['changes']), ['icon', 'images'])), 'Guarded successor-token batches must contain artwork changes only.');
+        }
+    }
+
     // Unknown, square, or internally conflicting response geometry cannot become reusable portrait evidence.
     foreach ([
         'unknown' => ['file_path' => '/unknown.jpg', 'iso_639_1' => 'de'],
@@ -480,18 +499,29 @@ namespace Tests {
     same(true, $legacyResult->success, 'A host without the additive guard must retain safe ordinary per-row enrichment.');
     same(false, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($legacyHost->records[1]['programme']), true), 'An old host must fail closed for cross-row reuse.');
 
-    // A schema-valid cached lookup from an earlier invocation is not fresh match provenance.
+    // A persisted cache entry is not provenance, but a later invocation must be able to
+    // perform a fresh candidate/episode/image validation and establish new provenance.
     execute([seed(1)]);
-    [$cachedResult, $cachedHost] = execute([target(1), seed(2)], preserveCache: true);
+    [$cachedResult, $cachedHost, $cachedTmdb] = execute([target(1), seed(2)], preserveCache: true);
     same(true, $cachedResult->success, 'Cached per-row enrichment must remain usable.');
-    same(false, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($cachedHost->records[1]['programme']), true), 'A cached seed must not establish a fresh cross-row binding.');
+    same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($cachedHost->records[1]['programme']), true), 'A warm-cache invocation must establish a binding only after fresh revalidation.');
+    same(true, in_array(['tv-candidates', 'Atlas'], $cachedTmdb->calls, true), 'Warm-cache binding provenance must include a fresh candidate lookup.');
+    same(true, in_array(['season', 101, 1], $cachedTmdb->calls, true), 'Warm-cache binding provenance must include fresh episode validation.');
+    same(true, count(Http::$calls) >= 1, 'Warm-cache binding provenance must include a fresh selected-identity image response.');
 
     // Guard failures fail closed without a legacy retry or token laundering.
-    foreach (['busy', 'unsupported'] as $status) {
-        [$guardResult, $guardHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host) use ($status): void { $host->forcedGuardedSnapshotStatus = $status; });
-        same(false, $guardResult->success, "{$status} guarded snapshot must fail closed.");
-        same([], $guardHost->applies, "{$status} must not fall back to ordinary apply.");
-    }
+    [$busyResult, $busyHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host): void { $host->forcedGuardedSnapshotStatus = 'busy'; });
+    same(false, $busyResult->success, 'A busy guarded snapshot must fail closed.');
+    same([], $busyHost->applies, 'A busy guard must not fall back to ordinary apply.');
+
+    [$unsupportedResult, $unsupportedHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host): void { $host->forcedGuardedSnapshotStatus = 'unsupported'; });
+    same(true, $unsupportedResult->success, 'Initial unsupported capability must retain ordinary per-row enrichment.');
+    same([], $unsupportedHost->guardedApplies, 'An unsupported host must fail closed for cross-row reuse.');
+    same(false, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($unsupportedHost->records[1]['programme']), true), 'Unsupported capability must not propagate a provider binding.');
+
+    [$midUnsupportedResult, $midUnsupportedHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host): void { $host->forceUnsupportedGuardedSnapshotAt = 2; });
+    same(false, $midUnsupportedResult->success, 'Unsupported capability after the census starts must fail closed.');
+    same([], $midUnsupportedHost->guardedApplies, 'Mid-census unsupported capability must not apply or fall back.');
     [$missingTokenResult, $missingTokenHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host): void { $host->omitEvidence = true; });
     same(false, $missingTokenResult->success, 'A guarded snapshot without a token must fail closed.');
     same([], $missingTokenHost->applies, 'A missing token must not reach apply.');
@@ -500,11 +530,11 @@ namespace Tests {
     same(false, $driftResult->success, 'Drift between the evidence pass and apply traversal must fail closed.');
     same([], $driftHost->guardedApplies, 'Snapshot drift must prevent guarded apply.');
 
-    [$lateStaleResult, $lateStaleHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host): void { $host->mutateBeforeGuardedApply = 2; });
+    [$lateStaleResult, $lateStaleHost] = execute([target(1), target(2), seed(3)], function (EpgCacheEnrichmentService $host): void { $host->mutateBeforeGuardedApply = 2; });
     same(false, $lateStaleResult->success, 'A later guarded apply becoming stale must fail without retrying against refreshed evidence.');
     same(2, count($lateStaleHost->guardedApplies), 'The stale guarded page must be attempted once only.');
     same([], $lateStaleHost->applies, 'A guarded stale result must never fall back to unguarded apply.');
-    same('source-1:g2', $lateStaleHost->guardedSnapshots[3]['evidence'] ?? null, 'An artwork-only accepted batch must roll its evidence-neutral successor token into the next page.');
+    same('source-1:g2', $lateStaleHost->guardedSnapshots[4]['evidence'] ?? null, 'An artwork-only accepted batch must roll its evidence-neutral successor token into the next page.');
 
     [$consumedResult, $consumedHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host): void { $host->omitApplyEvidence = true; });
     same(true, $consumedResult->success, 'An accepted evidence-changing batch must continue safe ordinary per-row enrichment.');
