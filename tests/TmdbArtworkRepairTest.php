@@ -1663,6 +1663,42 @@ namespace Tests {
     assertSameValue(1, $baresTmdb->tvSearches, 'The exact Unicode title should resolve through the TV artwork path.');
     assertSameValue(0, $baresTmdb->movieSearches, 'Strong episodic evidence should not search movies.');
 
+    $logoProgramme = [
+        'title' => 'Bares für Rares',
+        'subtitle' => 'Ein außergewöhnliches Fundstück',
+        'episode_num' => '0.0',
+        'desc' => 'Horst Lichter begrüßt Menschen, die seltene Fundstücke und Antiquitäten von Experten schätzen lassen.',
+        'category' => 'Series',
+    ];
+    $logoCache = [];
+    $logoImagesCache = [];
+    $logoTmdb = new TmdbService('bares');
+    $priorApiKey = $GLOBALS['tmdbTestSettings']->tmdb_api_key;
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
+    Http::$responses[] = new FakeHttpResponse(true, [
+        'posters' => [],
+        'backdrops' => [],
+        'logos' => [[
+            'file_path' => '/bares-logo.png',
+            'aspect_ratio' => 2.5,
+            'iso_639_1' => 'de',
+            'vote_average' => 6.0,
+        ]],
+    ]);
+    set_error_handler(static function (int $severity, string $message, string $file, int $line): never {
+        throw new \ErrorException($message, 0, $severity, $file, $line);
+    });
+    try {
+        enrich($plugin, $method, $logoProgramme, $logoTmdb, $logoCache, imagesCache: $logoImagesCache);
+    } finally {
+        restore_error_handler();
+        $GLOBALS['tmdbTestSettings']->tmdb_api_key = $priorApiKey;
+    }
+    assertTrueValue(
+        in_array('https://image.tmdb.org/t/p/w500/bares-logo.png', array_column($logoProgramme['images'], 'url'), true),
+        'A fresh TMDB logo must survive enrichment without being treated as reusable poster/backdrop artwork.'
+    );
+
     $ghostsCache = [];
     $ghostsTmdb = new TmdbService('ghosts');
     foreach ([

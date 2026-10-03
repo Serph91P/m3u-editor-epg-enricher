@@ -1732,7 +1732,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                             continue;
                         }
 
-                        if ($freshSeriesArtwork[$img['type']] === null && in_array($img['type'], ['poster', 'backdrop'], true)
+                        if (in_array($img['type'], ['poster', 'backdrop'], true)
+                            && $freshSeriesArtwork[$img['type']] === null
                             && $this->isReusableSeriesArtwork($img, $img['type'])) {
                             $freshSeriesArtwork[$img['type']] = $img;
                         }
