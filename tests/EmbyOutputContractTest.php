@@ -18,6 +18,7 @@ namespace Tests {
     require_once __DIR__.'/../Plugin.php';
     use App\Plugins\Support\PluginExecutionContext; use App\Services\{EpgCacheEnrichmentService, EpgCacheService, TmdbService}; use App\Settings\GeneralSettings; use AppLocalPlugins\EpgEnricher\Plugin; use ReflectionMethod;
     function same(mixed $e, mixed $a, string $m): void { if ($e !== $a) { fwrite(STDERR, "$m\nExpected: ".var_export($e, true)."\nActual: ".var_export($a, true)."\n"); exit(1); } }
+    function applyHostPatch(array $programme, array $changes): array { $imagesAppend = $changes['images_append'] ?? []; unset($changes['images_append']); $programme = array_replace($programme, $changes); foreach ($imagesAppend as $image) { if (! in_array($image, $programme['images'] ?? [], true)) { $programme['images'][] = $image; } } return $programme; }
     function execute(array $outcomes): array { $host = new EpgCacheEnrichmentService(); $host->outcomes = $outcomes; $GLOBALS['outputServices'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => new TmdbService(), GeneralSettings::class => new GeneralSettings()]; $context = new PluginExecutionContext(); $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true); return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context]; }
     // Replaces the prior post-enrichment XMLTV-cache assertions.  The host owns
     // serialization now, so publication is observed at its conditional-apply boundary.
@@ -50,6 +51,22 @@ namespace Tests {
     same(['P', 'L', 'L', 'L'], array_column($changes['images'] ?? [], 'orient'), 'Artwork orientations must remain role-specific.');
     same([10, 20, 30, 40], array_column($changes['images'] ?? [], 'size'), 'Artwork sizes must survive canonical serialization.');
     same(false, isset($changes['icon']), 'An unchanged generic icon must not be overwritten by artwork roles.');
+    $newPoster = ['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10];
+    foreach ([
+        'dimensioned untyped' => ['url' => 'https://source.invalid/untyped.jpg', 'width' => 1280, 'height' => 720],
+        'untyped without dimensions' => ['url' => 'https://source.invalid/untyped-without-dimensions.jpg'],
+        'untyped null dimensions' => ['url' => 'https://source.invalid/untyped-null-dimensions.jpg', 'width' => null, 'height' => null],
+        'typed non-numeric dimensions' => ['url' => 'https://source.invalid/typed-non-numeric.jpg', 'type' => 'poster', 'width' => 'wide', 'height' => 'tall'],
+        'typed non-positive dimensions' => ['url' => 'https://source.invalid/typed-non-positive.jpg', 'type' => 'poster', 'width' => 0, 'height' => -1],
+        'unknown role' => ['url' => 'https://source.invalid/unknown-role.jpg', 'type' => 'legacy', 'width' => 1280, 'height' => 720],
+    ] as $shape => $legacyImage) {
+        $untypedBefore = ['images' => [$legacyImage]];
+        $untypedAfter = ['images' => [$legacyImage, $newPoster]];
+        $untypedChanges = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(new Plugin(), $untypedBefore, $untypedAfter);
+        same([$newPoster], $untypedChanges['images_append'] ?? null, "A host patch must append a validated poster while preserving {$shape} untyped source artwork.");
+        same(false, isset($untypedChanges['images']), "A host patch must not replace {$shape} untyped source artwork.");
+        same([$legacyImage, $newPoster], applyHostPatch($untypedBefore, $untypedChanges)['images'], "A fake host apply must retain {$shape} untyped source artwork and persist the validated poster.");
+    }
     $trustedLandscape = new ReflectionMethod(Plugin::class, 'hasTrustedLandscapeIcon');
     $trustedLandscape->setAccessible(true);
     foreach (['fanart', 'banner'] as $canonicalRole) {

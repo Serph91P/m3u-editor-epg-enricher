@@ -144,10 +144,18 @@ namespace Tests {
     assertSameValue(1, count($host->applies), 'A changed canonical programme must be conditionally applied once.');
     assertSameValue('completed', $result->status, 'Only an accepted host apply may report enrichment success.');
     assertSameValue(1, $result->data['programmes_updated'] ?? null, 'Accepted apply must count the changed programme.');
+    assertSameValue(0, $result->data['posters_added'] ?? null, 'An applied patch without a new poster must not increment the poster counter.');
     assertSameValue(1, $host->applies[0]['patches'][0]['id'] ?? null, 'Patch must preserve the host programme id.');
     assertSameValue('hash-stable', $host->applies[0]['patches'][0]['hash'] ?? null, 'Patch must preserve the host programme hash.');
     assertSameValue('Sports', $host->applies[0]['patches'][0]['changes']['category'] ?? null, 'Canonical patch must carry the enriched category.');
     assertSameValue(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], $context->messages, 'The evidence and apply passes must emit end-user heartbeats without host internals.');
+
+    [$noopResult, $noopHost] = runFixture(['noop']);
+    assertSameValue('completed', $noopResult->status, 'A host no-op remains a completed scan.');
+    assertSameValue(0, $noopResult->data['programmes_updated'] ?? null, 'A host no-op must not count a programme update.');
+    assertSameValue(0, $noopResult->data['categories_added'] ?? null, 'A host no-op must not claim an unsaved category update.');
+    assertSameValue(0, $noopResult->data['posters_added'] ?? null, 'A host no-op must not claim an unsaved artwork update.');
+    assertSameValue(1, count($noopHost->applies), 'A host no-op must still observe the host apply boundary.');
 
     [$pagedResult, $pagedHost] = runFixture(['applied', 'applied'], [], PHP_INT_MAX, [
         ['programmes' => [['id' => 1, 'hash' => 'page-1', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => 1],
@@ -166,10 +174,12 @@ namespace Tests {
     assertSameValue(3, count($staleHost->snapshots), 'A stale page must be re-read exactly once after the bounded evidence pass.');
     assertSameValue(2, count($staleHost->applies), 'A stale page must be retried exactly once.');
     assertSameValue(1, $staleResult->data['programmes_updated'] ?? null, 'Only the accepted retry counts as an update.');
+    assertSameValue(0, $staleResult->data['posters_added'] ?? null, 'A stale first attempt and accepted retry without a new poster must not increment the poster counter.');
 
     [$legacyResult, $legacyHost] = runFixture(['legacy_cache_read_only']);
     assertSameValue(false, $legacyResult->success, 'Legacy cache read-only outcome must not claim success.');
     assertSameValue(0, $legacyResult->data['programmes_updated'] ?? 0, 'Rejected host apply must not count an update.');
+    assertSameValue(0, $legacyResult->data['posters_added'] ?? 0, 'Rejected host apply must not count a poster.');
     assertSameValue(1, count($legacyHost->applies), 'Legacy outcome must not use a direct-storage fallback.');
 
     foreach ([
@@ -181,6 +191,7 @@ namespace Tests {
         [$rejectedResult, $rejectedHost] = runFixture($statuses);
         assertSameValue(false, $rejectedResult->success, "{$status} must not claim success.");
         assertSameValue(0, $rejectedResult->data['programmes_updated'] ?? 0, "{$status} must not count updates.");
+        assertSameValue(0, $rejectedResult->data['posters_added'] ?? 0, "{$status} must not count posters.");
         assertSameValue(1, count($rejectedHost->applies), "{$status} must stop at the host boundary.");
     }
 

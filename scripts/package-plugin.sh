@@ -11,20 +11,26 @@ mkdir -p "$DIST_DIR"
 cd "$ROOT_DIR"
 rm -f "$ARCHIVE_PATH" "$ARCHIVE_PATH.sha256"
 
-zip -r "$ARCHIVE_PATH" . \
-  -x '.git' \
-  -x '.git/*' \
-  -x '.gitignore' \
-  -x '.github/*' \
-  -x '.hermes/*' \
-  -x 'dist/*' \
-  -x 'tests/*' \
-  -x 'scripts/*' \
-  -x 'README.md' \
-  -x 'AGENTS.md' \
-  -x 'CLAUDE.md' \
-  -x '.DS_Store' \
-  -x '._*'
+if command -v zip >/dev/null 2>&1; then
+  zip -r "$ARCHIVE_PATH" . \
+    -x '.git' \
+    -x '.git/*' \
+    -x '.gitignore' \
+    -x '.github/*' \
+    -x '.hermes/*' \
+    -x '.serena' \
+    -x '.serena/*' \
+    -x 'dist/*' \
+    -x 'tests/*' \
+    -x 'scripts/*' \
+    -x 'README.md' \
+    -x 'AGENTS.md' \
+    -x 'CLAUDE.md' \
+    -x '.DS_Store' \
+    -x '._*'
+else
+  php "$ROOT_DIR/scripts/package-plugin-fallback.php" "$ARCHIVE_PATH"
+fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum "$ARCHIVE_PATH" | awk '{print $1}' > "$ARCHIVE_PATH.sha256"

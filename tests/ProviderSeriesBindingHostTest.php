@@ -154,11 +154,16 @@ namespace App\Services {
     {
         protected string $language = '';
         public array $calls = [];
+        public int $atlasSearchMissesRemaining = 0;
         public function isConfigured(): bool { return true; }
 
         public function searchTvSeriesCandidates(string $name, ?int $year = null, int $limit = 5): array
         {
             $this->calls[] = ['tv-candidates', $name];
+            if ($name === 'Atlas' && $this->atlasSearchMissesRemaining > 0) {
+                $this->atlasSearchMissesRemaining--;
+                return [];
+            }
             return match ($name) {
                 'Atlas' => [$this->candidate(101, 'Atlas'), $this->candidate(102, 'Atlas')],
                 'Conflict One' => [$this->candidate(201, 'Conflict One'), $this->candidate(211, 'Conflict One')],
@@ -224,6 +229,7 @@ namespace App\Services {
         public array $guardedApplies = [];
         public array $snapshots = [];
         public array $applies = [];
+        public array $applyStatuses = [];
         public int $generation = 1;
         public int $pageSize = 1;
         public ?int $mutateBeforeGuardedSnapshot = null;
@@ -256,9 +262,12 @@ namespace App\Services {
 
         public function apply(object $context, object $epg, array $patches): array
         {
-            $this->applies[] = compact('patches');
-            $this->applyPatches($patches);
-            return ['status' => 'applied'];
+            $status = array_shift($this->applyStatuses) ?? 'applied';
+            $this->applies[] = compact('patches', 'status');
+            if ($status === 'applied') {
+                $this->applyPatches($patches);
+            }
+            return ['status' => $status];
         }
 
         public function guardedApply(object $context, object $epg, array $patches, string $evidence): array
@@ -271,7 +280,7 @@ namespace App\Services {
             $this->applyPatches($patches);
             $this->generation++;
             $evidenceNeutral = array_all($patches, static function (array $patch): bool {
-                return array_diff(array_keys($patch['changes'] ?? []), ['icon', 'images']) === [];
+                return array_diff(array_keys($patch['changes'] ?? []), ['icon', 'images', 'images_append']) === [];
             });
             return $this->omitApplyEvidence || ! $evidenceNeutral
                 ? ['status' => 'applied']
@@ -294,7 +303,15 @@ namespace App\Services {
             foreach ($patches as $patch) {
                 $id = (int) $patch['id'];
                 if (! isset($this->records[$id]) || $this->records[$id]['hash'] !== $patch['hash']) { continue; }
-                $this->records[$id]['programme'] = array_replace($this->records[$id]['programme'], $patch['changes']);
+                $changes = $patch['changes'];
+                $imagesAppend = $changes['images_append'] ?? [];
+                unset($changes['images_append']);
+                $this->records[$id]['programme'] = array_replace($this->records[$id]['programme'], $changes);
+                foreach ($imagesAppend as $image) {
+                    if (! in_array($image, $this->records[$id]['programme']['images'] ?? [], true)) {
+                        $this->records[$id]['programme']['images'][] = $image;
+                    }
+                }
                 $this->records[$id]['hash'] = 'applied-'.$id.'-'.$this->generation;
             }
         }
@@ -426,6 +443,22 @@ namespace Tests {
         same(true, count($context->messages) >= 4, 'Both passes must emit visible heartbeats.');
     }
 
+    $untypedTarget = target();
+    $legacyImage = ['url' => 'https://provider.invalid/legacy-untyped.jpg'];
+    $untypedTarget['programme']['images'] = [$legacyImage];
+    unset($untypedTarget['programme']['icon']);
+    [$untypedResult, $untypedHost] = execute([$untypedTarget, seed(2)]);
+    same(true, $untypedResult->success, 'A fresh binding with untyped source artwork must complete through the guarded host path.');
+    same(2, $untypedResult->data['posters_added'] ?? null, 'Only applied patches that actually contain posters may contribute to the run-wide poster count.');
+    same(true, in_array($legacyImage, $untypedHost->records[1]['programme']['images'], true), 'A fresh binding must retain the untyped source object unchanged.');
+    same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($untypedHost->records[1]['programme']), true), 'A fresh binding must persist validated poster artwork alongside untyped source artwork.');
+    same(true, array_any($untypedHost->guardedApplies, static fn (array $apply): bool => array_any($apply['patches'], static fn (array $patch): bool => isset($patch['changes']['images_append']))), 'Fresh bindings must submit append-only artwork patches instead of dropping them at the host boundary.');
+
+    $backdropOnlyContext = new PluginExecutionContext();
+    $backdropOnlyContext->settings['enrich_posters'] = false;
+    [$backdropOnlyResult] = execute([target(1), seed(2)], context: $backdropOnlyContext);
+    same(0, $backdropOnlyResult->data['posters_added'] ?? null, 'An applied fresh-binding patch containing only backdrop artwork must not count as a poster.');
+
     // Normal metadata writes consume evidence in Core. Binding artwork must therefore
     // finish in evidence-neutral guarded batches before those writes begin.
     $normalContext = new PluginExecutionContext();
@@ -539,7 +572,57 @@ namespace Tests {
     [$consumedResult, $consumedHost] = execute([target(1), seed(2)], function (EpgCacheEnrichmentService $host): void { $host->omitApplyEvidence = true; });
     same(true, $consumedResult->success, 'An accepted evidence-changing batch must continue safe ordinary per-row enrichment.');
     same(1, count($consumedHost->guardedApplies), 'A consumed evidence token must never be reused on a later page.');
-    same(1, count($consumedHost->applies), 'After token consumption, later pages must use ordinary conditional apply without cross-row reuse.');
+    same(1, count($consumedHost->applies), 'After token consumption, the later page must use ordinary conditional apply without re-queuing its successful provider match.');
+
+    // Exercise cache replay through the complete doEnrich flow. Row 1 misses before
+    // row 3 establishes the same source-bound cache identity; unrelated row 2 stays a miss.
+    $cacheReplayIdentity = static fn (int $id): array => row($id, [
+        'channel' => 'target', 'title' => 'Atlas', 'subtitle' => 'Seed Episode',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.1.'], seriesId()],
+        'images' => [],
+    ]);
+    $cacheReplayRows = [
+        $cacheReplayIdentity(1),
+        row(2, [
+            'channel' => 'target', 'title' => 'Unknown Programme', 'subtitle' => 'Unknown Episode',
+            'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.1.'], seriesId('gracenote:SH000000020000')],
+            'images' => [],
+        ]),
+        $cacheReplayIdentity(3),
+    ];
+    $runCacheReplay = static function (array $statuses) use ($cacheReplayRows): array {
+        return execute($cacheReplayRows, function (EpgCacheEnrichmentService $host) use ($statuses): void {
+            $host->forceUnsupportedGuardedSnapshotAt = 1;
+            $host->applyStatuses = $statuses;
+            $GLOBALS['bindingHostServices'][TmdbService::class]->atlasSearchMissesRemaining = 1;
+        });
+    };
+
+    [$replayApplied, $replayAppliedHost, $replayAppliedTmdb] = $runCacheReplay(['applied', 'applied']);
+    same(true, $replayApplied->success, 'A cache hit discovered after the forward page must be repaired by one bounded replay.');
+    same([[3], [1]], array_map(static fn (array $apply): array => array_column($apply['patches'], 'id'), $replayAppliedHost->applies), 'Only the later identity match and the exact earlier cache-miss ID may be applied.');
+    same(2, $replayApplied->data['programmes_updated'] ?? null, 'Only the seed write and the successfully applied replay repair may increment the update counter.');
+    same([0, 1, 2, 0, 1, 2], array_column($replayAppliedHost->snapshots, 'afterId'), 'Forward and replay traversals must each paginate once to completion.');
+    same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($replayAppliedHost->records[1]['programme']), true), 'The replay cache hit must repair the earlier source-bound row.');
+    same([], imageUrls($replayAppliedHost->records[2]['programme']), 'An unrelated replay cache miss must remain unchanged.');
+    same(2, count(array_filter($replayAppliedTmdb->calls, static fn (array $call): bool => $call === ['tv-candidates', 'Atlas'])), 'Replay must not add a third provider candidate request for the repaired identity.');
+    same(1, count(array_filter($replayAppliedTmdb->calls, static fn (array $call): bool => $call === ['tv-candidates', 'Unknown Programme'])), 'Replay must not repeat a provider request for a cache miss.');
+
+    foreach ([
+        'noop' => [true, 1],
+        'stale' => [false, 1],
+        'failed' => [false, 1],
+    ] as $replayStatus => [$expectedSuccess, $expectedUpdated]) {
+        [$replayResult, $replayHost, $replayTmdb] = $runCacheReplay(['applied', $replayStatus]);
+        same($expectedSuccess, $replayResult->success, "A {$replayStatus} replay result must retain the documented fail-closed outcome.");
+        same($expectedUpdated, $replayResult->data['programmes_updated'] ?? null, "A {$replayStatus} replay result must count only applied patches.");
+        same(2, count($replayHost->applies), "A {$replayStatus} replay result must be attempted once without an unguarded retry loop.");
+        $expectedSnapshots = $replayStatus === 'noop' ? [0, 1, 2, 0, 1, 2] : [0, 1, 2, 0];
+        same($expectedSnapshots, array_column($replayHost->snapshots, 'afterId'), "A {$replayStatus} replay result must terminate without restarting a replay traversal.");
+        same([], $replayHost->guardedApplies, "A {$replayStatus} ordinary replay must not reuse a guarded evidence token.");
+        same(false, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($replayHost->records[1]['programme']), true), "A {$replayStatus} replay must not claim an unapplied repair.");
+        same(2, count(array_filter($replayTmdb->calls, static fn (array $call): bool => $call === ['tv-candidates', 'Atlas'])), "A {$replayStatus} replay must issue no additional provider request.");
+    }
 
     $cancelContext = new PluginExecutionContext();
     $cancelContext->cancelAfterChecks = 3;

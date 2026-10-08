@@ -445,6 +445,7 @@ namespace App\Services {
             private array $movieCandidatesByQuery = [],
             private array $seasonDetails = [],
             private bool $throwOnSeasonDetails = false,
+            private bool $throwOnMovieDetails = false,
         ) {
             parent::__construct('candidate-api');
         }
@@ -487,6 +488,9 @@ namespace App\Services {
         public function getMovieDetails(int $tmdbId): ?array
         {
             $this->movieDetailsRequests++;
+            if ($this->throwOnMovieDetails) {
+                throw new \RuntimeException('synthetic movie details failure');
+            }
 
             return $this->movieDetails[$tmdbId] ?? null;
         }
@@ -559,6 +563,11 @@ namespace Tests {
         bool $overwrite = false,
         bool $mapGenresToEpgCategories = false,
         bool $mapGenresToKodiGuideGenres = false,
+        bool $keywordDetection = false,
+        bool $enrichPosters = true,
+        bool $enrichBackdrops = true,
+        bool $allowProviderLookup = true,
+        bool $overwriteArtwork = false,
     ): array
     {
         $seasonCache ??= [];
@@ -571,15 +580,17 @@ namespace Tests {
             $overwrite,
             true,
             true,
-            true,
-            true,
+            $enrichPosters,
+            $enrichBackdrops,
             $mapGenresToEpgCategories,
             $mapGenresToKodiGuideGenres,
-            false,
+            $keywordDetection,
             $enrichEpisodeDetails,
             &$seasonCache,
             &$imagesCache,
             $lookupContext,
+            $allowProviderLookup,
+            $overwriteArtwork,
         ]);
     }
 
@@ -662,6 +673,34 @@ namespace Tests {
     $sanitizeTmdbCacheMethod->setAccessible(true);
     $detectSeriesSignalsMethod = $reflection->getMethod('detectSeriesSignals');
     $detectSeriesSignalsMethod->setAccessible(true);
+    $canonicalHostChangesMethod = $reflection->getMethod('canonicalHostChanges');
+    $canonicalHostChangesMethod->setAccessible(true);
+    $patchAddsPosterMethod = $reflection->getMethod('patchAddsPoster');
+    $patchAddsPosterMethod->setAccessible(true);
+
+    $expectedLogicVersion = '2026.10.08-separate-artwork-overwrite';
+    $currentLogicVersion = $reflection->getConstant('ENRICHMENT_LOGIC_VERSION');
+    assertSameValue($expectedLogicVersion, $currentLogicVersion, 'Separate artwork overwrite must bump the enrichment logic version.');
+    $settingsHasher = $reflection->getMethod('computeSettingsHash');
+    $settingsHasher->setAccessible(true);
+    $legacySettingsHash = md5(json_encode([
+        'logic_version' => '2026.10.02-provider-series-provenance',
+        'enrich_from_tmdb' => true,
+        'overwrite_existing' => false,
+        'enrich_categories' => true,
+        'enrich_descriptions' => true,
+        'enrich_posters' => true,
+        'enrich_backdrops' => true,
+        'map_genres_to_epg_categories' => false,
+        'map_genres_to_kodi_guide_genres' => false,
+        'keyword_category_detection' => true,
+        'enrich_episode_details' => true,
+        'tmdb_language' => '',
+    ]));
+    assertTrueValue(
+        $settingsHasher->invoke($plugin, []) !== $legacySettingsHash,
+        'The logic-version bump must invalidate settings hashes produced before News/Sports artwork matching changed.'
+    );
 
     assertSameValue(
         [
@@ -679,6 +718,244 @@ namespace Tests {
         ]),
         'A trailing-dot XMLTV NS value should resolve its zero-based season and episode.'
     );
+
+    $keywordNewsDetails = normalizedTvDetailsFixture(
+        700,
+        'Harbor News',
+        'A synthetic newsroom programme with validated artwork.',
+        'https://image.tmdb.org/t/p/w500/harbor-news-poster.jpg',
+        'https://image.tmdb.org/t/p/original/harbor-news-backdrop.jpg',
+    );
+    $keywordNewsTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 700,
+            'name' => 'Harbor News',
+            'original_name' => 'Harbor News',
+            'first_air_date' => '2024-01-01',
+            'overview' => 'A synthetic newsroom programme with validated artwork.',
+        ]],
+        tvDetails: [700 => $keywordNewsDetails],
+    );
+    $keywordNewsProgramme = [
+        'title' => 'Harbor News',
+        'desc' => 'A synthetic newsroom programme with validated artwork.',
+    ];
+    $keywordNewsCache = [];
+    $keywordNewsResult = enrich(
+        $plugin,
+        $method,
+        $keywordNewsProgramme,
+        $keywordNewsTmdb,
+        $keywordNewsCache,
+        mapGenresToEpgCategories: true,
+        keywordDetection: true,
+    );
+    assertSameValue('News', $keywordNewsProgramme['category'] ?? null, 'Keyword detection must retain its news category before artwork matching.');
+    assertSameValue(
+        'https://image.tmdb.org/t/p/original/harbor-news-backdrop.jpg',
+        $keywordNewsProgramme['icon'] ?? null,
+        'A news keyword must not suppress a separately validated artwork match when requested roles are missing.'
+    );
+    assertSameValue(true, $keywordNewsResult['lookup'] ?? null, 'Missing news artwork should make one bounded validated lookup.');
+    assertSameValue([1, 1], [$keywordNewsTmdb->tvCandidateSearches, $keywordNewsTmdb->movieCandidateSearches], 'News artwork matching must retain one bounded search per eligible media type.');
+
+    $sourcePoster = [
+        'url' => 'https://provider.invalid/harbor-news-poster.jpg',
+        'type' => 'poster',
+        'orient' => 'P',
+        'width' => 500,
+        'height' => 750,
+        'source' => 'provider',
+        'scope' => 'programme',
+    ];
+    $sourceBackdrop = [
+        'url' => 'https://provider.invalid/harbor-news-backdrop.jpg',
+        'type' => 'backdrop',
+        'orient' => 'L',
+        'width' => 1920,
+        'height' => 1080,
+        'source' => 'provider',
+        'scope' => 'programme',
+    ];
+    $sourceUntyped = [
+        'url' => 'https://provider.invalid/harbor-news-untyped.jpg',
+        'width' => 1280,
+        'height' => 720,
+    ];
+    $existingCanonicalPoster = [
+        'url' => 'https://provider.invalid/existing-poster.jpg',
+        'type' => 'poster',
+        'width' => 500,
+        'height' => 750,
+        'orient' => 'P',
+        'size' => 1,
+    ];
+    $newCanonicalFanart = [
+        'url' => 'https://provider.invalid/new-fanart.jpg',
+        'type' => 'fanart',
+        'width' => 1920,
+        'height' => 1080,
+        'orient' => 'L',
+        'size' => 1,
+    ];
+    assertSameValue(
+        false,
+        $patchAddsPosterMethod->invoke($plugin, ['images' => [$existingCanonicalPoster]], ['images' => [$existingCanonicalPoster, $newCanonicalFanart]]),
+        'Replacing an image list to add only fanart must not count its unchanged poster as newly persisted.'
+    );
+    assertSameValue(
+        true,
+        $patchAddsPosterMethod->invoke($plugin, ['images' => []], ['images' => [$existingCanonicalPoster]]),
+        'A replacement that actually introduces a poster must count the newly persisted poster role.'
+    );
+
+    $untypedMatchProgramme = [
+        'title' => 'Harbor News',
+        'desc' => 'A synthetic newsroom programme with validated artwork.',
+        'images' => [$sourceUntyped],
+    ];
+    $untypedMatchBefore = $untypedMatchProgramme;
+    $untypedMatchCache = [];
+    enrich($plugin, $method, $untypedMatchProgramme, clone $keywordNewsTmdb, $untypedMatchCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertTrueValue(in_array($sourceUntyped, $untypedMatchProgramme['images'] ?? [], true), 'A validated News match must retain untyped source artwork in its local candidate.');
+    assertSameValue(
+        null,
+        $canonicalHostChangesMethod->invoke($plugin, $untypedMatchBefore, $untypedMatchProgramme)['images'] ?? null,
+        'A validated News match must omit an images replacement when the host cannot serialize pre-existing untyped artwork.'
+    );
+
+    $posterMissingProgramme = [
+        'title' => 'Harbor News',
+        'desc' => 'A synthetic newsroom programme with validated artwork.',
+        'icon' => $sourceBackdrop['url'],
+        'images' => [$sourceBackdrop],
+    ];
+    $posterMissingTmdb = clone $keywordNewsTmdb;
+    $posterMissingTmdb->tvCandidateSearches = 0;
+    $posterMissingTmdb->movieCandidateSearches = 0;
+    $posterMissingCache = [];
+    $posterMissingResult = enrich($plugin, $method, $posterMissingProgramme, $posterMissingTmdb, $posterMissingCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertSameValue('News', $posterMissingProgramme['category'] ?? null, 'Poster-only repair must retain the detected news category.');
+    assertSameValue($sourceBackdrop['url'], $posterMissingProgramme['icon'] ?? null, 'Poster-only repair must preserve the source-owned backdrop.');
+    assertTrueValue(in_array($sourceBackdrop['url'], array_column($posterMissingProgramme['images'] ?? [], 'url'), true), 'Poster-only repair must preserve the source-owned backdrop image.');
+    assertTrueValue(in_array('https://image.tmdb.org/t/p/w500/harbor-news-poster.jpg', array_column($posterMissingProgramme['images'] ?? [], 'url'), true), 'Poster-only repair must add the validated missing poster.');
+    assertSameValue(true, $posterMissingResult['lookup'] ?? null, 'Poster-only repair should use one bounded lookup.');
+    assertSameValue([1, 1], [$posterMissingTmdb->tvCandidateSearches, $posterMissingTmdb->movieCandidateSearches], 'Poster-only repair must add exactly one bounded search per eligible media type.');
+
+    $backdropMissingProgramme = [
+        'title' => 'Harbor News',
+        'desc' => 'A synthetic newsroom programme with validated artwork.',
+        'images' => [$sourcePoster],
+    ];
+    $backdropMissingTmdb = clone $keywordNewsTmdb;
+    $backdropMissingTmdb->tvCandidateSearches = 0;
+    $backdropMissingTmdb->movieCandidateSearches = 0;
+    $backdropMissingCache = [];
+    $backdropMissingResult = enrich($plugin, $method, $backdropMissingProgramme, $backdropMissingTmdb, $backdropMissingCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertSameValue('News', $backdropMissingProgramme['category'] ?? null, 'Backdrop-only repair must retain the detected news category.');
+    assertTrueValue(in_array($sourcePoster['url'], array_column($backdropMissingProgramme['images'] ?? [], 'url'), true), 'Backdrop-only repair must preserve the source-owned poster.');
+    assertSameValue('https://image.tmdb.org/t/p/original/harbor-news-backdrop.jpg', $backdropMissingProgramme['icon'] ?? null, 'Backdrop-only repair must add the validated missing backdrop.');
+    assertSameValue(true, $backdropMissingResult['lookup'] ?? null, 'Backdrop-only repair should use one bounded lookup.');
+    assertSameValue([1, 1], [$backdropMissingTmdb->tvCandidateSearches, $backdropMissingTmdb->movieCandidateSearches], 'Backdrop-only repair must add exactly one bounded search per eligible media type.');
+
+    $completeNewsProgramme = [
+        'title' => 'Harbor News',
+        'icon' => $sourceBackdrop['url'],
+        'images' => [$sourceBackdrop, $sourcePoster],
+    ];
+    $completeNewsTmdb = new CandidateTmdbService();
+    $completeNewsCache = [];
+    $completeNewsBefore = $completeNewsProgramme;
+    $completeNewsResult = enrich($plugin, $method, $completeNewsProgramme, $completeNewsTmdb, $completeNewsCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertSameValue('News', $completeNewsProgramme['category'] ?? null, 'Complete news artwork must retain the detected category.');
+    assertSameValue($completeNewsBefore['icon'], $completeNewsProgramme['icon'] ?? null, 'Complete news artwork must preserve the source-owned icon.');
+    assertSameValue($completeNewsBefore['images'], $completeNewsProgramme['images'] ?? null, 'Complete news artwork must preserve all source-owned roles.');
+    assertSameValue(false, $completeNewsResult['lookup'] ?? null, 'Complete news artwork must not trigger a lookup.');
+    assertSameValue([0, 0], [$completeNewsTmdb->tvCandidateSearches, $completeNewsTmdb->movieCandidateSearches], 'Complete news artwork must not perform provider work.');
+
+    $disabledNewsProgramme = ['title' => 'Harbor News'];
+    $disabledNewsTmdb = new CandidateTmdbService();
+    $disabledNewsCache = [];
+    $disabledNewsResult = enrich($plugin, $method, $disabledNewsProgramme, $disabledNewsTmdb, $disabledNewsCache, mapGenresToEpgCategories: true, keywordDetection: true, enrichPosters: false, enrichBackdrops: false);
+    assertSameValue('News', $disabledNewsProgramme['category'] ?? null, 'Artwork-disabled news enrichment must retain the detected category.');
+    assertSameValue(false, $disabledNewsResult['lookup'] ?? null, 'Artwork-disabled news enrichment must not trigger a lookup.');
+    assertSameValue([0, 0], [$disabledNewsTmdb->tvCandidateSearches, $disabledNewsTmdb->movieCandidateSearches], 'Artwork-disabled news enrichment must not perform provider work.');
+    assertSameValue(null, $disabledNewsProgramme['images'] ?? null, 'Artwork-disabled news enrichment must not add images.');
+
+    $wrongNewsDetails = normalizedTvDetailsFixture(702, 'Harbor News', 'A fictional family drama set on an island.', 'https://image.tmdb.org/t/p/w500/wrong-news-poster.jpg', 'https://image.tmdb.org/t/p/original/wrong-news-backdrop.jpg');
+    $wrongNewsTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 702,
+            'name' => 'Harbor News',
+            'original_name' => 'Harbor News',
+            'first_air_date' => '2024-01-01',
+            'overview' => 'A fictional family drama set on an island.',
+        ]],
+        tvDetails: [702 => $wrongNewsDetails],
+    );
+    $wrongNewsProgramme = [
+        'title' => 'Harbor News',
+        'desc' => 'Live regional headlines and weather updates.',
+        'images' => [$sourcePoster],
+    ];
+    $wrongNewsCache = [];
+    $wrongNewsResult = enrich($plugin, $method, $wrongNewsProgramme, $wrongNewsTmdb, $wrongNewsCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertSameValue('News', $wrongNewsProgramme['category'] ?? null, 'A rejected same-title news candidate must retain the detected category.');
+    assertSameValue([$sourcePoster], $wrongNewsProgramme['images'] ?? null, 'A rejected same-title news candidate must preserve source artwork without adding TMDB images.');
+    assertSameValue(null, $wrongNewsProgramme['icon'] ?? null, 'A semantically wrong same-title news candidate must not add a backdrop.');
+    assertSameValue(true, $wrongNewsResult['lookup'] ?? null, 'A missing role may perform one bounded validation attempt before abstaining.');
+    assertSameValue([1, 1], [$wrongNewsTmdb->tvCandidateSearches, $wrongNewsTmdb->movieCandidateSearches], 'A rejected news candidate must remain bounded to one search per eligible media type.');
+    assertSameValue([], $wrongNewsCache, 'A semantically rejected news candidate must not enter the reusable TMDB cache.');
+
+    $untypedAbstentionProgramme = [
+        'title' => 'Harbor News',
+        'desc' => 'Live regional headlines and weather updates.',
+        'images' => [$sourceUntyped],
+    ];
+    $untypedAbstentionBefore = $untypedAbstentionProgramme;
+    $untypedAbstentionCache = [];
+    enrich($plugin, $method, $untypedAbstentionProgramme, clone $wrongNewsTmdb, $untypedAbstentionCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertSameValue([$sourceUntyped], $untypedAbstentionProgramme['images'] ?? null, 'A fail-closed News abstention must retain untyped source artwork.');
+    assertSameValue(
+        null,
+        $canonicalHostChangesMethod->invoke($plugin, $untypedAbstentionBefore, $untypedAbstentionProgramme)['images'] ?? null,
+        'A fail-closed News abstention must not emit an images replacement for untyped source artwork.'
+    );
+
+    $wrongSportsDetails = normalizedMovieDetailsFixture(703, 'Arena Sportschau', 'A scripted romance about an old stadium.', 'https://image.tmdb.org/t/p/w500/wrong-sports-poster.jpg', 'https://image.tmdb.org/t/p/original/wrong-sports-backdrop.jpg');
+    $wrongSportsTmdb = new CandidateTmdbService(
+        movieCandidates: [[
+            'tmdb_id' => 703,
+            'title' => 'Arena Sportschau',
+            'original_title' => 'Arena Sportschau',
+            'release_date' => '2023-01-01',
+            'overview' => 'A scripted romance about an old stadium.',
+        ]],
+        movieDetails: [703 => $wrongSportsDetails],
+    );
+    $wrongSportsProgramme = [
+        'title' => 'Arena Sportschau',
+        'desc' => 'Live scores and tournament coverage.',
+        'icon' => $sourceBackdrop['url'],
+        'images' => [$sourceBackdrop],
+    ];
+    $wrongSportsCache = [];
+    enrich($plugin, $method, $wrongSportsProgramme, $wrongSportsTmdb, $wrongSportsCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertSameValue('Sports', $wrongSportsProgramme['category'] ?? null, 'A rejected same-title sports candidate must retain the detected category.');
+    assertSameValue([$sourceBackdrop], $wrongSportsProgramme['images'] ?? null, 'A rejected same-title sports candidate must preserve source artwork without adding or duplicating images.');
+    assertSameValue($sourceBackdrop['url'], $wrongSportsProgramme['icon'] ?? null, 'A rejected sports candidate must preserve its source-owned backdrop.');
+    assertSameValue([1, 1], [$wrongSportsTmdb->tvCandidateSearches, $wrongSportsTmdb->movieCandidateSearches], 'A rejected sports candidate must remain bounded to one search per eligible media type.');
+
+    $ambiguousNewsTmdb = new CandidateTmdbService(tvCandidates: [
+        ['tmdb_id' => 704, 'name' => 'Harbor News', 'original_name' => 'Harbor News', 'first_air_date' => '2020-01-01', 'overview' => 'Live regional headlines from one synthetic station.'],
+        ['tmdb_id' => 705, 'name' => 'Harbor News', 'original_name' => 'Harbor News', 'first_air_date' => '2021-01-01', 'overview' => 'Live regional headlines from another synthetic station.'],
+    ]);
+    $ambiguousNewsProgramme = ['title' => 'Harbor News', 'desc' => 'Live regional headlines.'];
+    $ambiguousNewsCache = [];
+    enrich($plugin, $method, $ambiguousNewsProgramme, $ambiguousNewsTmdb, $ambiguousNewsCache, mapGenresToEpgCategories: true, keywordDetection: true);
+    assertSameValue('News', $ambiguousNewsProgramme['category'] ?? null, 'An ambiguous news candidate set must retain the detected category.');
+    assertSameValue(null, $ambiguousNewsProgramme['icon'] ?? null, 'An ambiguous news candidate set must fail closed without artwork.');
+    assertSameValue([1, 1], [$ambiguousNewsTmdb->tvCandidateSearches, $ambiguousNewsTmdb->movieCandidateSearches], 'An ambiguous news candidate set must remain bounded to one search per eligible media type.');
 
     $genericClassicDetails = normalizedTvDetailsFixture(
         701,
@@ -2501,17 +2778,361 @@ namespace Tests {
         $sourceLandscapeImagesCache,
     );
     assertSameValue(true, $sourceLandscapeReplayResult['cache_hit'], 'The repeated programme should reuse its validated identity cache entry.');
-    assertSameValue(false, $sourceLandscape['artwork_decision']['cache_hit'] ?? null, 'The first artwork decision must persist the cache miss provenance.');
-    assertSameValue(true, $sourceLandscapeReplay['artwork_decision']['cache_hit'] ?? null, 'The repeated artwork decision must persist the cache hit provenance.');
-    $sourceLandscapeComparable = $sourceLandscape;
-    $sourceLandscapeReplayComparable = $sourceLandscapeReplay;
-    unset($sourceLandscapeComparable['artwork_decision']['cache_hit'], $sourceLandscapeReplayComparable['artwork_decision']['cache_hit']);
-    assertSameValue($sourceLandscapeComparable, $sourceLandscapeReplayComparable, 'Artwork output must remain deterministic apart from the required cache provenance.');
+    assertSameValue(false, array_key_exists('cache_hit', $sourceLandscape['artwork_decision'] ?? []), 'Persisted artwork decisions must not contain volatile cache provenance.');
+    assertSameValue($sourceLandscape, $sourceLandscapeReplay, 'Artwork output must remain deterministic on a cache replay.');
     $branchBEvidence = [
         'canonical_details_preferred' => 1,
         'source_primary_lookup_evaluated' => 1,
         'reason_codes' => ['tmdb_details_backdrop_preferred'],
     ];
+
+    $replacementImages = [
+        'posters' => [],
+        'backdrops' => [[
+            'file_path' => '/details-backdrop.jpg',
+            'iso_639_1' => null,
+            'vote_count' => 2,
+            'vote_average' => 7.0,
+            'width' => 1920,
+            'height' => 1080,
+            'aspect_ratio' => 1.778,
+        ], [
+            'file_path' => '/secondary-backdrop.jpg',
+            'iso_639_1' => 'de',
+            'vote_count' => 20,
+            'vote_average' => 9.0,
+            'width' => 1920,
+            'height' => 1080,
+            'aspect_ratio' => 1.778,
+        ]],
+        'logos' => [],
+    ];
+    $replacementInput = [
+        'title' => 'Backdrop Quality',
+        'desc' => 'A 2026 programme used to verify backdrop quality selection. Provider note.',
+        'category' => 'Provider category',
+        'icon' => $sourcePrimary,
+        'images' => [[
+            'url' => $sourcePrimary,
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+        ], [
+            'url' => 'https://provider.invalid/keep-logo.png',
+            'type' => 'logo',
+            'orient' => 'L',
+            'width' => 500,
+            'height' => 200,
+            'scope' => 'programme',
+        ]],
+    ];
+    $replacementBackdrop = 'https://image.tmdb.org/t/p/w1280/details-backdrop.jpg';
+
+    Http::$responses[] = new FakeHttpResponse(true, $replacementImages);
+    $defaultArtwork = $replacementInput;
+    $defaultArtworkCache = [];
+    $defaultArtworkImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $defaultArtwork,
+        new TmdbService('backdrop-quality'),
+        $defaultArtworkCache,
+        imagesCache: $defaultArtworkImagesCache,
+        enrichPosters: false,
+    );
+    assertSameValue($sourcePrimary, $defaultArtwork['icon'] ?? null, 'The default mode must preserve an existing trusted backdrop.');
+
+    Http::$responses[] = new FakeHttpResponse(true, $replacementImages);
+    $artworkOnly = $replacementInput;
+    $artworkOnlyCache = [];
+    $artworkOnlyImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $artworkOnly,
+        new TmdbService('backdrop-quality'),
+        $artworkOnlyCache,
+        imagesCache: $artworkOnlyImagesCache,
+        enrichPosters: false,
+        overwriteArtwork: true,
+    );
+    assertSameValue($replacementBackdrop, $artworkOnly['icon'] ?? null, 'Artwork-only overwrite must replace an existing trusted backdrop after validated TMDB identity and image selection.');
+    assertSameValue($replacementInput['desc'], $artworkOnly['desc'] ?? null, 'Artwork-only overwrite must preserve an existing description.');
+    assertSameValue($replacementInput['category'], $artworkOnly['category'] ?? null, 'Artwork-only overwrite must preserve an existing category.');
+    assertSameValue(false, in_array($sourcePrimary, array_column($artworkOnly['images'] ?? [], 'url'), true), 'Artwork-only overwrite must remove the safely typed previous fanart role.');
+    assertSameValue(true, in_array('https://provider.invalid/keep-logo.png', array_column($artworkOnly['images'] ?? [], 'url'), true), 'Artwork-only overwrite must preserve unrelated logo roles.');
+    assertSameValue(
+        [
+            [$replacementBackdrop, 'backdrop'],
+            ['https://image.tmdb.org/t/p/w1280/secondary-backdrop.jpg', 'backdrop'],
+            ['https://provider.invalid/keep-logo.png', 'logo'],
+        ],
+        array_map(
+            static fn (array $image): array => [$image['url'] ?? null, $image['type'] ?? null],
+            array_values($artworkOnly['images'] ?? []),
+        ),
+        'Artwork-only serialization must contain exactly two canonical-first backdrops followed by the preserved unrelated logo.'
+    );
+
+    $artworkOnlyReplay = $artworkOnly;
+    enrich(
+        $plugin,
+        $method,
+        $artworkOnlyReplay,
+        new TmdbService('backdrop-quality'),
+        $artworkOnlyCache,
+        imagesCache: $artworkOnlyImagesCache,
+        enrichPosters: false,
+        overwriteArtwork: true,
+    );
+    assertSameValue($artworkOnly, $artworkOnlyReplay, 'Artwork-only replacement must be idempotent on an identical replay.');
+
+    Http::$responses[] = new FakeHttpResponse(true, $replacementImages);
+    $globalOverwrite = $replacementInput;
+    $globalOverwriteCache = [];
+    $globalOverwriteImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $globalOverwrite,
+        new TmdbService('backdrop-quality'),
+        $globalOverwriteCache,
+        imagesCache: $globalOverwriteImagesCache,
+        overwrite: true,
+        enrichPosters: false,
+    );
+    assertSameValue($replacementBackdrop, $globalOverwrite['icon'] ?? null, 'Legacy global overwrite must continue to replace artwork.');
+    assertSameValue('A programme used to verify backdrop quality selection.', $globalOverwrite['desc'] ?? null, 'Legacy global overwrite must continue to replace existing metadata.');
+
+    Http::$responses[] = new FakeHttpResponse(true, $replacementImages);
+    $bothOverwrite = $replacementInput;
+    $bothOverwriteCache = [];
+    $bothOverwriteImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $bothOverwrite,
+        new TmdbService('backdrop-quality'),
+        $bothOverwriteCache,
+        imagesCache: $bothOverwriteImagesCache,
+        overwrite: true,
+        enrichPosters: false,
+        overwriteArtwork: true,
+    );
+    assertSameValue($globalOverwrite, $bothOverwrite, 'Enabling both overwrite switches must not process artwork twice or change legacy global output.');
+
+    $disabledArtwork = $replacementInput;
+    $disabledArtworkCache = [];
+    $disabledArtworkImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $disabledArtwork,
+        new TmdbService('backdrop-quality'),
+        $disabledArtworkCache,
+        imagesCache: $disabledArtworkImagesCache,
+        enrichPosters: false,
+        enrichBackdrops: false,
+        overwriteArtwork: true,
+    );
+    assertSameValue($sourcePrimary, $disabledArtwork['icon'] ?? null, 'Artwork-only overwrite must not replace a disabled backdrop role.');
+    assertSameValue(false, in_array($replacementBackdrop, array_column($disabledArtwork['images'] ?? [], 'url'), true), 'Artwork-only overwrite must not add artwork for a disabled backdrop role.');
+    assertSameValue($replacementInput['desc'], $disabledArtwork['desc'] ?? null, 'Disabled image roles must not alter existing text metadata.');
+
+    $missingReplacement = $replacementInput;
+    $missingReplacementCache = [];
+    $missingReplacementImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $missingReplacement,
+        new TmdbService('none'),
+        $missingReplacementCache,
+        imagesCache: $missingReplacementImagesCache,
+        enrichPosters: false,
+        overwriteArtwork: true,
+    );
+    assertSameValue($replacementInput, $missingReplacement, 'A missing or ambiguous identity must retain all existing artwork.');
+
+    $failedArtworkInput = [
+        'title' => 'Localized Poster',
+        'desc' => 'A 2026 localized poster fixture.',
+        'category' => 'Provider category',
+        'icon' => $sourcePrimary,
+        'images' => [[
+            'url' => $sourcePrimary,
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'programme',
+        ], [
+            'url' => 'https://provider.invalid/existing-poster.jpg',
+            'type' => 'poster',
+            'orient' => 'P',
+            'width' => 800,
+            'height' => 1200,
+            'scope' => 'programme',
+        ]],
+    ];
+    $failedArtwork = $failedArtworkInput;
+    $failedArtworkCache = [];
+    $failedArtworkImagesCache = [];
+    Http::$responses[] = new FakeHttpResponse(false);
+    enrich(
+        $plugin,
+        $method,
+        $failedArtwork,
+        new TmdbService('localized-poster'),
+        $failedArtworkCache,
+        imagesCache: $failedArtworkImagesCache,
+        overwriteArtwork: true,
+    );
+    assertSameValue($sourcePrimary, $failedArtwork['icon'] ?? null, 'A failed image response must retain the existing backdrop in artwork-only mode.');
+    assertSameValue(true, in_array('https://provider.invalid/existing-poster.jpg', array_column($failedArtwork['images'] ?? [], 'url'), true), 'A failed image response must retain the existing poster in artwork-only mode.');
+    assertSameValue(false, in_array('https://image.tmdb.org/t/p/w500/default-poster.jpg', array_column($failedArtwork['images'] ?? [], 'url'), true), 'Artwork-only replacement must not use a geometry-unverified details poster after the image response fails.');
+    assertSameValue($failedArtworkInput['desc'], $failedArtwork['desc'] ?? null, 'A failed artwork response must not overwrite text metadata.');
+
+    $seriesDetails = normalizedTvDetailsFixture(
+        930,
+        'Synthetic Series',
+        'Validated synthetic series overview.',
+        null,
+        'https://image.tmdb.org/t/p/original/canonical-series-backdrop.jpg',
+    );
+    $seriesTmdb = new CandidateTmdbService(
+        tvCandidates: [[
+            'tmdb_id' => 930,
+            'name' => 'Synthetic Series',
+            'original_name' => 'Synthetic Series',
+            'first_air_date' => '2025-01-01',
+            'overview' => 'Validated synthetic series overview.',
+        ]],
+        tvDetails: [930 => $seriesDetails],
+        seasonDetails: ['930:1' => ['episodes' => [[
+            'episode_number' => 2,
+            'name' => 'Second Chapter',
+            'overview' => 'Localized episode overview.',
+            'still_path' => '/synthetic-series-s01e02.jpg',
+        ]]]],
+    );
+    $seriesProgramme = [
+        'title' => 'Synthetic Series',
+        'subtitle' => 'Second Chapter',
+        'desc' => 'Provider series description.',
+        'category' => 'Provider series category',
+        'episode_num' => '0.1.',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.1.']],
+        'icon' => 'https://provider.invalid/old-series-backdrop.jpg',
+        'images' => [[
+            'url' => 'https://provider.invalid/old-series-backdrop.jpg',
+            'type' => 'fanart',
+            'orient' => 'L',
+            'width' => 1920,
+            'height' => 1080,
+            'scope' => 'series',
+        ], [
+            'url' => 'https://provider.invalid/existing-episode-still.jpg',
+            'type' => 'screenshot',
+            'orient' => 'L',
+            'width' => 1280,
+            'height' => 720,
+            'scope' => 'episode',
+        ]],
+    ];
+    $seriesCache = [];
+    $seriesSeasonCache = [];
+    $seriesImagesCache = [];
+    Http::$responses[] = new FakeHttpResponse(true, [
+        'posters' => [],
+        'backdrops' => [[
+            'file_path' => '/canonical-series-backdrop.jpg',
+            'iso_639_1' => null,
+            'vote_count' => 1,
+            'vote_average' => 6.0,
+            'width' => 1920,
+            'height' => 1080,
+        ], [
+            'file_path' => '/alternate-series-backdrop.jpg',
+            'iso_639_1' => 'de',
+            'vote_count' => 50,
+            'vote_average' => 9.0,
+            'width' => 1920,
+            'height' => 1080,
+        ]],
+        'logos' => [],
+    ]);
+    enrich(
+        $plugin,
+        $method,
+        $seriesProgramme,
+        $seriesTmdb,
+        $seriesCache,
+        seasonCache: $seriesSeasonCache,
+        imagesCache: $seriesImagesCache,
+        enrichEpisodeDetails: true,
+        enrichPosters: false,
+        overwriteArtwork: true,
+    );
+    assertSameValue('https://image.tmdb.org/t/p/w1280/canonical-series-backdrop.jpg', $seriesProgramme['icon'] ?? null, 'Artwork-only series replacement must prefer the canonical TMDB details backdrop.');
+    assertSameValue('Provider series description.', $seriesProgramme['desc'] ?? null, 'Artwork-only series replacement must preserve the provider description.');
+    assertSameValue(true, in_array('https://provider.invalid/existing-episode-still.jpg', array_column($seriesProgramme['images'] ?? [], 'url'), true), 'Artwork-only series replacement must preserve an existing episode still role.');
+    assertSameValue(true, in_array('https://image.tmdb.org/t/p/original/synthetic-series-s01e02.jpg', array_column($seriesProgramme['images'] ?? [], 'url'), true), 'Artwork-only series replacement must retain the validated TMDB episode still as secondary artwork.');
+    assertSameValue(
+        ['https://image.tmdb.org/t/p/w1280/canonical-series-backdrop.jpg', 'https://image.tmdb.org/t/p/w1280/alternate-series-backdrop.jpg'],
+        array_slice(array_column(array_values(array_filter($seriesProgramme['images'] ?? [], fn (array $image): bool => ($image['type'] ?? null) === 'backdrop')), 'url'), 0, 2),
+        'Series backdrop serialization must preserve canonical-first ordering ahead of the alternative and episode stills.'
+    );
+
+    Http::$responses[] = new FakeHttpResponse(true, $replacementImages);
+    $fillMissingMetadata = $replacementInput;
+    unset($fillMissingMetadata['desc']);
+    $fillMissingMetadataCache = [];
+    $fillMissingMetadataImagesCache = [];
+    enrich(
+        $plugin,
+        $method,
+        $fillMissingMetadata,
+        new TmdbService('backdrop-quality'),
+        $fillMissingMetadataCache,
+        imagesCache: $fillMissingMetadataImagesCache,
+        enrichPosters: false,
+        overwriteArtwork: true,
+    );
+    assertSameValue('A programme used to verify backdrop quality selection.', $fillMissingMetadata['desc'] ?? null, 'Artwork-only overwrite must still fill metadata gaps allowed by existing enrichment settings.');
+
+    assertTrueValue(
+        $settingsHasher->invoke($plugin, []) !== $settingsHasher->invoke($plugin, ['replace_existing_artwork' => true]),
+        'The settings hash must distinguish artwork-only replacement so an unchanged source is reprocessed after the switch changes.'
+    );
+    $manifest = json_decode(file_get_contents(__DIR__.'/../plugin.json'), true, flags: JSON_THROW_ON_ERROR);
+    $manifestFields = [];
+    foreach ($manifest['settings'] as $section) {
+        foreach ($section['fields'] ?? [] as $field) {
+            $manifestFields[$field['id']] = $field;
+        }
+    }
+    assertSameValue('boolean', $manifestFields['replace_existing_artwork']['type'] ?? null, 'Replace existing artwork must be a boolean manifest setting.');
+    assertSameValue('Replace existing artwork', $manifestFields['replace_existing_artwork']['label'] ?? null, 'Replace existing artwork must expose the stable English label.');
+    assertSameValue(false, $manifestFields['replace_existing_artwork']['default'] ?? null, 'Replace existing artwork must remain opt-in by default.');
+
+    $replacementOutputPath = getenv('CROSS_REPO_REPLACEMENT_OUTPUT');
+    if (is_string($replacementOutputPath) && $replacementOutputPath !== '') {
+        $serializedReplacement = json_encode([
+            'schema_version' => 1,
+            'programme_before' => $replacementInput,
+            'host_changes' => $canonicalHostChangesMethod->invoke($plugin, $replacementInput, $artworkOnly),
+            'programme_after' => $artworkOnly,
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n";
+        assertSameValue(
+            strlen($serializedReplacement),
+            file_put_contents($replacementOutputPath, $serializedReplacement),
+            'The cross-repository replacement contract must export the exact serialized host changes from the artwork-only path.'
+        );
+    }
 
     $languagePriority = $selectImages->invoke($plugin, [
         'posters' => [
@@ -2632,6 +3253,126 @@ namespace Tests {
     $wrongType['_media_type'] = 'tv';
     assertSameValue(null, $projectionMethod->invoke($plugin, $wrongType, 'movie'), 'A contradictory media type must still be rejected.');
 
+    // Regression: bounded candidate search responses do not contain cast/director.
+    // A same-title remake therefore used to remain an artificial tie even when the
+    // programme description carried two strong people identifiers. Hydrate only
+    // tied candidates and use that identity evidence before abstaining.
+    $identityDetailsA = normalizedMovieDetailsFixture(811, 'Synthetic Remake', 'First synthetic story.', 'https://image.tmdb.org/t/p/w500/synthetic-remake-poster.jpg');
+    $identityDetailsA['cast'] = ['Alpha Person', 'Beta Person'];
+    $identityDetailsB = normalizedMovieDetailsFixture(812, 'Synthetic Remake', 'Second synthetic story.');
+    $identityDetailsB['cast'] = ['Gamma Person', 'Delta Person'];
+    $identityMovieCandidates = [
+        ['tmdb_id' => 811, 'title' => 'Synthetic Remake', 'original_title' => 'Synthetic Remake', 'release_date' => '2024-01-01', 'overview' => 'First synthetic story.'],
+        ['tmdb_id' => 812, 'title' => 'Synthetic Remake', 'original_title' => 'Synthetic Remake', 'release_date' => '1989-01-01', 'overview' => 'Second synthetic story.'],
+    ];
+    $identityTmdb = new CandidateTmdbService(
+        movieCandidates: $identityMovieCandidates,
+        movieDetails: [811 => $identityDetailsA, 812 => $identityDetailsB],
+    );
+    $provisional = null;
+    $identityResult = $searchMethod->invokeArgs($plugin, [$identityTmdb, 'Synthetic Remake', 'movie', null, 'Alpha Person and Beta Person lead the story.', &$provisional]);
+    assertSameValue(811, $identityResult['tmdb_id'] ?? null, 'Details-backed people evidence must resolve a bounded same-title candidate tie.');
+    assertSameValue(2, $identityTmdb->movieDetailsRequests, 'Only the two tied movie candidates should be hydrated, and the winner details must be reused.');
+
+    $identityEnrichmentTmdb = new CandidateTmdbService(
+        movieCandidates: $identityMovieCandidates,
+        movieDetails: [811 => $identityDetailsA, 812 => $identityDetailsB],
+    );
+    $identityProgramme = [
+        'title' => 'Synthetic Remake',
+        'desc' => 'Alpha Person and Beta Person lead the story.',
+        'category' => 'Movie',
+    ];
+    $identityProgrammeBefore = $identityProgramme;
+    $identityCache = [];
+    $identityEnrichmentResult = enrich($plugin, $method, $identityProgramme, $identityEnrichmentTmdb, $identityCache);
+    assertSameValue(true, $identityEnrichmentResult['lookup'] ?? null, 'The details-backed identity repair must run through the real programme enrichment path.');
+    assertSameValue('poster', $identityProgramme['images'][0]['type'] ?? null, 'The repaired identity must emit a typed poster through the real enrichment path.');
+    assertSameValue('https://image.tmdb.org/t/p/w500/synthetic-remake-poster.jpg', $identityProgramme['images'][0]['url'] ?? null, 'The repaired identity must emit the validated winner poster.');
+    assertSameValue(2, $identityEnrichmentTmdb->movieDetailsRequests, 'The enrichment path must reuse winner details after the two-candidate hydration pass.');
+
+    $crossRepoOutputPath = getenv('CROSS_REPO_ENRICHER_OUTPUT');
+    if (is_string($crossRepoOutputPath) && $crossRepoOutputPath !== '') {
+        $serializedOutput = json_encode([
+            'schema_version' => 1,
+            'programme_before' => $identityProgrammeBefore,
+            'host_changes' => $canonicalHostChangesMethod->invoke($plugin, $identityProgrammeBefore, $identityProgramme),
+            'programme_after' => $identityProgramme,
+            'provider_requests' => [
+                'movie_candidates' => $identityEnrichmentTmdb->movieCandidateSearches,
+                'movie_details' => $identityEnrichmentTmdb->movieDetailsRequests,
+            ],
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n";
+        assertSameValue(
+            strlen($serializedOutput),
+            file_put_contents($crossRepoOutputPath, $serializedOutput),
+            'The cross-repository contract must export the exact serialized host changes produced by the real enrichment path.'
+        );
+    }
+
+    $cachedReplayTmdb = new CandidateTmdbService(throwOnMovieCandidates: true);
+    $cachedReplayProgramme = $identityProgrammeBefore;
+    $cachedReplayResult = enrich(
+        $plugin,
+        $method,
+        $cachedReplayProgramme,
+        $cachedReplayTmdb,
+        $identityCache,
+        allowProviderLookup: false,
+    );
+    assertSameValue(true, $cachedReplayResult['cache_hit'] ?? null, 'A later exact cache entry must repair an earlier occurrence during the no-provider replay pass.');
+    assertSameValue('poster', $cachedReplayProgramme['images'][0]['type'] ?? null, 'The no-provider replay must emit the cached poster.');
+    assertSameValue([0, 0], [$cachedReplayTmdb->tvCandidateSearches, $cachedReplayTmdb->movieCandidateSearches], 'The cache replay pass must never amplify provider candidate requests.');
+
+    $cacheMissReplayTmdb = new CandidateTmdbService(throwOnTvCandidates: true, throwOnMovieCandidates: true);
+    $cacheMissReplayProgramme = ['title' => 'Uncached Synthetic Programme'];
+    $cacheMissReplayCache = [];
+    $cacheMissReplayResult = enrich(
+        $plugin,
+        $method,
+        $cacheMissReplayProgramme,
+        $cacheMissReplayTmdb,
+        $cacheMissReplayCache,
+        allowProviderLookup: false,
+    );
+    assertSameValue(false, $cacheMissReplayResult['lookup'] ?? null, 'A replay cache miss must stop before provider lookup.');
+    assertSameValue(['title' => 'Uncached Synthetic Programme'], $cacheMissReplayProgramme, 'A replay cache miss must remain a no-op.');
+    assertSameValue([0, 0], [$cacheMissReplayTmdb->tvCandidateSearches, $cacheMissReplayTmdb->movieCandidateSearches], 'A replay cache miss must make zero provider requests.');
+
+    $identityCandidates = [
+        ['tmdb_id' => 821, 'title' => 'Synthetic Tie', 'original_title' => 'Synthetic Tie', 'release_date' => '2024-01-01', 'overview' => 'Narrative one.'],
+        ['tmdb_id' => 822, 'title' => 'Synthetic Tie', 'original_title' => 'Synthetic Tie', 'release_date' => '1989-01-01', 'overview' => 'Narrative two.'],
+    ];
+    $missingDetailsTmdb = new CandidateTmdbService(movieCandidates: $identityCandidates);
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $missingDetailsTmdb, 'Synthetic Tie', 'movie', null, 'Alpha Person and Beta Person lead the story.'), 'Missing tied-candidate details must preserve abstention.');
+    assertSameValue(1, $missingDetailsTmdb->movieDetailsRequests, 'A missing first detail response must stop the bounded hydration pass.');
+
+    $ambiguousDetailsA = normalizedMovieDetailsFixture(821, 'Synthetic Tie', 'Narrative one.');
+    $ambiguousDetailsA['cast'] = ['Shared Person', 'Second Person'];
+    $ambiguousDetailsB = normalizedMovieDetailsFixture(822, 'Synthetic Tie', 'Narrative two.');
+    $ambiguousDetailsB['cast'] = ['Shared Person', 'Second Person'];
+    $ambiguousDetailsTmdb = new CandidateTmdbService(
+        movieCandidates: $identityCandidates,
+        movieDetails: [821 => $ambiguousDetailsA, 822 => $ambiguousDetailsB],
+    );
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $ambiguousDetailsTmdb, 'Synthetic Tie', 'movie', null, 'Shared Person and Second Person lead the story.'), 'Equal details-backed evidence must preserve abstention.');
+    assertSameValue(2, $ambiguousDetailsTmdb->movieDetailsRequests, 'Ambiguous evidence may hydrate only the two exact-score tied candidates.');
+
+    $contradictoryDetails = normalizedMovieDetailsFixture(899, 'Synthetic Tie', 'Contradictory synthetic story.');
+    $contradictoryDetailsTmdb = new CandidateTmdbService(
+        movieCandidates: $identityCandidates,
+        movieDetails: [821 => $contradictoryDetails],
+    );
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $contradictoryDetailsTmdb, 'Synthetic Tie', 'movie', null, 'Alpha Person and Beta Person lead the story.'), 'A contradictory detail identity must preserve abstention.');
+    assertSameValue(1, $contradictoryDetailsTmdb->movieDetailsRequests, 'A contradictory first detail response must stop the bounded hydration pass.');
+
+    $failingDetailsTmdb = new CandidateTmdbService(
+        movieCandidates: $identityCandidates,
+        throwOnMovieDetails: true,
+    );
+    assertSameValue(null, validatedSearch($plugin, $searchMethod, $failingDetailsTmdb, 'Synthetic Tie', 'movie', null, 'Alpha Person and Beta Person lead the story.'), 'A detail request failure must preserve abstention.');
+    assertSameValue(1, $failingDetailsTmdb->movieDetailsRequests, 'A failed first detail request must stop the bounded hydration pass.');
+
     $seriesBindingKeyMethod = $reflection->getMethod('providerSeriesBindingKey');
     $seriesBindingKeyMethod->setAccessible(true);
     $seriesBindingMethod = $reflection->getMethod('buildFreshSeriesBindings');
@@ -2649,9 +3390,12 @@ namespace Tests {
     $untrustedSeriesId = $bindingSeed;
     $untrustedSeriesId['episode_nums'][1]['value'] = 'other:SH123456780000';
     assertSameValue(null, $seriesBindingKeyMethod->invoke($plugin, $untrustedSeriesId, 'source-a', 'de-DE'), 'Unknown provider series namespaces must not bind.');
-    $freshSeed = ['series_key' => $bindingKey, 'logic' => '2026.10.02-provider-series-provenance', 'decision' => 'fresh_episode_validated', 'validation_path' => ['path' => 'unique_episode_title', 'season' => 1, 'episode' => 2, 'subtitle' => 'Seed episode'], 'cache_key' => 'fresh-input-evidence', 'season' => 1, 'episode' => 2, 'subtitle' => 'Seed episode', 'tmdb_id' => 901, 'media_type' => 'tv', 'poster' => ['url' => 'https://image.tmdb.org/t/p/original/series-poster.jpg', 'type' => 'poster', 'width' => 640, 'height' => 1000, 'orient' => 'P', 'size' => 2, 'source' => 'tmdb', 'scope' => 'programme', 'geometry_source' => 'tmdb_dimensions'], 'backdrop' => ['url' => 'https://image.tmdb.org/t/p/original/series-backdrop.jpg', 'type' => 'backdrop', 'width' => 1600, 'height' => 900, 'orient' => 'L', 'size' => 1, 'source' => 'tmdb', 'scope' => 'programme', 'geometry_source' => 'tmdb_dimensions', 'artwork_quality' => 'tmdb_metadata_unrated']];
+    $freshSeed = ['series_key' => $bindingKey, 'logic' => $currentLogicVersion, 'decision' => 'fresh_episode_validated', 'validation_path' => ['path' => 'unique_episode_title', 'season' => 1, 'episode' => 2, 'subtitle' => 'Seed episode'], 'cache_key' => 'fresh-input-evidence', 'season' => 1, 'episode' => 2, 'subtitle' => 'Seed episode', 'tmdb_id' => 901, 'media_type' => 'tv', 'poster' => ['url' => 'https://image.tmdb.org/t/p/original/series-poster.jpg', 'type' => 'poster', 'width' => 640, 'height' => 1000, 'orient' => 'P', 'size' => 2, 'source' => 'tmdb', 'scope' => 'programme', 'geometry_source' => 'tmdb_dimensions'], 'backdrop' => ['url' => 'https://image.tmdb.org/t/p/original/series-backdrop.jpg', 'type' => 'backdrop', 'width' => 1600, 'height' => 900, 'orient' => 'L', 'size' => 1, 'source' => 'tmdb', 'scope' => 'programme', 'geometry_source' => 'tmdb_dimensions', 'artwork_quality' => 'tmdb_metadata_unrated']];
     $bindings = $seriesBindingMethod->invoke($plugin, [$freshSeed]);
     assertSameValue(901, $bindings[$bindingKey]['tmdb_id'] ?? null, 'Only a fresh episode-validated TV decision may produce a series binding.');
+    $staleLogicSeed = $freshSeed;
+    $staleLogicSeed['logic'] = '2026.10.04-news-sports-artwork';
+    assertSameValue([], $seriesBindingMethod->invoke($plugin, [$staleLogicSeed]), 'Pre-change logic decisions must not seed reusable series artwork bindings.');
     $conflictSeed = $freshSeed;
     $conflictSeed['tmdb_id'] = 902;
     assertSameValue([], $seriesBindingMethod->invoke($plugin, [$freshSeed, $conflictSeed]), 'Late conflicting fresh identities must poison the binding key.');

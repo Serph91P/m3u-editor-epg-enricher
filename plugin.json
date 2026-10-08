@@ -51,6 +51,13 @@
           "label": "Overwrite existing metadata",
           "default": false,
           "helper_text": "Replace existing artwork and descriptions even if the programme already has data (e.g. from Schedules Direct)."
+        },
+        {
+          "id": "replace_existing_artwork",
+          "type": "boolean",
+          "label": "Replace existing artwork",
+          "default": false,
+          "helper_text": "Replace validated poster and backdrop roles without overwriting existing text metadata."
         }
       ]
     },
