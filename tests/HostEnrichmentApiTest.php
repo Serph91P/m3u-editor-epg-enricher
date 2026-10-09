@@ -46,13 +46,17 @@ namespace App\Plugins\Support {
         public array $settings = ['enrich_from_tmdb' => true, 'overwrite_existing' => false, 'enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'map_genres_to_epg_categories' => true, 'map_genres_to_kodi_guide_genres' => false, 'keyword_category_detection' => true, 'enrich_episode_details' => false];
         public array $messages = [];
         public array $progresses = [];
+        public array $logs = [];
+        public array $checkpoints = [];
         public bool $dryRun = false;
         public int $cancellationChecks = 0;
         public int $cancelAfterChecks = PHP_INT_MAX;
         public function cancellationRequested(): bool { return ++$this->cancellationChecks >= $this->cancelAfterChecks; }
-        public function heartbeat(string $message, ?int $progress = null): void { $this->messages[] = $message; $this->progresses[] = $progress; }
-        public function info(string $message): void { $this->messages[] = $message; }
-        public function warning(string $message): void { $this->messages[] = $message; }
+        public function heartbeat(string $message, ?int $progress = null, array $state = []): void { $this->messages[] = $message; $this->progresses[] = $progress; }
+        public function info(string $message): void { $this->logs[] = ['level' => 'info', 'message' => $message]; }
+        public function warning(string $message): void { $this->logs[] = ['level' => 'warning', 'message' => $message]; }
+        public function error(string $message): void { $this->logs[] = ['level' => 'error', 'message' => $message]; }
+        public function checkpoint(int $progress, string $message, array $state = [], bool $log = false): void { $this->checkpoints[] = compact('progress', 'message', 'state', 'log'); $this->heartbeat($message, $progress); if ($log) { $this->info($message); } }
     }
 }
 
@@ -149,6 +153,12 @@ namespace Tests {
     assertSameValue('hash-stable', $host->applies[0]['patches'][0]['hash'] ?? null, 'Patch must preserve the host programme hash.');
     assertSameValue('Sports', $host->applies[0]['patches'][0]['changes']['category'] ?? null, 'Canonical patch must carry the enriched category.');
     assertSameValue(['Checking programme details and artwork.', 'Checking programme details and artwork.', 'Saving updates.'], $context->messages, 'The evidence and apply passes must emit end-user heartbeats without host internals.');
+    assertSameValue([
+        ['level' => 'info', 'message' => 'Checking programme details and artwork.'],
+        ['level' => 'info', 'message' => 'Checking programme details and artwork.'],
+        ['level' => 'info', 'message' => 'Saving updates.'],
+    ], $context->logs, 'Visible enrichment phases must persist Live Activity logs.');
+    assertSameValue([5, 5, 5], array_column($context->checkpoints, 'progress'), 'Phase checkpoints must publish non-zero progress rather than leave the run at 0%.');
 
     [$noopResult, $noopHost] = runFixture(['noop']);
     assertSameValue('completed', $noopResult->status, 'A host no-op remains a completed scan.');
@@ -237,7 +247,7 @@ namespace Tests {
     $progressMethod->setAccessible(true);
     $progressMethod->invokeArgs(new Plugin(), [new \App\Models\Epg(1), 1, [1], $progressContext, &$progress]);
     assertSameValue(['total' => 2, 'completed' => 2], $progress, 'Completed page counts must accumulate against the bounded census total.');
-    assertSameValue([50, 99], array_values(array_filter($progressContext->progresses, fn ($value): bool => $value !== null)), 'Progress must be monotonic after accepted pages and reserve 100 for the terminal heartbeat.');
+    assertSameValue([5, 5, 5, 50, 50, 99], array_values(array_filter($progressContext->progresses, fn ($value): bool => $value !== null)), 'Phase checkpoints and accepted pages must publish monotonic, non-zero progress and reserve 100 for the terminal heartbeat.');
     assertSameValue([
         'Checking programme details and artwork.',
         'Checking programme details and artwork.',

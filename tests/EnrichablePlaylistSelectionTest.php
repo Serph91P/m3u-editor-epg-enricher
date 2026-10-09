@@ -61,7 +61,11 @@ namespace App\Plugins\Support {
 
         public function __construct(public ?object $user) {}
 
-        public function heartbeat(string $message, ?int $progress = null): void {}
+        public function heartbeat(string $message, ?int $progress = null, array $state = []): void {}
+        public function checkpoint(int $progress, string $message, array $state = [], bool $log = false): void { $this->heartbeat($message, $progress, $state); }
+        public function info(string $message): void {}
+        public function warning(string $message): void {}
+        public function error(string $message): void {}
     }
 
     class PluginSelectOptionsContext

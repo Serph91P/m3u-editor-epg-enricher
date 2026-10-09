@@ -48,13 +48,17 @@ namespace App\Plugins\Support {
             'tmdb_language' => 'de-DE',
         ];
         public array $messages = [];
+        public array $logs = [];
+        public array $checkpoints = [];
         public bool $dryRun = false;
         public int $cancellationChecks = 0;
         public int $cancelAfterChecks = PHP_INT_MAX;
         public function cancellationRequested(): bool { return ++$this->cancellationChecks >= $this->cancelAfterChecks; }
-        public function heartbeat(string $message, ?int $progress = null): void { $this->messages[] = $message; }
-        public function info(string $message): void {}
-        public function warning(string $message): void {}
+        public function heartbeat(string $message, ?int $progress = null, array $state = []): void { $this->messages[] = $message; }
+        public function info(string $message): void { $this->logs[] = ['level' => 'info', 'message' => $message]; }
+        public function warning(string $message): void { $this->logs[] = ['level' => 'warning', 'message' => $message]; }
+        public function error(string $message): void { $this->logs[] = ['level' => 'error', 'message' => $message]; }
+        public function checkpoint(int $progress, string $message, array $state = [], bool $log = false): void { $this->checkpoints[] = compact('progress', 'message', 'state', 'log'); $this->heartbeat($message, $progress); if ($log) { $this->info($message); } }
     }
 }
 

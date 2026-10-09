@@ -32,9 +32,11 @@ namespace App\Plugins\Support {
         public int $checks = 0;
         public int $cancelAfter = PHP_INT_MAX;
         public function cancellationRequested(): bool { return ++$this->checks >= $this->cancelAfter; }
-        public function heartbeat(string $message, ?int $progress = null): void { $this->heartbeats[] = ['message' => $message, 'progress' => $progress]; }
-        public function info(string $message): void { $this->heartbeat($message); }
-        public function warning(string $message): void { $this->heartbeat($message); }
+        public function heartbeat(string $message, ?int $progress = null, array $state = []): void { $this->heartbeats[] = ['message' => $message, 'progress' => $progress]; }
+        public function checkpoint(int $progress, string $message, array $state = [], bool $log = false): void { $this->heartbeat($message, $progress, $state); }
+        public function info(string $message): void {}
+        public function warning(string $message): void {}
+        public function error(string $message): void {}
     }
 }
 

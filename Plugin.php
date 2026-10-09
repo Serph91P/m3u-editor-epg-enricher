@@ -508,12 +508,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     public function runAction(string $action, array $payload, PluginExecutionContext $context): PluginActionResult
     {
-        return match ($action) {
+        $result = match ($action) {
             'enrich_epg' => $this->enrichEpg($payload, $context),
             'health_check' => $this->healthCheck($context),
             'clear_state' => $this->clearEnrichmentState($context),
             default => PluginActionResult::failure("Unsupported action [{$action}]."),
         };
+
+        return $this->logRunResult($context, $result);
     }
 
     /**
@@ -522,23 +524,23 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     public function runHook(string $hook, array $payload, PluginExecutionContext $context): PluginActionResult
     {
         if ($hook !== 'epg.cache.generated') {
-            return PluginActionResult::success("Hook [{$hook}] ignored - not relevant.");
+            return $this->logRunResult($context, PluginActionResult::success("Hook [{$hook}] ignored - not relevant."));
         }
 
         $autoRun = $context->settings['auto_run_on_cache'] ?? true;
         if (! $autoRun) {
-            return PluginActionResult::success('Auto-run disabled - skipping.');
+            return $this->logRunResult($context, PluginActionResult::success('Auto-run disabled - skipping.'));
         }
 
         $epgId = $payload['epg_id'] ?? null;
         $userId = $payload['user_id'] ?? null;
 
         if (! $epgId || ! $userId) {
-            return PluginActionResult::failure('Missing epg_id or user_id in hook payload.');
+            return $this->logRunResult($context, PluginActionResult::failure('Missing epg_id or user_id in hook payload.'));
         }
 
         if (! $context->user || (int) $userId !== (int) $context->user->getKey()) {
-            return PluginActionResult::failure('Hook user does not match the execution user.');
+            return $this->logRunResult($context, PluginActionResult::failure('Hook user does not match the execution user.'));
         }
 
         $playlistIds = $this->ownedEnrichablePlaylistIds(
@@ -547,7 +549,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         );
 
         if (empty($playlistIds)) {
-            return PluginActionResult::success('No owned, enrichable playlists in hook payload - skipping.');
+            return $this->logRunResult($context, PluginActionResult::success('No owned, enrichable playlists in hook payload - skipping.'));
         }
 
         // Filter playlists if the user restricted auto-run to specific ones
@@ -557,7 +559,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $allowedPlaylistIds = $this->ownedEnrichablePlaylistIds($context->user, $allowedPlaylistIds);
             $playlistIds = array_values(array_intersect($playlistIds, $allowedPlaylistIds));
             if (empty($playlistIds)) {
-                return PluginActionResult::success('No matching playlists for auto-run - skipping.');
+                return $this->logRunResult($context, PluginActionResult::success('No matching playlists for auto-run - skipping.'));
             }
         }
 
@@ -567,9 +569,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ->pluck('name', 'id')
             ->all();
 
-        $context->heartbeat("EPG cache generated (ID: {$epgId}). Running playlist-scoped enrichment.");
+        $cacheMessage = "EPG cache generated (ID: {$epgId}). Running playlist-scoped enrichment.";
+        $context->checkpoint(1, $cacheMessage, ['summary' => $cacheMessage], log: true);
 
-        return $this->enrichPlaylists($playlists, $context);
+        return $this->logRunResult($context, $this->enrichPlaylists($playlists, $context));
     }
 
     /**
@@ -622,7 +625,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $totalChannels = $this->countTargetChannels($epgIds, $playlistIds);
         $playlistLabel = $this->playlistLabel($playlists);
-        $context->heartbeat("Starting EPG enrichment for {$playlistLabel} ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).');
+        $startMessage = "Starting EPG enrichment for {$playlistLabel} ({$totalChannels} active channels across ".count($epgIds).' EPG source(s)).';
+        $context->checkpoint(1, $startMessage, ['summary' => $startMessage], log: true);
 
         $progress = ['total' => 0, 'completed' => 0];
         $busyEpgIds = [];
@@ -689,13 +693,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $notice = implode(' ', array_unique($notices));
         if ($busyEpgIds !== []) {
-            $context->heartbeat('EPG enrichment is already in progress for one or more sources.');
+            $context->heartbeat('EPG enrichment is already in progress for one or more sources.', state: ['summary' => 'EPG enrichment is already in progress for one or more sources.']);
+            $context->warning('EPG enrichment is already in progress for one or more sources.');
 
             return PluginActionResult::success("Enrichment is already in progress for {$playlistLabel}. {$notice}");
         }
 
         if (empty($combinedStats)) {
-            $context->heartbeat('EPG enrichment finished.', 100);
+            $context->checkpoint(100, 'EPG enrichment finished.', ['summary' => 'EPG enrichment finished.'], log: true);
             return PluginActionResult::success("Enrichment finished for {$playlistLabel}: {$notice}");
         }
 
@@ -707,7 +712,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $summary .= " {$notice}";
         }
 
-        $context->heartbeat('EPG enrichment finished: '.$progress['completed'].' programmes checked.', 100);
+        $finishMessage = 'EPG enrichment finished: '.$progress['completed'].' programmes checked.';
+        $context->checkpoint(100, $finishMessage, ['summary' => $finishMessage], log: true);
 
         return PluginActionResult::success($summary, $combinedStats);
     }
@@ -720,6 +726,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $names = array_map(fn (string $name): string => "'{$name}'", array_values($playlists));
 
         return (count($names) === 1 ? 'playlist ' : 'playlists ').implode(', ', $names);
+    }
+
+    private function logRunResult(PluginExecutionContext $context, PluginActionResult $result): PluginActionResult
+    {
+        if ($result->success) {
+            $context->info($result->summary);
+        } elseif ($result->status === 'cancelled') {
+            $context->warning($result->summary);
+        } else {
+            $context->error($result->summary);
+        }
+
+        return $result;
     }
 
     private function enrichablePlaylistQuery(object $user)
@@ -937,12 +956,20 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $stats = ['programmes_processed' => 0, 'programmes_updated' => $bindingStats['programmes_updated'], 'programmes_already_enriched' => 0, 'posters_added' => $bindingStats['posters_added'], 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
         $cacheReplayIds = [];
         $afterId = 0;
+        $loggedCheckingProgrammeDetails = false;
+        $loggedSavingUpdates = false;
         do {
             $snapshot = $service->snapshot($context, $epg, $afterId, 100);
             if (($snapshot['status'] ?? null) !== 'ok') {
                 return PluginActionResult::failure('Could not read programme information.', $stats);
             }
-            $context->heartbeat($this->endUserProgressMessage('Checking programme details and artwork', $progress));
+            if (! $loggedCheckingProgrammeDetails) {
+                $checkingMessage = $this->endUserProgressMessage('Checking programme details and artwork', $progress);
+                $context->checkpoint($this->progressCheckpoint($progress), $checkingMessage, ['summary' => $checkingMessage], log: true);
+                $loggedCheckingProgrammeDetails = true;
+            } else {
+                $context->heartbeat($this->endUserProgressMessage('Checking programme details and artwork', $progress));
+            }
             $patches = [];
             $posterAdds = [];
             $pageStats = $stats;
@@ -973,7 +1000,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if ($context->cancellationRequested()) {
                     return PluginActionResult::cancelled('Enrichment cancelled before saving updates.', $stats);
                 }
-                $context->heartbeat($this->endUserProgressMessage('Saving updates', $progress));
+                $savingMessage = $this->endUserProgressMessage('Saving updates', $progress);
+                if (! $loggedSavingUpdates) {
+                    $context->checkpoint($this->progressCheckpoint($progress), $savingMessage, ['summary' => $savingMessage], log: true);
+                    $loggedSavingUpdates = true;
+                } else {
+                    $context->heartbeat($savingMessage, $this->progressCheckpoint($progress), ['summary' => $savingMessage]);
+                }
                 $appliedPatches = $patches;
                 $appliedPosterAdds = $posterAdds;
                 $apply = $service->apply($context, $epg, $patches);
@@ -1028,7 +1061,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $percentage = $progress['total'] > 0
                     ? min(99, (int) floor(($progress['completed'] * 100) / $progress['total']))
                     : 99;
-                $context->heartbeat($this->endUserProgressMessage('Checking programme details and artwork', $progress), $percentage);
+                $context->heartbeat($this->endUserProgressMessage('Checking programme details and artwork', $progress), $percentage, ['summary' => $this->endUserProgressMessage('Checking programme details and artwork', $progress)]);
             }
             $afterId = $snapshot['next'] ?? null;
         } while ($afterId !== null);
@@ -1117,6 +1150,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $phase.': '.(int) ($progress['completed'] ?? 0).'/'.(int) ($progress['total'] ?? 0).' checked.';
     }
 
+    private function progressCheckpoint(?array $progress): int
+    {
+        if ($progress === null || (int) ($progress['total'] ?? 0) < 1) {
+            return 5;
+        }
+
+        return max(5, min(99, (int) floor(((int) ($progress['completed'] ?? 0) * 100) / (int) $progress['total'])));
+    }
+
     private function enrichCopy(array $programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage): array
     {
         $this->enrichProgrammeWithSettings($programme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
@@ -1150,6 +1192,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $checked = 0;
         $afterId = 0;
         $evidence = null;
+        $loggedCheckingProgrammeDetails = false;
         do {
             if ($context->cancellationRequested()) {
                 return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
@@ -1162,7 +1205,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return PluginActionResult::failure('Could not read programme information.', []);
             }
             $evidence = $snapshot['evidence'];
-            $context->heartbeat('Checking programme details and artwork.');
+            if (! $loggedCheckingProgrammeDetails) {
+                $context->checkpoint(5, 'Checking programme details and artwork.', ['summary' => 'Checking programme details and artwork.'], log: true);
+                $loggedCheckingProgrammeDetails = true;
+            } else {
+                $context->heartbeat('Checking programme details and artwork.');
+            }
             foreach (($snapshot['programmes'] ?? []) as $row) {
                 if ($context->cancellationRequested()) {
                     return PluginActionResult::cancelled('Enrichment cancelled while checking programme details.', ['channels_targeted' => count($targetChannels)]);
@@ -1192,6 +1240,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $afterId = 0;
         $updated = 0;
         $postersAdded = 0;
+        $context->checkpoint(80, 'Applying validated series artwork.', ['summary' => 'Applying validated series artwork.'], log: true);
+        $loggedSavingSeriesArtwork = false;
         do {
             if ($context->cancellationRequested()) {
                 return PluginActionResult::cancelled('Enrichment cancelled before saving series artwork.', ['programmes_updated' => $updated]);
@@ -1224,7 +1274,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $posterAdds[] = $this->patchAddsPoster($row['programme'], $changes);
             }
             if ($patches !== []) {
-                $context->heartbeat('Saving validated series artwork.');
+                if (! $loggedSavingSeriesArtwork) {
+                    $context->checkpoint(90, 'Saving validated series artwork.', ['summary' => 'Saving validated series artwork.'], log: true);
+                    $loggedSavingSeriesArtwork = true;
+                } else {
+                    $context->heartbeat('Saving validated series artwork.', 90, ['summary' => 'Saving validated series artwork.']);
+                }
                 $apply = $service->guardedApply($context, $epg, $patches, $evidence);
                 $status = $apply['status'] ?? 'unknown';
                 if (! in_array($status, ['applied', 'noop'], true)) {

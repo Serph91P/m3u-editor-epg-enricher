@@ -73,11 +73,22 @@ namespace App\Plugins\Support {
             return false;
         }
 
-        public function heartbeat(string $message, ?int $progress = null): void
+        public function heartbeat(string $message, ?int $progress = null, array $state = []): void
         {
             $this->messages[] = $message;
             $this->progresses[] = $progress;
         }
+
+        public function checkpoint(int $progress, string $message, array $state = [], bool $log = false): void
+        {
+            $this->heartbeat($message, $progress, $state);
+        }
+
+        public function info(string $message): void {}
+
+        public function warning(string $message): void {}
+
+        public function error(string $message): void {}
     }
 }
 
