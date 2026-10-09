@@ -3,7 +3,10 @@
 namespace {
     function app(string $class): object
     {
-        return new App\Services\EpgCacheService();
+        return match ($class) {
+            App\Services\EpgCacheEnrichmentService::class => new App\Services\EpgCacheEnrichmentService(),
+            default => new App\Services\EpgCacheService(),
+        };
     }
 
     function storage_path(string $path = ''): string
@@ -58,7 +61,11 @@ namespace App\Plugins\Support {
 
         public function __construct(public ?object $user) {}
 
-        public function heartbeat(string $message, ?int $progress = null): void {}
+        public function heartbeat(string $message, ?int $progress = null, array $state = []): void {}
+        public function checkpoint(int $progress, string $message, array $state = [], bool $log = false): void { $this->heartbeat($message, $progress, $state); }
+        public function info(string $message): void {}
+        public function warning(string $message): void {}
+        public function error(string $message): void {}
     }
 
     class PluginSelectOptionsContext
@@ -370,6 +377,18 @@ namespace App\Services {
     }
 
     class TmdbService {}
+    class EpgCacheEnrichmentService
+    {
+        public function snapshot(object $context, object $epg, int $afterId = 0, int $limit = 500): array
+        {
+            return ['status' => 'ok', 'programmes' => [], 'next' => null];
+        }
+
+        public function apply(object $context, object $epg, array $patches): array
+        {
+            return ['status' => 'noop'];
+        }
+    }
 }
 
 namespace App\Settings {

@@ -1,319 +1,92 @@
 <?php
 
-namespace App\Plugins\Contracts {
-    interface EpgProcessorPluginInterface {}
-    interface HookablePluginInterface {}
-
-    interface PluginSelectOptionsProviderInterface
-    {
-        public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array;
-    }
+namespace {
+    function app(string $class): object { return $GLOBALS['outputServices'][$class] ?? throw new \RuntimeException("Missing service {$class}"); }
+    function storage_path(string $path = ''): string { return sys_get_temp_dir().'/epg-enricher-output'; }
 }
-
+namespace App\Plugins\Contracts { interface EpgProcessorPluginInterface {} interface HookablePluginInterface {} interface PluginSelectOptionsProviderInterface { public function selectOptions(string $provider, \App\Plugins\Support\PluginSelectOptionsContext $context): array; } }
 namespace App\Plugins\Support {
-    class PluginActionResult {}
     class PluginSelectOptionsContext {}
-
-    class PluginExecutionContext
-    {
-        public function __construct(public readonly bool $dryRun) {}
-    }
+    class PluginActionResult { public function __construct(public readonly string $status, public readonly bool $success, public readonly string $summary, public readonly array $data = []) {} public static function success(string $s, array $d = []): self { return new self('completed', true, $s, $d); } public static function failure(string $s, array $d = []): self { return new self('failed', false, $s, $d); } public static function cancelled(string $s, array $d = []): self { return new self('cancelled', false, $s, $d); } }
+    class PluginExecutionContext { public array $settings = ['enrich_from_tmdb' => true, 'enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'map_genres_to_epg_categories' => true, 'map_genres_to_kodi_guide_genres' => false, 'keyword_category_detection' => true, 'enrich_episode_details' => false]; public array $messages = []; public bool $dryRun = false; public function cancellationRequested(): bool { return false; } public function heartbeat(string $m, ?int $p = null, array $state = []): void { $this->messages[] = $m; } public function checkpoint(int $p, string $m, array $state = [], bool $log = false): void { $this->heartbeat($m, $p, $state); } public function info(string $m): void {} public function warning(string $m): void {} public function error(string $m): void {} }
 }
-
-namespace App\Models {
-    class FakeCollection
-    {
-        public function __construct(private array $values) {}
-
-        public function all(): array
-        {
-            return $this->values;
-        }
-    }
-
-    class EpgChannelConstraintQuery
-    {
-        public function whereIn(string $column, array $values): self
-        {
-            if ($column === 'epg_id') {
-                ChannelQuery::$epgIds = array_map('intval', $values);
-            }
-
-            return $this;
-        }
-    }
-
-    class ChannelQuery
-    {
-        public static array $epgIds = [];
-        private array $rows;
-
-        public function __construct()
-        {
-            $this->rows = Channel::$rows;
-            self::$epgIds = [];
-        }
-
-        public function whereIn(string $column, array $values): self
-        {
-            $this->rows = array_values(array_filter(
-                $this->rows,
-                fn (array $row): bool => in_array($row[$column] ?? null, $values, true),
-            ));
-
-            return $this;
-        }
-
-        public function where(string $column, mixed $value): self
-        {
-            $this->rows = array_values(array_filter(
-                $this->rows,
-                fn (array $row): bool => ($row[$column] ?? null) === $value,
-            ));
-
-            return $this;
-        }
-
-        public function whereNotNull(string $column): self
-        {
-            $this->rows = array_values(array_filter(
-                $this->rows,
-                fn (array $row): bool => ($row[$column] ?? null) !== null,
-            ));
-
-            return $this;
-        }
-
-        public function whereHas(string $relation, callable $callback): self
-        {
-            $callback(new EpgChannelConstraintQuery());
-            $this->rows = array_values(array_filter(
-                $this->rows,
-                fn (array $row): bool => in_array($row['epg_id'], self::$epgIds, true),
-            ));
-
-            return $this;
-        }
-
-        public function distinct(): self
-        {
-            return $this;
-        }
-
-        public function pluck(string $column): FakeCollection
-        {
-            return new FakeCollection(array_values(array_unique(array_column($this->rows, $column))));
-        }
-    }
-
-    class PlaylistQuery
-    {
-        private array $rows;
-
-        public function __construct()
-        {
-            $this->rows = Playlist::$rows;
-        }
-
-        public function whereKey(array $ids): self
-        {
-            $this->rows = array_values(array_filter(
-                $this->rows,
-                fn (Playlist $playlist): bool => in_array($playlist->id, $ids, true),
-            ));
-
-            return $this;
-        }
-
-        public function get(): array
-        {
-            return $this->rows;
-        }
-    }
-
-    class Channel
-    {
-        public static array $rows = [];
-
-        public static function query(): ChannelQuery
-        {
-            return new ChannelQuery();
-        }
-    }
-
-    class Playlist
-    {
-        public static array $rows = [];
-
-        public function __construct(public int $id, public string $name) {}
-
-        public static function query(): PlaylistQuery
-        {
-            return new PlaylistQuery();
-        }
-
-        public function getTable(): string
-        {
-            return 'playlists';
-        }
-    }
-
-    class Epg {}
-    class EpgChannel {}
-}
-
-namespace App\Services {
-    use App\Models\Playlist;
-    use Illuminate\Support\Facades\Storage;
-
-    class EpgCacheService
-    {
-        public static array $clearCalls = [];
-        public static array $latestXmlByPlaylist = [];
-
-        public static function getPlaylistEpgCachePath(Playlist $playlist, bool $compressed = false): string
-        {
-            return 'playlist-epg-files/playlists-'.$playlist->id.'-epg.xml'.($compressed ? '.gz' : '');
-        }
-
-        public static function clearPlaylistEpgCacheFile(Playlist $playlist): bool
-        {
-            self::$clearCalls[] = $playlist->id;
-            $disk = Storage::disk('local');
-            $cleared = false;
-            foreach ([false, true] as $compressed) {
-                $path = self::getPlaylistEpgCachePath($playlist, $compressed);
-                if ($disk->exists($path)) {
-                    $disk->delete($path);
-                    $cleared = true;
-                }
-            }
-
-            return $cleared;
-        }
-
-        public static function requestPlaylistXmltv(Playlist $playlist): array
-        {
-            $disk = Storage::disk('local');
-            $path = self::getPlaylistEpgCachePath($playlist);
-            if ($disk->exists($path)) {
-                return ['hit' => true, 'body' => $disk->get($path)];
-            }
-
-            $body = self::$latestXmlByPlaylist[$playlist->id];
-            $disk->put($path, $body);
-            $disk->put(self::getPlaylistEpgCachePath($playlist, true), 'gzip:'.$body);
-
-            return ['hit' => false, 'body' => $body];
-        }
-    }
-
-    class TmdbService {}
-}
-
-namespace App\Settings {
-    class GeneralSettings {}
-}
-
-namespace Illuminate\Support\Facades {
-    class Storage
-    {
-        public static array $files = [];
-
-        public static function disk(string $name): self
-        {
-            return new self();
-        }
-
-        public function exists(string $path): bool
-        {
-            return array_key_exists($path, self::$files);
-        }
-
-        public function delete(string $path): bool
-        {
-            unset(self::$files[$path]);
-
-            return true;
-        }
-
-        public function get(string $path): string
-        {
-            return self::$files[$path];
-        }
-
-        public function put(string $path, string $contents): void
-        {
-            self::$files[$path] = $contents;
-        }
-    }
-
-    class Http {}
-    class Log {}
-}
-
+namespace App\Models { class Values { public function __construct(private array $v) {} public function filter(): self { return $this; } public function unique(): self { return $this; } public function values(): self { return $this; } public function all(): array { return $this->v; } } class Query { public function __construct(private bool $channel) {} public function __call(string $m, array $a): self { return $this; } public function pluck(string $c): Values { return new Values($this->channel ? ['target'] : [1]); } } class Channel { public static function query(): Query { return new Query(false); } } class EpgChannel { public static function query(): Query { return new Query(true); } } class Epg { public string $name = 'Output fixture'; public static function find(int $id): self { return new self(); } } class Playlist {} }
+namespace App\Services { class EpgCacheService { public function isCacheValid(object $epg): bool { return true; } } class TmdbService { protected string $language = ''; public function isConfigured(): bool { return true; } } class EpgCacheEnrichmentService { public array $applies = []; public array $outcomes = ['applied']; public function snapshot(object $c, object $e, int $afterId = 0, int $limit = 500): array { return ['status' => 'ok', 'programmes' => [['id' => 1, 'hash' => 'output-hash', 'programme' => ['channel' => 'target', 'title' => 'Bundesliga']]], 'next' => null]; } public function apply(object $c, object $e, array $patches): array { $this->applies[] = compact('patches'); return ['status' => array_shift($this->outcomes) ?? 'applied']; } } }
+namespace App\Settings { class GeneralSettings { public string $tmdb_language = 'de-DE'; } }
+namespace Illuminate\Support\Facades { class Storage { public static function disk(string $n): self { return new self(); } public function makeDirectory(string $p): void {} public function path(string $p): string { return sys_get_temp_dir().'/'.$p; } public function exists(string $p): bool { return false; } public function get(string $p): string { return '{}'; } public function put(string $p, string $v): bool { return true; } } class Http {} class Log {} }
 namespace Tests {
     require_once __DIR__.'/../Plugin.php';
+    use App\Plugins\Support\PluginExecutionContext; use App\Services\{EpgCacheEnrichmentService, EpgCacheService, TmdbService}; use App\Settings\GeneralSettings; use AppLocalPlugins\EpgEnricher\Plugin; use ReflectionMethod;
+    function same(mixed $e, mixed $a, string $m): void { if ($e !== $a) { fwrite(STDERR, "$m\nExpected: ".var_export($e, true)."\nActual: ".var_export($a, true)."\n"); exit(1); } }
+    function applyHostPatch(array $programme, array $changes): array { $imagesAppend = $changes['images_append'] ?? []; unset($changes['images_append']); $programme = array_replace($programme, $changes); foreach ($imagesAppend as $image) { if (! in_array($image, $programme['images'] ?? [], true)) { $programme['images'][] = $image; } } return $programme; }
+    function execute(array $outcomes): array { $host = new EpgCacheEnrichmentService(); $host->outcomes = $outcomes; $GLOBALS['outputServices'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => new TmdbService(), GeneralSettings::class => new GeneralSettings()]; $context = new PluginExecutionContext(); $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true); return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context]; }
+    // Replaces the prior post-enrichment XMLTV-cache assertions.  The host owns
+    // serialization now, so publication is observed at its conditional-apply boundary.
+    [$accepted, $acceptedHost, $acceptedContext] = execute(['applied']);
+    same('completed', $accepted->status, 'The retained output contract must complete only after host publication.');
+    same(true, $accepted->success, 'An accepted host publication must be successful.');
+    same(1, $accepted->data['programmes_processed'] ?? null, 'The selected canonical programme must be processed once.');
+    same(1, $accepted->data['programmes_updated'] ?? null, 'Only an accepted host apply may count a programme update.');
+    same(1, count($acceptedHost->applies), 'An affected selected programme must submit one host patch batch.');
+    same(1, $acceptedHost->applies[0]['patches'][0]['id'] ?? null, 'The host programme id must remain attached to its output patch.');
+    same('output-hash', $acceptedHost->applies[0]['patches'][0]['hash'] ?? null, 'The host content hash must remain attached to its output patch.');
+    same('Sports', $acceptedHost->applies[0]['patches'][0]['changes']['category'] ?? null, 'The enriched output category must be published through the host.');
+    same(['Checking programme details and artwork.', 'Saving updates.'], $acceptedContext->messages, 'End-user messages must cover evidence, apply, and accepted output work.');
 
-    use App\Models\Channel;
-    use App\Models\Playlist;
-    use App\Plugins\Support\PluginExecutionContext;
-    use App\Services\EpgCacheService;
-    use AppLocalPlugins\EpgEnricher\Plugin;
-    use Illuminate\Support\Facades\Storage;
-    use ReflectionClass;
-
-    function assertSameValue(mixed $expected, mixed $actual, string $message): void
-    {
-        if ($expected !== $actual) {
-            fwrite(STDERR, $message."\nExpected: ".var_export($expected, true)."\nActual: ".var_export($actual, true)."\n");
-            exit(1);
-        }
+    // A host no-op replaces the old “unchanged playlist output stays cached” case:
+    // no direct XMLTV/cache action is available to the plugin.
+    [$noop, $noopHost, $noopContext] = execute(['noop']);
+    same('completed', $noop->status, 'A host no-op remains a completed non-mutation.');
+    same(true, $noop->success, 'A host no-op must remain a successful scan.');
+    same(1, $noop->data['programmes_processed'] ?? null, 'A no-op still scans the canonical selected programme.');
+    same(0, $noop->data['programmes_updated'] ?? null, 'A no-op must not advertise an XMLTV/output mutation.');
+    same(1, count($noopHost->applies), 'The host, rather than a direct output cache, must decide a no-op.');
+    same(1, $noopHost->applies[0]['patches'][0]['id'] ?? null, 'A no-op remains bound to the host programme id.');
+    same(['Checking programme details and artwork.', 'Saving updates.'], $noopContext->messages, 'No-op output must report evidence and the attempted save without claiming publication.');
+    $changes = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(new Plugin(), ['icon' => 'https://source.invalid/icon.png', 'images' => []], ['icon' => 'https://source.invalid/icon.png', 'images' => [['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10], ['url' => 'https://fixture.invalid/backdrop.jpg', 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 20], ['url' => 'https://fixture.invalid/still.jpg', 'type' => 'screenshot', 'width' => 1280, 'height' => 720, 'orient' => 'L', 'size' => 30], ['url' => 'https://fixture.invalid/logo.png', 'type' => 'logo', 'width' => 800, 'height' => 300, 'orient' => 'L', 'size' => 40]]]);
+    same(['poster', 'fanart', 'banner', 'logo'], array_column($changes['images'] ?? [], 'type'), 'Poster, backdrop, still and logo retain separate canonical roles.');
+    same(['https://fixture.invalid/poster.jpg', 'https://fixture.invalid/backdrop.jpg', 'https://fixture.invalid/still.jpg', 'https://fixture.invalid/logo.png'], array_column($changes['images'] ?? [], 'url'), 'Role-specific output URLs must be retained.');
+    same([1000, 1920, 1280, 800], array_column($changes['images'] ?? [], 'width'), 'Artwork widths must survive canonical serialization.');
+    same([1500, 1080, 720, 300], array_column($changes['images'] ?? [], 'height'), 'Artwork heights must survive canonical serialization.');
+    same(['P', 'L', 'L', 'L'], array_column($changes['images'] ?? [], 'orient'), 'Artwork orientations must remain role-specific.');
+    same([10, 20, 30, 40], array_column($changes['images'] ?? [], 'size'), 'Artwork sizes must survive canonical serialization.');
+    same(false, isset($changes['icon']), 'An unchanged generic icon must not be overwritten by artwork roles.');
+    $newPoster = ['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10];
+    foreach ([
+        'dimensioned untyped' => ['url' => 'https://source.invalid/untyped.jpg', 'width' => 1280, 'height' => 720],
+        'untyped without dimensions' => ['url' => 'https://source.invalid/untyped-without-dimensions.jpg'],
+        'untyped null dimensions' => ['url' => 'https://source.invalid/untyped-null-dimensions.jpg', 'width' => null, 'height' => null],
+        'typed non-numeric dimensions' => ['url' => 'https://source.invalid/typed-non-numeric.jpg', 'type' => 'poster', 'width' => 'wide', 'height' => 'tall'],
+        'typed non-positive dimensions' => ['url' => 'https://source.invalid/typed-non-positive.jpg', 'type' => 'poster', 'width' => 0, 'height' => -1],
+        'unknown role' => ['url' => 'https://source.invalid/unknown-role.jpg', 'type' => 'legacy', 'width' => 1280, 'height' => 720],
+    ] as $shape => $legacyImage) {
+        $untypedBefore = ['images' => [$legacyImage]];
+        $untypedAfter = ['images' => [$legacyImage, $newPoster]];
+        $untypedChanges = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(new Plugin(), $untypedBefore, $untypedAfter);
+        same([$newPoster], $untypedChanges['images_append'] ?? null, "A host patch must append a validated poster while preserving {$shape} untyped source artwork.");
+        same(false, isset($untypedChanges['images']), "A host patch must not replace {$shape} untyped source artwork.");
+        same([$legacyImage, $newPoster], applyHostPatch($untypedBefore, $untypedChanges)['images'], "A fake host apply must retain {$shape} untyped source artwork and persist the validated poster.");
     }
-
-    $first = new Playlist(10, 'First selected');
-    $second = new Playlist(11, 'Second selected');
-    $unaffected = new Playlist(12, 'Unaffected selected');
-    $unselected = new Playlist(13, 'Unselected');
-    Playlist::$rows = [$first, $second, $unaffected, $unselected];
-    Channel::$rows = [
-        ['playlist_id' => 10, 'enabled' => true, 'epg_channel_id' => 101, 'epg_id' => 1],
-        ['playlist_id' => 10, 'enabled' => true, 'epg_channel_id' => 102, 'epg_id' => 2],
-        ['playlist_id' => 11, 'enabled' => true, 'epg_channel_id' => 103, 'epg_id' => 2],
-        ['playlist_id' => 12, 'enabled' => true, 'epg_channel_id' => 104, 'epg_id' => 3],
-        ['playlist_id' => 13, 'enabled' => true, 'epg_channel_id' => 105, 'epg_id' => 1],
-    ];
-
-    foreach (Playlist::$rows as $playlist) {
-        Storage::$files[EpgCacheService::getPlaylistEpgCachePath($playlist)] = '<category>Soap</category>';
-        Storage::$files[EpgCacheService::getPlaylistEpgCachePath($playlist, true)] = 'gzip:<category>Soap</category>';
-        EpgCacheService::$latestXmlByPlaylist[$playlist->id] = '<category>Series</category>';
+    $trustedLandscape = new ReflectionMethod(Plugin::class, 'hasTrustedLandscapeIcon');
+    $trustedLandscape->setAccessible(true);
+    foreach (['fanart', 'banner'] as $canonicalRole) {
+        $hostRoundTrip = [
+            'icon' => "https://image.tmdb.org/t/p/w1280/host-{$canonicalRole}.jpg",
+            'images' => [[
+                'url' => "https://image.tmdb.org/t/p/w1280/host-{$canonicalRole}.jpg",
+                'type' => $canonicalRole,
+                'width' => 1280,
+                'height' => 720,
+                'orient' => 'L',
+                'size' => 1,
+            ]],
+        ];
+        same(true, $trustedLandscape->invoke(new Plugin(), $hostRoundTrip), "A canonical host round-trip of a TMDB {$canonicalRole} role must remain trusted and avoid repeated artwork repair.");
     }
-
-    $plugin = new Plugin();
-    $reflection = new ReflectionClass($plugin);
-    $invalidate = $reflection->getMethod('invalidatePlaylistEpgCaches');
-    $invalidate->setAccessible(true);
-    $invalidate->invoke($plugin, [10, 11, 12], [1, 2], new PluginExecutionContext(false));
-
-    assertSameValue([10, 11], EpgCacheService::$clearCalls, 'Each affected selected playlist must be invalidated exactly once across modified EPG sources.');
-    foreach ([$first, $second] as $playlist) {
-        $request = EpgCacheService::requestPlaylistXmltv($playlist);
-        assertSameValue(false, $request['hit'], 'The first post-enrichment XMLTV request must not remain a stale cache hit.');
-        assertSameValue('<category>Series</category>', $request['body'], 'The regenerated XMLTV must expose the enriched category.');
-    }
-    assertSameValue(true, EpgCacheService::requestPlaylistXmltv($unaffected)['hit'], 'A selected playlist whose EPG did not change must retain its cache.');
-    assertSameValue(true, EpgCacheService::requestPlaylistXmltv($unselected)['hit'], 'An unselected playlist must retain its cache.');
-
-    $callsBeforeNoOp = EpgCacheService::$clearCalls;
-    $invalidate->invoke($plugin, [10, 11], [], new PluginExecutionContext(false));
-    $invalidate->invoke($plugin, [10, 11], [1, 2], new PluginExecutionContext(true));
-    assertSameValue($callsBeforeNoOp, EpgCacheService::$clearCalls, 'No-op and dry-run enrichment must not invalidate playlist caches.');
-
+    $untrustedBannerRoundTrip = $hostRoundTrip;
+    $untrustedBannerRoundTrip['icon'] = 'https://untrusted.invalid/host-banner.jpg';
+    $untrustedBannerRoundTrip['images'][0]['url'] = $untrustedBannerRoundTrip['icon'];
+    same(false, $trustedLandscape->invoke(new Plugin(), $untrustedBannerRoundTrip), 'A source-less banner outside the verified TMDB host must not become trusted.');
+    $tokens = token_get_all((string) file_get_contents(__DIR__.'/../Plugin.php')); $code = ''; foreach ($tokens as $token) { $code .= is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true) ? '' : (is_array($token) ? $token[1] : $token); } foreach (['requestPlaylistXmltv', 'clearPlaylistEpgCacheFile', 'playlist-epg-files'] as $forbidden) { same(false, str_contains($code, $forbidden), "Direct output adapter $forbidden must not return."); }
     echo "Emby output contract tests passed.\n";
-    echo json_encode([
-        'selected_playlist_invalidations' => EpgCacheService::$clearCalls,
-        'post_enrichment_stale_hits' => 0,
-        'fixture_network_calls' => 0,
-    ], JSON_THROW_ON_ERROR)."\n";
 }
