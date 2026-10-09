@@ -922,7 +922,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
         $imagesCache = $this->loadTmdbImagesCache();
-        $seriesEvidence = $this->collectFreshSeriesBindings($service, $epg, $epgId, $targetChannels, $context, $settings, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $tmdbLanguage);
+        $seriesEvidence = $this->collectFreshSeriesBindings($service, $epg, $epgId, $targetChannels, $context, $settings, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $tmdbLanguage, $progress);
         if ($seriesEvidence instanceof PluginActionResult) {
             return $seriesEvidence;
         }
@@ -942,6 +942,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 (bool) ($settings['enrich_posters'] ?? true),
                 (bool) ($settings['enrich_backdrops'] ?? true),
                 (bool) (($settings['overwrite_existing'] ?? false) || ($settings['replace_existing_artwork'] ?? false)),
+                $progress,
             );
             if ($bindingResult instanceof PluginActionResult) {
                 return $bindingResult;
@@ -1174,7 +1175,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /** @return array{bindings: array<string, array>, evidence: ?string}|PluginActionResult */
-    private function collectFreshSeriesBindings(object $service, Epg $epg, int $epgId, array $targetChannels, PluginExecutionContext $context, array $settings, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, string $tmdbLanguage): array|PluginActionResult
+    private function collectFreshSeriesBindings(object $service, Epg $epg, int $epgId, array $targetChannels, PluginExecutionContext $context, array $settings, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, string $tmdbLanguage, ?array $progress = null): array|PluginActionResult
     {
         // Cross-row reuse requires the additive host evidence capability. Older hosts
         // retain ordinary per-row enrichment but cannot establish a safe binding.
@@ -1206,7 +1207,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
             $evidence = $snapshot['evidence'];
             if (! $loggedCheckingProgrammeDetails) {
-                $context->checkpoint(5, 'Checking programme details and artwork.', ['summary' => 'Checking programme details and artwork.'], log: true);
+                $context->checkpoint($this->progressCheckpoint($progress), 'Checking programme details and artwork.', ['summary' => 'Checking programme details and artwork.'], log: true);
                 $loggedCheckingProgrammeDetails = true;
             } else {
                 $context->heartbeat('Checking programme details and artwork.');
@@ -1235,12 +1236,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /** @return array{programmes_updated:int,posters_added:int}|PluginActionResult */
-    private function applyFreshSeriesArtworkBindings(object $service, Epg $epg, string $epgSourceId, string $tmdbLanguage, array $targetChannels, PluginExecutionContext $context, array $bindings, string $evidence, bool $enrichPosters, bool $enrichBackdrops, bool $overwriteArtwork): array|PluginActionResult
+    private function applyFreshSeriesArtworkBindings(object $service, Epg $epg, string $epgSourceId, string $tmdbLanguage, array $targetChannels, PluginExecutionContext $context, array $bindings, string $evidence, bool $enrichPosters, bool $enrichBackdrops, bool $overwriteArtwork, ?array $progress = null): array|PluginActionResult
     {
         $afterId = 0;
         $updated = 0;
         $postersAdded = 0;
-        $context->checkpoint(80, 'Applying validated series artwork.', ['summary' => 'Applying validated series artwork.'], log: true);
+        $context->checkpoint($this->progressCheckpoint($progress), 'Applying validated series artwork.', ['summary' => 'Applying validated series artwork.'], log: true);
         $loggedSavingSeriesArtwork = false;
         do {
             if ($context->cancellationRequested()) {
@@ -1275,10 +1276,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
             if ($patches !== []) {
                 if (! $loggedSavingSeriesArtwork) {
-                    $context->checkpoint(90, 'Saving validated series artwork.', ['summary' => 'Saving validated series artwork.'], log: true);
+                    $context->checkpoint($this->progressCheckpoint($progress), 'Saving validated series artwork.', ['summary' => 'Saving validated series artwork.'], log: true);
                     $loggedSavingSeriesArtwork = true;
                 } else {
-                    $context->heartbeat('Saving validated series artwork.', 90, ['summary' => 'Saving validated series artwork.']);
+                    $context->heartbeat('Saving validated series artwork.', $this->progressCheckpoint($progress), ['summary' => 'Saving validated series artwork.']);
                 }
                 $apply = $service->guardedApply($context, $epg, $patches, $evidence);
                 $status = $apply['status'] ?? 'unknown';

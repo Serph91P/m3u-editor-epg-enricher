@@ -471,6 +471,17 @@ namespace Tests {
     same(true, $normalResult->success, 'Normal metadata enrichment alongside a binding must succeed.');
     same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($normalHost->records[2]['programme']), true), 'A later target must retain safe reuse after an earlier normal metadata write consumes evidence.');
     same(true, count($normalHost->applies) >= 1, 'Evidence-changing metadata must use the ordinary conditional apply path after binding artwork is complete.');
+    $previousProgress = 0;
+    foreach ($normalContext->checkpoints as $checkpoint) {
+        same(true, $checkpoint['progress'] >= $previousProgress, 'Binding artwork phases must not make the visible run progress regress before ordinary enrichment.');
+        same(true, $checkpoint['log'], 'Every visible binding artwork phase must create a Live Activity log entry.');
+        same($checkpoint['message'], $checkpoint['state']['summary'] ?? null, 'Visible binding artwork phases must refresh the Current Signal summary.');
+        $previousProgress = $checkpoint['progress'];
+    }
+    foreach (['Checking programme details and artwork.', 'Applying validated series artwork.', 'Saving validated series artwork.'] as $message) {
+        same(true, in_array($message, array_column($normalContext->checkpoints, 'message'), true), "Binding artwork runs must expose the {$message} phase.");
+        same(true, in_array(['level' => 'info', 'message' => $message], $normalContext->logs, true), "Binding artwork runs must log the {$message} phase.");
+    }
     foreach ($normalHost->guardedApplies as $guardedApply) {
         foreach ($guardedApply['patches'] as $patch) {
             same([], array_values(array_diff(array_keys($patch['changes']), ['icon', 'images'])), 'Guarded successor-token batches must contain artwork changes only.');
