@@ -44,12 +44,12 @@ namespace Tests {
     same(1, $noopHost->applies[0]['patches'][0]['id'] ?? null, 'A no-op remains bound to the host programme id.');
     same(['Checking programme details and artwork.', 'Saving updates.'], $noopContext->messages, 'No-op output must report evidence and the attempted save without claiming publication.');
     $changes = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(new Plugin(), ['icon' => 'https://source.invalid/icon.png', 'images' => []], ['icon' => 'https://source.invalid/icon.png', 'images' => [['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10], ['url' => 'https://fixture.invalid/backdrop.jpg', 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 20], ['url' => 'https://fixture.invalid/still.jpg', 'type' => 'screenshot', 'width' => 1280, 'height' => 720, 'orient' => 'L', 'size' => 30], ['url' => 'https://fixture.invalid/logo.png', 'type' => 'logo', 'width' => 800, 'height' => 300, 'orient' => 'L', 'size' => 40]]]);
-    same(['poster', 'fanart', 'banner', 'logo'], array_column($changes['images'] ?? [], 'type'), 'Poster, backdrop, still and logo retain separate canonical roles.');
-    same(['https://fixture.invalid/poster.jpg', 'https://fixture.invalid/backdrop.jpg', 'https://fixture.invalid/still.jpg', 'https://fixture.invalid/logo.png'], array_column($changes['images'] ?? [], 'url'), 'Role-specific output URLs must be retained.');
-    same([1000, 1920, 1280, 800], array_column($changes['images'] ?? [], 'width'), 'Artwork widths must survive canonical serialization.');
-    same([1500, 1080, 720, 300], array_column($changes['images'] ?? [], 'height'), 'Artwork heights must survive canonical serialization.');
-    same(['P', 'L', 'L', 'L'], array_column($changes['images'] ?? [], 'orient'), 'Artwork orientations must remain role-specific.');
-    same([10, 20, 30, 40], array_column($changes['images'] ?? [], 'size'), 'Artwork sizes must survive canonical serialization.');
+    same(['poster', 'backdrop', 'still'], array_column($changes['images'] ?? [], 'type'), 'Poster, backdrop and still must use XMLTV DTD roles at the host boundary.');
+    same(['https://fixture.invalid/poster.jpg', 'https://fixture.invalid/backdrop.jpg', 'https://fixture.invalid/still.jpg'], array_column($changes['images'] ?? [], 'url'), 'DTD role-specific output URLs must be retained without inventing a programme logo role.');
+    same([1000, 1920, 1280], array_column($changes['images'] ?? [], 'width'), 'Artwork widths must survive canonical serialization.');
+    same([1500, 1080, 720], array_column($changes['images'] ?? [], 'height'), 'Artwork heights must survive canonical serialization.');
+    same(['P', 'L', 'L'], array_column($changes['images'] ?? [], 'orient'), 'Artwork orientations must remain role-specific.');
+    same([10, 20, 30], array_column($changes['images'] ?? [], 'size'), 'Artwork sizes must survive canonical serialization.');
     same(false, isset($changes['icon']), 'An unchanged generic icon must not be overwritten by artwork roles.');
     $newPoster = ['url' => 'https://fixture.invalid/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 10];
     foreach ([
@@ -63,13 +63,12 @@ namespace Tests {
         $untypedBefore = ['images' => [$legacyImage]];
         $untypedAfter = ['images' => [$legacyImage, $newPoster]];
         $untypedChanges = (new ReflectionMethod(Plugin::class, 'canonicalHostChanges'))->invoke(new Plugin(), $untypedBefore, $untypedAfter);
-        same([$newPoster], $untypedChanges['images_append'] ?? null, "A host patch must append a validated poster while preserving {$shape} untyped source artwork.");
-        same(false, isset($untypedChanges['images']), "A host patch must not replace {$shape} untyped source artwork.");
-        same([$legacyImage, $newPoster], applyHostPatch($untypedBefore, $untypedChanges)['images'], "A fake host apply must retain {$shape} untyped source artwork and persist the validated poster.");
+        same([], $untypedChanges, "A PR1605 host patch must abstain when {$shape} source artwork cannot be represented losslessly.");
+        same([$legacyImage], applyHostPatch($untypedBefore, $untypedChanges)['images'], "Abstention must retain {$shape} source artwork unchanged.");
     }
     $trustedLandscape = new ReflectionMethod(Plugin::class, 'hasTrustedLandscapeIcon');
     $trustedLandscape->setAccessible(true);
-    foreach (['fanart', 'banner'] as $canonicalRole) {
+    foreach (['backdrop', 'still'] as $canonicalRole) {
         $hostRoundTrip = [
             'icon' => "https://image.tmdb.org/t/p/w1280/host-{$canonicalRole}.jpg",
             'images' => [[

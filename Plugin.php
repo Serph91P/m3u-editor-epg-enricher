@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.10.08-separate-artwork-overwrite';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.10.09-horizontal-show-primary';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1268,7 +1268,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     continue;
                 }
                 $changes = $this->canonicalHostChanges($row['programme'], $programme);
-                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images', 'images_append']) !== []) {
+                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images']) !== []) {
                     continue;
                 }
                 $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
@@ -1420,35 +1420,56 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         if (($after['images'] ?? []) !== ($before['images'] ?? [])) {
             $beforeImages = [];
-            $preserveUntypedSourceImages = false;
+            $canReplaceImages = true;
             foreach ((array) ($before['images'] ?? []) as $image) {
                 $canonicalImage = $this->canonicalHostImage($image);
-                if ($canonicalImage === null) {
-                    $preserveUntypedSourceImages = true;
-                } else {
+                if ($canonicalImage !== null) {
                     $beforeImages[] = $canonicalImage;
+                } elseif ($this->isHostValidUntypedImage($image)) {
+                    $beforeImages[] = $image;
+                } else {
+                    $canReplaceImages = false;
+                    break;
                 }
             }
             $images = [];
-            foreach ((array) ($after['images'] ?? []) as $image) {
-                $canonicalImage = $this->canonicalHostImage($image);
-                if ($canonicalImage !== null) {
-                    $images[] = $canonicalImage;
+            if ($canReplaceImages) {
+                foreach ((array) ($after['images'] ?? []) as $image) {
+                    $canonicalImage = $this->canonicalHostImage($image);
+                    if ($canonicalImage !== null) {
+                        $images[] = $canonicalImage;
+                    } elseif ($this->isHostValidUntypedImage($image)) {
+                        $images[] = $image;
+                    } else {
+                        continue;
+                    }
                 }
             }
-            if ($preserveUntypedSourceImages) {
-                $appendedImages = array_values(array_filter(
-                    $images,
-                    fn (array $image): bool => ! in_array($image, $beforeImages, true),
-                ));
-                if ($appendedImages !== []) {
-                    $changes['images_append'] = $appendedImages;
-                }
-            } else {
+            if ($canReplaceImages && $images !== $beforeImages) {
                 $changes['images'] = $images;
             }
         }
         return $changes;
+    }
+
+    private function isHostValidUntypedImage(mixed $image): bool
+    {
+        if (! is_array($image)) {
+            return false;
+        }
+        $keys = array_keys($image);
+        sort($keys);
+        if ($keys !== ['height', 'orient', 'size', 'type', 'url', 'width']) {
+            return false;
+        }
+
+        return $image['type'] === ''
+            && is_string($image['orient'])
+            && is_int($image['width'])
+            && is_int($image['height'])
+            && is_int($image['size'])
+            && is_string($image['url'])
+            && $this->isCanonicalHostArtworkUrl($image['url']);
     }
 
     /** @return array{url: string, type: string, width: int, height: int, orient: string, size: int}|null */
@@ -1463,8 +1484,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || ! $this->isCanonicalHostArtworkUrl($image['url'])) {
             return null;
         }
-        $type = match ($image['type'] ?? '') { 'backdrop' => 'fanart', 'screenshot' => 'banner', default => $image['type'] ?? '' };
-        if (! in_array($type, ['poster', 'banner', 'fanart', 'logo'], true)) {
+        $type = match ($image['type'] ?? '') { 'screenshot' => 'still', default => $image['type'] ?? '' };
+        if (! in_array($type, ['poster', 'backdrop', 'still', 'person', 'character'], true)) {
             return null;
         }
 
@@ -1496,7 +1517,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
-        foreach (['images', 'images_append'] as $field) {
+        foreach (['images'] as $field) {
             foreach ((array) ($changes[$field] ?? []) as $image) {
                 if (is_array($image)
                     && ($image['type'] ?? null) === 'poster'
@@ -1637,14 +1658,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || $seriesSignals['season'] !== null
             || $seriesSignals['episode'] !== null
             || $seriesSignals['confidence'] === 'high';
-        $isSeriesLikeCategory = in_array(mb_strtolower($existingCategory), ['series', 'kids'], true);
         $trustedEpisodeStillIcon = $this->hasTrustedEpisodeStillIcon($programme);
         $categoryMappingEnabled = $mapGenresToEpgCategories || $mapGenresToKodiGuideGenres;
-        $needsCategoryFix = $categoryMappingEnabled
-            && $enrichCategories
-            && $hasCategory
-            && $isSeriesEpisode
-            && ! $isSeriesLikeCategory;
 
         if (! $overwrite
             && (! $overwriteArtwork || ! $wantsArtwork)
@@ -1652,8 +1667,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             && (! $wantsArtwork || ! $trustedNonTmdbLandscapeIcon)
             && ($hasCategory || ! $enrichCategories)
             && ($hasDesc || ! $enrichDescriptions)
-            && (! $enrichEpisodeDetails || ! $hasStrongSeriesSignals || $trustedEpisodeStillIcon)
-            && ! $needsCategoryFix) {
+            && (! $enrichEpisodeDetails || ! $hasStrongSeriesSignals || $trustedEpisodeStillIcon)) {
             if ($trustedLandscapeIcon && (! $overwriteArtwork || $wantsArtwork)
                 && $this->finalizeImageSerialization($programme, true, $overwrite)) {
                 $result['changed'] = true;
@@ -1667,7 +1681,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // This prevents unnecessary TMDB lookups for live sports, news, etc. and avoids
         // wrong matches like "ALL IN - Die Bundesliga Highlight Show" → film "All In".
         $keywordCategory = null;
-        if ($keywordDetection && $categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix)) {
+        if ($keywordDetection && $categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory)) {
             $keywordCategory = $this->detectCategoryFromTitle($title);
             if ($keywordCategory !== null) {
                 $programme['category'] = $mapGenresToKodiGuideGenres
@@ -1813,6 +1827,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 null,
                 $episodeIdentity,
                 $episodeValidationPath,
+                (string) ($lookupContext['tmdb_language'] ?? ''),
             );
             $matchedViaBase = false;
 
@@ -1828,6 +1843,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $compoundIdentity,
                     $episodeIdentity,
                     $episodeValidationPath,
+                    (string) ($lookupContext['tmdb_language'] ?? ''),
                 );
                 $matchedViaBase = $tmdbData !== null;
             }
@@ -1866,7 +1882,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         if (! $tmdbData) {
-            if ($categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory || $needsCategoryFix) && $isSeriesEpisode) {
+            if ($categoryMappingEnabled && $enrichCategories && ($overwrite || ! $hasCategory) && $isSeriesEpisode) {
                 $programme['category'] = $mapGenresToKodiGuideGenres
                     ? $this->mapToKodiGuideGenre('Series', 'tv')
                     : 'Series';
@@ -1895,7 +1911,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $mediaType = $tmdbData['_media_type'] ?? null;
 
         // Add poster to images array (size=2: portrait for info/details views)
-        if ($enrichPosters && $posterUrl && ! ($artworkOnlyOverwrite && $trustedPoster)) {
+        if ($enrichPosters && $posterUrl
+            && ($overwriteArtwork || ! $trustedPoster)
+            && ! ($artworkOnlyOverwrite && $trustedPoster)) {
             $hasTmdbPoster = false;
             foreach (($programme['images'] ?? []) as $image) {
                 if (($image['url'] ?? null) === $posterUrl
@@ -2010,14 +2028,20 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                             $result['changed'] = true;
                         }
                     }
-                    if ($overwriteArtwork && $enrichPosters && $selectedPoster !== null) {
-                        $programme['images'] = $this->withoutArtworkRoles($programme['images'] ?? [], ['poster']);
+                    if ($enrichPosters && $selectedPoster !== null && ($overwriteArtwork || ! $trustedPoster)) {
+                        $programme['images'] = $overwriteArtwork
+                            ? $this->withoutArtworkRoles($programme['images'] ?? [], ['poster'])
+                            : array_values(array_filter(
+                                $programme['images'] ?? [],
+                                static fn (array $image): bool => ($image['type'] ?? null) !== 'poster'
+                                    || ($image['source'] ?? null) !== 'tmdb',
+                            ));
                     }
                     if ($overwriteArtwork && $enrichBackdrops && $selectedBackdrop !== null) {
                         $programme['images'] = $this->withoutArtworkRoles($programme['images'] ?? [], ['backdrop', 'fanart']);
                     }
                     foreach ($candidates as $img) {
-                        if ($img['type'] === 'poster' && ! $enrichPosters) {
+                        if ($img['type'] === 'poster' && (! $enrichPosters || (! $overwriteArtwork && $trustedPoster))) {
                             continue;
                         }
                         if ($img['type'] === 'backdrop' && ! $enrichBackdrops) {
@@ -2100,8 +2124,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $result['category'] = true;
                 $result['changed'] = true;
             }
-        } elseif (($mapGenresToKodiGuideGenres || $mapGenresToEpgCategories) && $hasCategory) {
-            // Map existing category even if not enriching from TMDB.
+        } elseif (($mapGenresToKodiGuideGenres || $mapGenresToEpgCategories) && $hasCategory && $overwrite) {
+            // Existing categories are remapped only when metadata overwrite is explicit.
             $mapped = $mapGenresToKodiGuideGenres
                 ? $this->mapToKodiGuideGenre($existingCategory, $mediaType)
                 : $this->mapToEpgCategory($existingCategory, $mediaType);
@@ -2434,7 +2458,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return strcmp((string) ($a['file_path'] ?? ''), (string) ($b['file_path'] ?? ''));
         };
 
-        // Backdrops zuerst (landscape primary, size=1), sprach-neutral bevorzugt
+        // A non-null TMDB image language is the only provider signal available for a
+        // likely title/brand-bearing horizontal show image. It is best-effort (not OCR):
+        // selected language, English and language-neutral remain the fallback ladder.
         $detailsBackdropPath = $detailsBackdropUrl !== null
             ? $this->tmdbImageFilePath($detailsBackdropUrl)
             : null;
@@ -2456,14 +2482,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
             }
         }
-        $langPrioBack = [null, $shortLang, 'en'];
+        $langPrioBack = array_values(array_unique([$shortLang, 'en', null], SORT_REGULAR));
         usort($backdrops, function (array $a, array $b) use ($detailsBackdropPath, $rank, $langPrioBack): int {
-            // The details response establishes the canonical artwork identity. Alternative
-            // ranking only applies after a genuine canonical backdrop has been considered.
-            $detailsOrder = (($b['file_path'] ?? null) === $detailsBackdropPath)
-                <=> (($a['file_path'] ?? null) === $detailsBackdropPath);
-            if ($detailsOrder !== 0) {
-                return $detailsOrder;
+            $languageOrder = $rank($a, $langPrioBack) <=> $rank($b, $langPrioBack);
+            if ($languageOrder !== 0) {
+                return $languageOrder;
             }
 
             $geometry = function (array $image): float {
@@ -2480,9 +2503,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return $geometryOrder;
             }
 
-            $languageOrder = $rank($a, $langPrioBack) <=> $rank($b, $langPrioBack);
-            if ($languageOrder !== 0) {
-                return $languageOrder;
+            // Within the same language tier retain TMDB's details artwork as the stable
+            // series-wide tie-break before votes and deterministic path ordering.
+            $detailsOrder = (($b['file_path'] ?? null) === $detailsBackdropPath)
+                <=> (($a['file_path'] ?? null) === $detailsBackdropPath);
+            if ($detailsOrder !== 0) {
+                return $detailsOrder;
             }
 
             $voteOrder = ($b['vote_average'] ?? 0) <=> ($a['vote_average'] ?? 0);
@@ -2502,10 +2528,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
             return strcmp((string) ($a['file_path'] ?? ''), (string) ($b['file_path'] ?? ''));
         });
-        foreach (array_slice($backdrops, 0, 2) as $b) {
-            if (empty($b['file_path'])) {
+        $selectedBackdropPaths = [];
+        foreach ($backdrops as $b) {
+            if (count($selectedBackdropPaths) >= 2) {
+                break;
+            }
+            if (empty($b['file_path']) || isset($selectedBackdropPaths[$b['file_path']])) {
                 continue;
             }
+            $selectedBackdropPaths[$b['file_path']] = true;
             $isDetailsFallback = ($b['_details_fallback'] ?? false) === true;
             $out[] = [
                 'url' => $isDetailsFallback ? $detailsBackdropUrl : 'https://image.tmdb.org/t/p/w1280'.$b['file_path'],
@@ -2536,7 +2567,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ));
         $langPrioPoster = [$shortLang, null, 'en'];
         usort($posters, fn ($a, $b) => $sortBy($a, $b, $langPrioPoster));
-        foreach (array_slice($posters, 0, 2) as $p) {
+        foreach (array_slice($posters, 0, 1) as $p) {
             if (empty($p['file_path'])) {
                 continue;
             }
@@ -2579,7 +2610,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             ];
         }
 
-        return $out;
+        $seenUrls = [];
+
+        return array_values(array_filter($out, static function (array $image) use (&$seenUrls): bool {
+            if (isset($seenUrls[$image['url']])) {
+                return false;
+            }
+            $seenUrls[$image['url']] = true;
+
+            return true;
+        }));
     }
 
     /**
@@ -2837,7 +2877,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         foreach ($programme['images'] as $image) {
             if (($image['url'] ?? null) === $icon
-                && strtolower(trim((string) ($image['type'] ?? ''))) === 'screenshot'
+                && in_array(strtolower(trim((string) ($image['type'] ?? ''))), ['screenshot', 'still'], true)
                 && strtolower(trim((string) ($image['scope'] ?? ''))) === 'episode'
                 && $this->isTrustedLandscapeImage($image)) {
                 return true;
@@ -2854,12 +2894,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $source = strtolower(trim((string) ($image['source'] ?? '')));
         $scope = strtolower(trim((string) ($image['scope'] ?? '')));
         $canonicalTmdbRole = $source === ''
-            && in_array($type, ['fanart', 'banner'], true)
+            && in_array($type, ['backdrop', 'still'], true)
             && $this->tmdbImageFilePath((string) ($image['url'] ?? '')) !== null;
 
         if (empty($image['url'])
             || $orient !== 'L'
-            || (! in_array($type, ['backdrop', 'fanart', 'screenshot'], true) && ! $canonicalTmdbRole)
+            || (! in_array($type, ['backdrop', 'fanart', 'screenshot', 'still'], true) && ! $canonicalTmdbRole)
             || ($source !== 'tmdb' && ! $canonicalTmdbRole && ! in_array($scope, ['programme', 'movie', 'series', 'episode'], true))) {
             return false;
         }
@@ -3201,7 +3241,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     private function stripRecognizedEpisodeTitleSuffix(string $title): string
     {
         $cleaned = preg_replace('/\s*\(\d{1,4}\)\s*$/', '', trim($title));
-        $cleaned = preg_replace('/\s*S\d{1,2}E\d{1,2}\s*$/i', '', $cleaned);
+        $cleaned = preg_replace('/\s*(?:\(\s*S\d{1,2}\s*\/\s*E\d{1,2}\s*\)|S\d{1,2}(?:\s*\/\s*|\s*)E\d{1,2})\s*$/i', '', $cleaned);
         $cleaned = preg_replace('/\s*[-\x{2013}\x{2014}]\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
         $cleaned = preg_replace('/\s*(?:Folge|Episode|Ep\.?|Teil|Part)\s*\d+\s*$/iu', '', $cleaned);
 
@@ -3226,6 +3266,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?array $requiredCompoundIdentity = null,
         ?array $episodeIdentity = null,
         ?array &$episodeValidationPath = null,
+        ?string $tmdbLocale = null,
     ): ?array
     {
         $provisionalCompoundIdentity = null;
@@ -3233,31 +3274,101 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $searchNorm = mb_strtolower(trim($searchTitle));
         $candidates = [];
         $hydratedDetails = [];
+        $hasTypedEpisodeIdentity = $forceMediaType === 'tv'
+            && is_int($episodeIdentity['season'] ?? null)
+            && $episodeIdentity['season'] > 0
+            && is_int($episodeIdentity['episode'] ?? null)
+            && $episodeIdentity['episode'] > 0;
 
         if (method_exists($tmdb, 'searchTvSeriesCandidates')
             && method_exists($tmdb, 'searchMovieCandidates')) {
-            try {
-                if ($forceMediaType !== 'movie') {
-                    $tvCandidates = array_slice($tmdb->searchTvSeriesCandidates($searchTitle, $year, 5), 0, 5);
-                    foreach ($tvCandidates as $candidate) {
-                        if (! $this->isValidRawTmdbCandidate($candidate, 'tv')) {
-                            return null;
+            $collectCandidates = function (?int $providerYear, bool $yearFallback = false) use (
+                $tmdb,
+                $searchTitle,
+                $forceMediaType,
+                $searchNorm,
+                $year,
+                $description,
+                $hasTypedEpisodeIdentity,
+            ): ?array {
+                $collected = [];
+                $seenCandidates = [];
+                try {
+                    if ($forceMediaType !== 'movie') {
+                        // The host maps its TV year argument to first_air_date_year. An
+                        // episode broadcast/production year is not a series start year,
+                        // so typed episodes deliberately search TV without that filter.
+                        $tvProviderYear = $hasTypedEpisodeIdentity ? null : $providerYear;
+                        $tvIdentityYear = $hasTypedEpisodeIdentity ? null : $year;
+                        $tvCandidates = array_slice($tmdb->searchTvSeriesCandidates($searchTitle, $tvProviderYear, 10), 0, 10);
+                        foreach ($tvCandidates as $providerRank => $candidate) {
+                            if (! $this->isValidRawTmdbCandidate($candidate, 'tv')) {
+                                return null;
+                            }
+                            if ($yearFallback && ! $hasTypedEpisodeIdentity
+                                && ! $this->isCandidateWithinFallbackYear($candidate, 'tv', $year)) {
+                                continue;
+                            }
+                            $key = 'tv:'.$candidate['tmdb_id'];
+                            if (! isset($seenCandidates[$key])) {
+                                $seenCandidates[$key] = true;
+                                $collected[] = $this->scoreTmdbCandidate(
+                                    array_merge($candidate, ['_provider_rank' => $providerRank + 1]),
+                                    'tv',
+                                    $searchNorm,
+                                    $tvIdentityYear,
+                                    $description,
+                                    [],
+                                );
+                            }
                         }
-                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'tv', $searchNorm, $year, $description, []);
                     }
+
+                    if ($forceMediaType !== 'tv') {
+                        $movieCandidates = array_slice($tmdb->searchMovieCandidates($searchTitle, $providerYear, 10), 0, 10);
+                        foreach ($movieCandidates as $providerRank => $candidate) {
+                            if (! $this->isValidRawTmdbCandidate($candidate, 'movie')) {
+                                return null;
+                            }
+                            if ($yearFallback && ! $this->isCandidateWithinFallbackYear($candidate, 'movie', $year)) {
+                                continue;
+                            }
+                            $key = 'movie:'.$candidate['tmdb_id'];
+                            if (! isset($seenCandidates[$key])) {
+                                $seenCandidates[$key] = true;
+                                $collected[] = $this->scoreTmdbCandidate(
+                                    array_merge($candidate, ['_provider_rank' => $providerRank + 1]),
+                                    'movie',
+                                    $searchNorm,
+                                    $year,
+                                    $description,
+                                    [],
+                                );
+                            }
+                        }
+                    }
+                } catch (\Throwable) {
+                    return null;
                 }
 
-                if ($forceMediaType !== 'tv') {
-                    $movieCandidates = array_slice($tmdb->searchMovieCandidates($searchTitle, $year, 5), 0, 5);
-                    foreach ($movieCandidates as $candidate) {
-                        if (! $this->isValidRawTmdbCandidate($candidate, 'movie')) {
-                            return null;
-                        }
-                        $candidates[] = $this->scoreTmdbCandidate($candidate, 'movie', $searchNorm, $year, $description, []);
-                    }
-                }
-            } catch (\Throwable) {
+                return $collected;
+            };
+
+            $candidates = $collectCandidates($year);
+            if ($candidates === null) {
                 return null;
+            }
+            // Some guide years are copyright/production years while TMDB filters on
+            // release/first-air year. Retry once without the provider-side filter when
+            // the bounded response contains no viable identity, while retaining the
+            // original year for movie/non-episode scoring.
+            if ($year !== null && ! $hasTypedEpisodeIdentity
+                && ! $this->hasPotentialTmdbIdentityCandidate($candidates)) {
+                $fallbackCandidates = $collectCandidates(null, true);
+                if ($fallbackCandidates === null) {
+                    return null;
+                }
+                $candidates = $this->mergeTmdbIdentityCandidates($candidates, $fallbackCandidates);
             }
 
             $best = $this->selectTmdbIdentityWinner($candidates);
@@ -3285,9 +3396,31 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 }
             }
             $episodeValidated = false;
+            $episodeValidationKind = null;
             if ($best === null) {
-                $best = $this->selectEpisodeValidatedTvWinner($tmdb, $candidates, $forceMediaType, $episodeIdentity);
+                $best = $this->selectEpisodeValidatedTvWinner(
+                    $tmdb,
+                    $candidates,
+                    $forceMediaType,
+                    $episodeIdentity,
+                    $episodeValidationKind,
+                );
                 $episodeValidated = $best !== null;
+            }
+            if ($best === null && $candidates !== []) {
+                $candidatesWithAliases = $this->rescoreCandidatesWithAlternativeTitles(
+                    $tmdb,
+                    $candidates,
+                    $searchNorm,
+                    $year,
+                    $description,
+                    $tmdbLocale,
+                );
+                if ($candidatesWithAliases === null) {
+                    return null;
+                }
+                $candidates = $candidatesWithAliases;
+                $best = $this->selectTmdbIdentityWinner($candidates);
             }
             if ($requiredCompoundIdentity !== null) {
                 $best = $this->confirmedCompoundIdentityCandidate(
@@ -3332,14 +3465,24 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 '_media_type' => $selectedMediaType,
             ]);
 
-            unset($best['_identity_valid'], $best['_identity_score']);
+            unset(
+                $best['_identity_valid'],
+                $best['_identity_score'],
+                $best['_identity_primary_title_score'],
+                $best['_identity_description_score'],
+                $best['_identity_person_score'],
+                $best['_identity_overview_overlap'],
+                $best['_provider_rank'],
+            );
 
             if (! $this->hasValidTmdbDetailsShape($best, $selectedMediaType)) {
                 return null;
             }
             if ($episodeValidated) {
                 $episodeValidationPath = [
-                    'path' => 'unique_episode_title',
+                    'path' => $episodeValidationKind === 'series_season'
+                        ? 'unique_series_season'
+                        : 'unique_episode_title',
                     'season' => $episodeIdentity['season'] ?? null,
                     'episode' => $episodeIdentity['episode'] ?? null,
                     'subtitle' => $episodeIdentity['subtitle'] ?? null,
@@ -3499,12 +3642,140 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             || trim((string) $candidate[$titleFields[1]]) !== '';
     }
 
+    private function isCandidateWithinFallbackYear(array $candidate, string $mediaType, ?int $expectedYear): bool
+    {
+        if ($expectedYear === null) {
+            return false;
+        }
+        $dateField = $mediaType === 'tv' ? 'first_air_date' : 'release_date';
+        $date = $candidate[$dateField] ?? null;
+        if (! is_scalar($date) || preg_match('/^(19\d{2}|20\d{2})/', (string) $date, $matches) !== 1) {
+            return false;
+        }
+
+        return abs($expectedYear - (int) $matches[1]) <= 1;
+    }
+
+    private function hasPotentialTmdbIdentityCandidate(array $candidates): bool
+    {
+        foreach ($candidates as $candidate) {
+            if (($candidate['_identity_valid'] ?? false) === true
+                && is_numeric($candidate['_identity_score'] ?? null)
+                && (float) $candidate['_identity_score'] >= 76.0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function mergeTmdbIdentityCandidates(array $primary, array $fallback): array
+    {
+        $merged = [];
+        foreach ([...$primary, ...$fallback] as $candidate) {
+            $mediaType = $candidate['_media_type'] ?? null;
+            $tmdbId = $candidate['tmdb_id'] ?? null;
+            if (! in_array($mediaType, ['tv', 'movie'], true) || ! is_int($tmdbId)) {
+                continue;
+            }
+            $key = $mediaType.':'.$tmdbId;
+            if (! isset($merged[$key])
+                || (float) ($candidate['_identity_score'] ?? -INF) > (float) ($merged[$key]['_identity_score'] ?? -INF)) {
+                $merged[$key] = $candidate;
+            }
+        }
+
+        return array_values($merged);
+    }
+
+    /** @return array<int, array>|null */
+    private function rescoreCandidatesWithAlternativeTitles(
+        TmdbService $tmdb,
+        array $candidates,
+        string $searchNorm,
+        ?int $year,
+        string $description,
+        ?string $tmdbLocale,
+    ): ?array {
+        $region = $this->tmdbRegionFromLocale($tmdbLocale);
+        if ($region === null) {
+            return null;
+        }
+
+        foreach ($candidates as $index => $candidate) {
+            $mediaType = $candidate['_media_type'] ?? null;
+            $tmdbId = $candidate['tmdb_id'] ?? null;
+            if (! in_array($mediaType, ['tv', 'movie'], true) || ! is_int($tmdbId) || $tmdbId <= 0) {
+                return null;
+            }
+            try {
+                $rawAlternatives = $mediaType === 'tv'
+                    ? $tmdb->getTvAlternativeTitles($tmdbId)
+                    : $tmdb->getMovieAlternativeTitles($tmdbId);
+            } catch (\Throwable) {
+                return null;
+            }
+            if (! is_array($rawAlternatives)) {
+                return null;
+            }
+
+            $alternativesByTitle = [];
+            foreach (array_slice($rawAlternatives, 0, 20) as $alternative) {
+                if (! is_array($alternative)
+                    || ! is_string($alternative['title'] ?? $alternative['name'] ?? null)
+                    || ! is_string($alternative['iso_3166_1'] ?? null)) {
+                    return null;
+                }
+                $title = trim($alternative['title'] ?? $alternative['name']);
+                $country = strtoupper(trim($alternative['iso_3166_1']));
+                if ($title === '' || preg_match('/^[A-Z]{2}$/', $country) !== 1) {
+                    return null;
+                }
+                $titleKey = $this->normalizeIdentityText($title);
+                if ($titleKey !== '' && ! isset($alternativesByTitle[$titleKey])) {
+                    $alternativesByTitle[$titleKey] = [
+                        'title' => $title,
+                        'iso_3166_1' => $country,
+                        '_matches_run_region' => $country === $region,
+                    ];
+                } elseif ($titleKey !== '' && $country === $region) {
+                    // The same verified title may be listed for several countries.
+                    // Preserve positive effective-run provenance regardless of order.
+                    $alternativesByTitle[$titleKey]['_matches_run_region'] = true;
+                }
+            }
+            $alternatives = array_values($alternativesByTitle);
+            $candidates[$index] = $this->scoreTmdbCandidate(
+                $candidate,
+                $mediaType,
+                $searchNorm,
+                $year,
+                $description,
+                $alternatives,
+                true,
+            );
+        }
+
+        return $candidates;
+    }
+
+    private function tmdbRegionFromLocale(?string $locale): ?string
+    {
+        $locale = trim((string) $locale);
+        if (preg_match('/^[A-Za-z]{2}[-_]([A-Za-z]{2})$/', $locale, $matches) !== 1) {
+            return null;
+        }
+
+        return strtoupper($matches[1]);
+    }
+
     /**
-     * Hydrate only an exact top-score tie that would otherwise abstain. Bounded
-     * search responses omit credits, while description scoring can use
-     * cast/director as strong evidence. Broader near-ties retain the existing
-     * no-details abstention and request budget. A failed or malformed detail
-     * response preserves the original abstention.
+     * Hydrate at most two exact-title candidates that would otherwise abstain.
+     * Search responses omit credits, so the cohort is ranked using only synopsis
+     * evidence already present in the bounded response and provider rank. This
+     * keeps large remake/name cohorts bounded while allowing strong cast/director
+     * evidence to resolve them. A failed or malformed detail response preserves
+     * the original abstention.
      *
      * @param  array<int, array>  $candidates
      * @param  array<string, array>  $hydratedDetails
@@ -3518,26 +3789,41 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         string $description,
         array &$hydratedDetails,
     ): ?array {
-        if ($candidates === []) {
+        // A supplied work year is already identity evidence. Do not replace an
+        // unresolved year conflict with extra credit lookups.
+        if ($candidates === [] || $year !== null) {
             return null;
         }
-        $topScore = max(array_map(
-            fn (array $candidate): float => (float) ($candidate['_identity_score'] ?? -INF),
-            $candidates,
-        ));
-        $tiedIndexes = [];
+        $eligibleIndexes = [];
         foreach ($candidates as $index => $candidate) {
             if (($candidate['_identity_valid'] ?? false) === true
                 && (float) ($candidate['_identity_score'] ?? -INF) >= 76.0
-                && (float) $candidate['_identity_score'] === $topScore) {
-                $tiedIndexes[] = $index;
+                && (float) ($candidate['_identity_primary_title_score'] ?? 0.0) === 1.0) {
+                $eligibleIndexes[] = $index;
             }
         }
-        if (count($tiedIndexes) < 2 || count($tiedIndexes) > 3) {
+        if (count($eligibleIndexes) < 2) {
             return null;
         }
 
-        foreach ($tiedIndexes as $index) {
+        usort($eligibleIndexes, function (int $left, int $right) use ($candidates): int {
+            $overview = ((int) ($candidates[$right]['_identity_overview_overlap'] ?? 0))
+                <=> ((int) ($candidates[$left]['_identity_overview_overlap'] ?? 0));
+            if ($overview !== 0) {
+                return $overview;
+            }
+            $rank = ((int) ($candidates[$left]['_provider_rank'] ?? PHP_INT_MAX))
+                <=> ((int) ($candidates[$right]['_provider_rank'] ?? PHP_INT_MAX));
+            if ($rank !== 0) {
+                return $rank;
+            }
+
+            return ((int) ($candidates[$left]['tmdb_id'] ?? PHP_INT_MAX))
+                <=> ((int) ($candidates[$right]['tmdb_id'] ?? PHP_INT_MAX));
+        });
+        $hydrateIndexes = array_slice($eligibleIndexes, 0, 2);
+
+        foreach ($hydrateIndexes as $index) {
             $candidate = $candidates[$index];
             $mediaType = $candidate['_media_type'] ?? null;
             $tmdbId = $candidate['tmdb_id'] ?? null;
@@ -3584,11 +3870,43 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($best === null || $best['_identity_score'] < 76.0 || ! $best['_identity_valid']) {
             return null;
         }
-        if (isset($candidates[1]) && ($best['_identity_score'] - $candidates[1]['_identity_score']) < 8.0) {
-            return null;
+        if (isset($candidates[1])) {
+            $runnerUp = $candidates[1];
+            $scoreLead = (float) $best['_identity_score'] - (float) $runnerUp['_identity_score'];
+            if ($scoreLead < 8.0 && ! $this->hasStrongDescriptionIdentityLead($best, $runnerUp, $scoreLead)) {
+                return null;
+            }
         }
 
         return $best;
+    }
+
+    /**
+     * Preserve the ordinary eight-point winner margin except for an exact primary
+     * title with uniquely strong evidence already present in the programme text.
+     * Three extra synopsis tokens distinguish a descriptive match; alternatively,
+     * two matched people plus a six-point description lead distinguish a credited
+     * remake. Equal evidence and non-exact titles still abstain.
+     */
+    private function hasStrongDescriptionIdentityLead(array $best, array $runnerUp, float $scoreLead): bool
+    {
+        if ($scoreLead <= 0.0
+            || (float) ($best['_identity_primary_title_score'] ?? 0.0) !== 1.0
+            || (float) ($runnerUp['_identity_primary_title_score'] ?? 0.0) !== 1.0) {
+            return false;
+        }
+
+        $bestDescription = (int) ($best['_identity_description_score'] ?? 0);
+        $runnerDescription = (int) ($runnerUp['_identity_description_score'] ?? 0);
+        $overviewLead = (int) ($best['_identity_overview_overlap'] ?? 0)
+            - (int) ($runnerUp['_identity_overview_overlap'] ?? 0);
+        $strongSynopsis = $bestDescription >= 6
+            && (int) ($best['_identity_overview_overlap'] ?? 0) >= 3
+            && $overviewLead >= 3;
+        $strongCredits = (int) ($best['_identity_person_score'] ?? 0) >= 8
+            && ($bestDescription - $runnerDescription) >= 6;
+
+        return $strongSynopsis || $strongCredits;
     }
 
     /**
@@ -3601,7 +3919,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         array $candidates,
         ?string $forceMediaType,
         ?array $episodeIdentity,
+        ?string &$validationKind = null,
     ): ?array {
+        $validationKind = null;
         $season = $episodeIdentity['season'] ?? null;
         $episode = $episodeIdentity['episode'] ?? null;
         $rawSubtitle = $episodeIdentity['subtitle'] ?? null;
@@ -3611,7 +3931,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if ($forceMediaType !== 'tv'
             || ! is_int($season) || $season <= 0
             || ! is_int($episode) || $episode <= 0
-            || $subtitle === '') {
+            || $subtitle === ''
+            || ! method_exists($tmdb, 'getSeasonDetailsResult')) {
             return null;
         }
 
@@ -3622,6 +3943,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $matches = [];
+        $seasonCompatible = [];
         foreach ($candidates as $candidate) {
             if (($candidate['_media_type'] ?? null) !== 'tv'
                 || ($candidate['_identity_valid'] ?? false) !== true
@@ -3632,17 +3954,33 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             try {
-                $seasonData = $tmdb->getSeasonDetails($candidate['tmdb_id'], $season);
+                $seasonResult = $tmdb->getSeasonDetailsResult($candidate['tmdb_id'], $season);
             } catch (\Throwable) {
                 return null;
             }
-            if (! is_array($seasonData) || ! is_array($seasonData['episodes'] ?? null)) {
-                // A competitor that cannot be inspected is unresolved evidence, not
-                // evidence that it lacks the episode. Selecting the other candidate
-                // would turn a 404, malformed response, or network failure into a
-                // false identity proof.
+            if (! is_array($seasonResult) || ! is_string($seasonResult['status'] ?? null)) {
                 return null;
             }
+            if ($seasonResult['status'] === 'not_found') {
+                if (array_keys($seasonResult) !== ['status']) {
+                    return null;
+                }
+                continue;
+            }
+            if ($seasonResult['status'] !== 'found'
+                || array_diff(array_keys($seasonResult), ['status', 'payload']) !== []
+                || ! is_array($seasonResult['payload'] ?? null)) {
+                // Error, legacy-null and malformed results are unresolved evidence.
+                // Only the Core contract's verified not_found state proves absence.
+                return null;
+            }
+            $seasonData = $seasonResult['payload'];
+            if (($seasonData['season_number'] ?? null) !== $season
+                || ! is_array($seasonData['episodes'] ?? null)
+                || ! array_is_list($seasonData['episodes'])) {
+                return null;
+            }
+            $seasonCompatible[] = $candidate;
             $targetTitles = [];
             foreach ($seasonData['episodes'] as $episodeData) {
                 if (! is_array($episodeData) || ! is_int($episodeData['episode_number'] ?? null)) {
@@ -3671,7 +4009,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
 
-        return count($matches) === 1 ? $matches[0] : null;
+        if (count($matches) === 1) {
+            $validationKind = 'episode_title';
+
+            return $matches[0];
+        }
+        if ($matches === [] && count($seasonCompatible) === 1
+            && (float) ($seasonCompatible[0]['_identity_primary_title_score'] ?? 0.0) === 1.0) {
+            $validationKind = 'series_season';
+
+            return $seasonCompatible[0];
+        }
+
+        return null;
     }
 
     private function scoreTmdbCandidate(
@@ -3681,21 +4031,31 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?int $year,
         string $description,
         array $alternativeTitles,
+        bool $verifiedScopedAlternativeTitles = false,
     ): array {
         $titleFields = $mediaType === 'tv'
             ? [$candidate['name'] ?? '', $candidate['original_name'] ?? '']
             : [$candidate['title'] ?? '', $candidate['original_title'] ?? ''];
         $bestTitleScore = 0.0;
+        $bestPrimaryTitleScore = 0.0;
         $bestTitleSource = 'primary';
+        $exactAlternative = false;
+        $exactAlternativeMatchesRunRegion = false;
         foreach ($titleFields as $title) {
-            $bestTitleScore = max($bestTitleScore, $this->titleMatchScore($searchNorm, (string) $title));
+            $bestPrimaryTitleScore = max($bestPrimaryTitleScore, $this->titleMatchScore($searchNorm, (string) $title));
         }
+        $bestTitleScore = $bestPrimaryTitleScore;
         foreach ($alternativeTitles as $alternative) {
             $alternativeTitle = (string) ($alternative['title'] ?? $alternative['name'] ?? '');
             $alternativeScore = $this->titleMatchScore($searchNorm, $alternativeTitle);
             if ($alternativeScore > $bestTitleScore) {
                 $bestTitleScore = $alternativeScore;
                 $bestTitleSource = 'alternative';
+            }
+            if ($this->normalizeIdentityText($searchNorm) === $this->normalizeIdentityText($alternativeTitle)) {
+                $exactAlternative = true;
+                $exactAlternativeMatchesRunRegion = $exactAlternativeMatchesRunRegion
+                    || ($alternative['_matches_run_region'] ?? true) === true;
             }
         }
 
@@ -3714,23 +4074,36 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             };
         }
 
-        $descriptionScore = $this->descriptionEvidenceScore($description, $candidate);
+        $descriptionEvidence = $this->descriptionEvidence($description, $candidate);
+        $descriptionScore = $descriptionEvidence['score'];
         $identityScore = ($bestTitleScore * 80) + $yearScore + $descriptionScore;
         $alternativeIsStrong = $bestTitleSource !== 'alternative'
+            || ($verifiedScopedAlternativeTitles && $exactAlternative
+                && ($exactAlternativeMatchesRunRegion || $yearExact || $descriptionScore >= 4))
             || ($bestTitleScore >= 0.9 && $yearExact && $descriptionScore >= 8);
 
         $candidate['_media_type'] = $mediaType;
         $candidate['_identity_score'] = round($identityScore, 3);
         $candidate['_identity_valid'] = $alternativeIsStrong;
+        $candidate['_identity_primary_title_score'] = $bestPrimaryTitleScore;
+        $candidate['_identity_description_score'] = $descriptionScore;
+        $candidate['_identity_person_score'] = $descriptionEvidence['person_score'];
+        $candidate['_identity_overview_overlap'] = $descriptionEvidence['overview_overlap'];
 
         return $candidate;
     }
 
     private function descriptionEvidenceScore(string $description, array $candidate): int
     {
+        return $this->descriptionEvidence($description, $candidate)['score'];
+    }
+
+    /** @return array{score: int, person_score: int, overview_overlap: int} */
+    private function descriptionEvidence(string $description, array $candidate): array
+    {
         $descriptionNorm = $this->normalizeIdentityText($description);
         if ($descriptionNorm === '') {
-            return 0;
+            return ['score' => 0, 'person_score' => 0, 'overview_overlap' => 0];
         }
 
         $people = [];
@@ -3765,7 +4138,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
         $overviewScore = $overlap >= 2 ? min(6, $overlap * 2) : 0;
 
-        return min(12, $personScore + $overviewScore);
+        return [
+            'score' => min(12, $personScore + $overviewScore),
+            'person_score' => min(12, $personScore),
+            'overview_overlap' => $overlap,
+        ];
     }
 
     /**
@@ -4094,6 +4471,29 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return 1.0;
         }
 
+        if ($this->normalizeInstallmentTitle($searchNorm) === $this->normalizeInstallmentTitle($tmdbNorm)) {
+            return 1.0;
+        }
+
+        // TMDB commonly qualifies numbered sequel titles after a colon (for
+        // example, "Name 3: Subtitle") while guide feeds retain only "Name 3".
+        // Treat that provider-owned suffix as exact evidence only when the guide
+        // title ends in a bounded installment marker; ordinary short base-title
+        // containment must keep using the conservative fuzzy score below.
+        $colonPosition = mb_strpos($tmdbTitle, ':');
+        if ($colonPosition !== false) {
+            $qualifiedBase = trim(mb_substr($tmdbTitle, 0, $colonPosition));
+            $qualifiedSuffix = trim(mb_substr($tmdbTitle, $colonPosition + 1));
+            $normalizedSearch = $this->normalizeIdentityText($searchNorm);
+            $normalizedInstallmentSearch = $this->normalizeInstallmentTitle($normalizedSearch);
+            if ($qualifiedBase !== ''
+                && $qualifiedSuffix !== ''
+                && $normalizedInstallmentSearch !== $normalizedSearch
+                && $normalizedInstallmentSearch === $this->normalizeInstallmentTitle($qualifiedBase)) {
+                return 1.0;
+            }
+        }
+
         // Containment: one title fully contains the other as a substring.
         // Only boost if the shorter string is a substantial portion of the longer one.
         // This prevents "All In" (6 chars) matching inside "All In - Die Bundesliga Show" (38 chars)
@@ -4148,6 +4548,44 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return $tokenScore;
+    }
+
+    private function normalizeInstallmentTitle(string $title): string
+    {
+        $normalized = $this->normalizeIdentityText($title);
+        $tokens = preg_split('/\s+/', $normalized, -1, PREG_SPLIT_NO_EMPTY);
+        if (! is_array($tokens) || count($tokens) < 2) {
+            return $normalized;
+        }
+
+        $lastIndex = count($tokens) - 1;
+        $token = $tokens[$lastIndex];
+        $value = ctype_digit($token) ? (int) $token : $this->boundedRomanInstallmentValue($token);
+        if ($value === null || $value < 2 || $value > 20) {
+            return $normalized;
+        }
+        $tokens[$lastIndex] = '#'.$value;
+
+        return implode(' ', $tokens);
+    }
+
+    private function boundedRomanInstallmentValue(string $token): ?int
+    {
+        $roman = strtoupper($token);
+        if (in_array($roman, ['I', 'V', 'X'], true)
+            || preg_match('/^(?:X{0,2})(?:IX|IV|V?I{0,3})$/', $roman) !== 1) {
+            return null;
+        }
+        $values = ['I' => 1, 'V' => 5, 'X' => 10];
+        $total = 0;
+        $previous = 0;
+        for ($index = strlen($roman) - 1; $index >= 0; $index--) {
+            $current = $values[$roman[$index]];
+            $total += $current < $previous ? -$current : $current;
+            $previous = $current;
+        }
+
+        return $total;
     }
 
     /**

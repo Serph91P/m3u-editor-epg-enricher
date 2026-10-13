@@ -192,6 +192,16 @@ namespace App\Services {
             return ['episodes' => $title === null ? [] : [['episode_number' => 2, 'name' => $title]]];
         }
 
+        public function getSeasonDetailsResult(int $tmdbId, int $season): array
+        {
+            $details = $this->getSeasonDetails($tmdbId, $season);
+
+            return [
+                'status' => 'found',
+                'payload' => ['season_number' => $season] + $details,
+            ];
+        }
+
         public function getTvSeriesDetails(int $tmdbId): ?array
         {
             $this->calls[] = ['tv-details', $tmdbId];
@@ -266,6 +276,7 @@ namespace App\Services {
 
         public function apply(object $context, object $epg, array $patches): array
         {
+            if (! $this->patchesMatchPr1605Contract($patches)) { return ['status' => 'invalid_request']; }
             $status = array_shift($this->applyStatuses) ?? 'applied';
             $this->applies[] = compact('patches', 'status');
             if ($status === 'applied') {
@@ -279,12 +290,13 @@ namespace App\Services {
             $call = count($this->guardedApplies) + 1;
             if ($this->mutateBeforeGuardedApply === $call) { $this->generation++; }
             $this->guardedApplies[] = compact('patches', 'evidence');
+            if (! $this->patchesMatchPr1605Contract($patches)) { return ['status' => 'invalid_request']; }
             if ($this->forcedGuardedApplyStatus !== null) { return ['status' => $this->forcedGuardedApplyStatus]; }
             if ($evidence !== $this->token()) { return ['status' => 'stale']; }
             $this->applyPatches($patches);
             $this->generation++;
             $evidenceNeutral = array_all($patches, static function (array $patch): bool {
-                return array_diff(array_keys($patch['changes'] ?? []), ['icon', 'images', 'images_append']) === [];
+                return array_diff(array_keys($patch['changes'] ?? []), ['icon', 'images']) === [];
             });
             return $this->omitApplyEvidence || ! $evidenceNeutral
                 ? ['status' => 'applied']
@@ -292,6 +304,21 @@ namespace App\Services {
         }
 
         private function token(): string { return 'source-1:g'.$this->generation; }
+
+        private function patchesMatchPr1605Contract(array $patches): bool
+        {
+            foreach ($patches as $patch) {
+                $changes = $patch['changes'] ?? [];
+                if (isset($changes['images_append'])) { return false; }
+                foreach ($changes['images'] ?? [] as $image) {
+                    if (! is_array($image)) { return false; }
+                    $keys = array_keys($image);
+                    sort($keys);
+                    if ($keys !== ['height', 'orient', 'size', 'type', 'url', 'width']) { return false; }
+                }
+            }
+            return true;
+        }
 
         private function page(int $afterId): array
         {
@@ -307,15 +334,7 @@ namespace App\Services {
             foreach ($patches as $patch) {
                 $id = (int) $patch['id'];
                 if (! isset($this->records[$id]) || $this->records[$id]['hash'] !== $patch['hash']) { continue; }
-                $changes = $patch['changes'];
-                $imagesAppend = $changes['images_append'] ?? [];
-                unset($changes['images_append']);
-                $this->records[$id]['programme'] = array_replace($this->records[$id]['programme'], $changes);
-                foreach ($imagesAppend as $image) {
-                    if (! in_array($image, $this->records[$id]['programme']['images'] ?? [], true)) {
-                        $this->records[$id]['programme']['images'][] = $image;
-                    }
-                }
+                $this->records[$id]['programme'] = array_replace($this->records[$id]['programme'], $patch['changes']);
                 $this->records[$id]['hash'] = 'applied-'.$id.'-'.$this->generation;
             }
         }
@@ -447,8 +466,28 @@ namespace Tests {
         same(true, count($context->messages) >= 4, 'Both passes must emit visible heartbeats.');
     }
 
+    $editionTarget = target();
+    $editionTarget['programme']['title'] = 'Atlas Weekend Edition';
+    [$editionResult, $editionHost] = execute([$editionTarget, seed(2)]);
+    same(true, $editionResult->success, 'An edition with a guarded provider-series identity must complete normally.');
+    same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($editionHost->records[1]['programme']), true), 'A distinct edition title may reuse artwork only through the exact source-scoped provider-series identity.');
+    same('Atlas Weekend Edition', $editionHost->records[1]['programme']['title'], 'Edition binding must not rewrite programme identity text.');
+
+    $spinOffTarget = target(provider: 'gracenote:SH876543210000');
+    $spinOffTarget['programme']['title'] = 'Atlas Origins';
+    [$spinOffResult, $spinOffHost] = execute([$spinOffTarget, seed(2)]);
+    same(true, $spinOffResult->success, 'A same-base spin-off with a different provider-series identity must abstain without failing the run.');
+    same(false, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($spinOffHost->records[1]['programme']), true), 'A shared base title must never bridge different provider-series identities.');
+
+    $unboundEdition = target();
+    $unboundEdition['programme']['title'] = 'Atlas Weekend Edition';
+    $unboundEdition['programme']['episode_nums'] = [['system' => 'xmltv_ns', 'value' => '0.8.']];
+    [$unboundEditionResult, $unboundEditionHost] = execute([$unboundEdition, seed(2)]);
+    same(true, $unboundEditionResult->success, 'An edition without provider identity must preserve conservative abstention.');
+    same(false, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($unboundEditionHost->records[1]['programme']), true), 'Title similarity alone must not release series artwork to an edition.');
+
     $untypedTarget = target();
-    $legacyImage = ['url' => 'https://provider.invalid/legacy-untyped.jpg'];
+    $legacyImage = ['url' => 'https://provider.invalid/legacy-untyped.jpg', 'type' => '', 'orient' => 'L', 'width' => 960, 'height' => 540, 'size' => 1];
     $untypedTarget['programme']['images'] = [$legacyImage];
     unset($untypedTarget['programme']['icon']);
     [$untypedResult, $untypedHost] = execute([$untypedTarget, seed(2)]);
@@ -456,7 +495,8 @@ namespace Tests {
     same(2, $untypedResult->data['posters_added'] ?? null, 'Only applied patches that actually contain posters may contribute to the run-wide poster count.');
     same(true, in_array($legacyImage, $untypedHost->records[1]['programme']['images'], true), 'A fresh binding must retain the untyped source object unchanged.');
     same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($untypedHost->records[1]['programme']), true), 'A fresh binding must persist validated poster artwork alongside untyped source artwork.');
-    same(true, array_any($untypedHost->guardedApplies, static fn (array $apply): bool => array_any($apply['patches'], static fn (array $patch): bool => isset($patch['changes']['images_append']))), 'Fresh bindings must submit append-only artwork patches instead of dropping them at the host boundary.');
+    same(false, array_any($untypedHost->guardedApplies, static fn (array $apply): bool => array_any($apply['patches'], static fn (array $patch): bool => isset($patch['changes']['images_append']))), 'Fresh bindings must never send the unsupported images_append field to a PR1605 host.');
+    same(true, array_any($untypedHost->guardedApplies, static fn (array $apply): bool => array_any($apply['patches'], static fn (array $patch): bool => ($patch['changes']['images'][0] ?? null) === $legacyImage)), 'Fresh bindings must preserve the original untyped image value-for-value inside the supported images replacement.');
 
     $backdropOnlyContext = new PluginExecutionContext();
     $backdropOnlyContext->settings['enrich_posters'] = false;
