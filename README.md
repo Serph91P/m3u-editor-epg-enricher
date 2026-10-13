@@ -15,6 +15,7 @@ Enriches EPG programme data with artwork, genres and descriptions from TMDB. Onl
 ## Requirements
 
 - TMDB API key configured in M3U Editor general settings
+- M3U Editor plugin API 1.0.0, with the `EpgCacheEnrichmentService` capability from [host PR #1556](https://github.com/m3ue/m3u-editor/pull/1556) deployed before this plugin version is enabled
 - At least one EPG source with a valid cache
 - Channels mapped to EPG channels in at least one playlist
 
@@ -45,20 +46,22 @@ Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because n
 
 1. After the EPG cache is generated (hook: `epg.cache.generated`), or when triggered manually
 2. Resolves every EPG source and channel ID used by each eligible selected playlist
-3. Reads each day's cached programme JSONL files, but only processes targeted channels
+3. Reads bounded, canonical programme snapshots from the host, but only processes targeted channels
 4. For each programme missing artwork/genres/descriptions:
    - Checks the local TMDB title cache
    - If not cached, searches TMDB (movie first, then TV series)
    - Fetches full details (poster, backdrop, genres, overview)
-   - Writes enriched data back to the JSONL cache
+   - Reads bounded pages using the host's integer cursor and submits conditional `id`/`hash` patches; the host publishes accepted changes
 5. Programmes that already have metadata (e.g. from Schedules Direct / Gracenote) are skipped unless "Overwrite existing" is enabled
-6. The enriched data is used the next time EPG output is generated
+6. Upgrade sequence: deploy the host capability first, then enable this plugin release. The manifest API version is 1.0.0 because the host validator requires an exact match; this does not imply that a pre-#1556 1.0.0 host provides the enrichment service. The plugin fails without that service and never uses direct cache access. This repository does not claim live server, XMLTV-consumer, or Emby validation.
 
-## Artwork Ordering and Emby
+## Artwork roles, XMLTV and clients
 
-When a validated TMDB landscape backdrop is added, it is written as the programme icon and both the first and final `images` entries. This is standards-compatible with XMLTV consumers that use either the first or final icon. Useful source portraits remain between those primary boundaries for clients that support multiple artwork variants, and an existing verified source landscape is preserved unless overwrite is enabled.
+The plugin submits canonical artwork through the host API. The host accepts its canonical `poster`, `banner`, `fanart`, and `logo` image types; plugin `backdrop` and `screenshot` candidates are normalized to `fanart` and `banner` respectively before submission. The host owns cache persistence and serialization; channel logos remain channel metadata. A backdrop does not satisfy an enabled poster requirement, and a poster never replaces the generic programme icon by itself.
 
-The enriched JSONL cache and generated XMLTV can be correct while Emby still displays older guide artwork. Emby imports and persists programme images separately and may continue serving its stored image after the XMLTV source changes. Refreshing or clearing stale guide data in Emby is a downstream maintenance action; this plugin does not use Emby-specific overwrites or change programme identities to force an artwork refresh.
+For the current host export, `programme.icon` remains the generic `<icon>` fallback for icon-only XMLTV consumers. Plugin-only changes cannot make an arbitrary consumer read image roles it never imports. The pending host API contract is [m3u-editor PR #1556](https://github.com/m3ue/m3u-editor/pull/1556); no live server, XMLTV-consumer, or Emby validation is claimed here.
+
+TMDB vote fields rank otherwise eligible images but do not prove content identity or visual suitability. A geometrically valid unvoted backdrop is retained with explicit `tmdb_metadata_unrated` provenance rather than being reported as a positively-rated selection. A client can still crop, cache, or ignore a role after a correct feed has been exported; that is distinct from an enrichment failure.
 
 ## Version History
 
