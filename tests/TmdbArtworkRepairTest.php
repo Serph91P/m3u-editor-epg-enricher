@@ -799,7 +799,19 @@ namespace Tests {
 
     $expectedLogicVersion = '2026.10.09-horizontal-show-primary';
     $currentLogicVersion = $reflection->getConstant('ENRICHMENT_LOGIC_VERSION');
-    assertSameValue($expectedLogicVersion, $currentLogicVersion, 'Horizontal show-primary artwork must bump the enrichment logic version.');
+    // Promotions preserve release-owned metadata; releases replace the feature marker
+    // with YYYY.MM.DD-v<manifest version>. Keep rejecting unrelated/stale markers.
+    $manifest = json_decode(file_get_contents(__DIR__ . '/../plugin.json'), true, 512, JSON_THROW_ON_ERROR);
+    $releaseLogicPattern = '/^\d{4}\.\d{2}\.\d{2}-v' . preg_quote($manifest['version'], '/') . '$/D';
+    foreach (['', '2026.10.02-provider-series-provenance', '2026.10.09-horizontal-show-primar',
+        '2026.09.02-v0.0.0', '2026.09.02-v' . $manifest['version'] . '-extra',
+        '2026.09.02-v' . $manifest['version'] . "\n"] as $invalidReleaseMarker) {
+        assertSameValue(0, preg_match($releaseLogicPattern, $invalidReleaseMarker), 'Release metadata must reject empty, stale, mismatched and malformed markers.');
+    }
+    assertTrueValue(
+        $currentLogicVersion === $expectedLogicVersion || preg_match($releaseLogicPattern, $currentLogicVersion) === 1,
+        'Horizontal show-primary artwork requires its feature marker or a release-owned marker matching the manifest version.'
+    );
     $settingsHasher = $reflection->getMethod('computeSettingsHash');
     $settingsHasher->setAccessible(true);
     $legacySettingsHash = md5(json_encode([
