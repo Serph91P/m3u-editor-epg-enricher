@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.10.23-poster-evidence';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.10.23-preserved-primary';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -990,7 +990,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if ($result['lookup'] && ! $result['cache_hit'] && ! $result['provider_match']) {
                     $cacheReplayIds[(int) ($row['id'] ?? 0)] = true;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
                 $published = array_replace($row['programme'], $changes);
                 $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($published))
                     || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($published));
@@ -1049,7 +1049,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         }
                         $retryBefore = $retryProgramme;
                         $retryResult = $this->enrichProgrammeWithSettings($retryProgramme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
-                        $retryChanges = $this->canonicalHostChanges($retryBefore, $retryProgramme, $overwriteArtwork);
+                        $retryChanges = $this->canonicalHostChanges($retryBefore, $retryProgramme, $overwriteArtwork, in_array('preserved_primary_url', $retry['supported_fields'] ?? [], true));
                         $retryPublished = array_replace($retryBefore, $retryChanges);
                         $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($retryPublished))
                             || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($retryPublished));
@@ -1146,7 +1146,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $stats['programmes_unmatched']--;
                     $cacheReplayIds[$replayId]['unmatched'] = false;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
                 $replayPublished = array_replace($row['programme'], $changes);
                 $cacheReplayIds[$replayId]['replay_complete'] = (! ($settings['enrich_posters'] ?? true) || $this->hasTrustedPoster($replayPublished))
                     && (! ($settings['enrich_backdrops'] ?? true) || $this->hasTrustedLandscapeIcon($replayPublished));
@@ -1319,8 +1319,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     || ! $this->applyFreshSeriesArtworkBinding($programme, $bindings[$seriesKey], $enrichPosters, $enrichBackdrops, $overwriteArtwork)) {
                     continue;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
-                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images']) !== []) {
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
+                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images', 'preserved_primary_url']) !== []) {
                     continue;
                 }
                 $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
@@ -1468,9 +1468,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $role === 'poster' ? $this->isTrustedPortraitImage($image) : $this->isTrustedLandscapeImage($image);
     }
 
-    private function canonicalHostChanges(array $before, array $after, bool $overwriteArtwork = false): array
+    private function canonicalHostChanges(array $before, array $after, bool $overwriteArtwork = false, bool $supportsPreservedPrimary = false): array
     {
         $changes = [];
+        if ($supportsPreservedPrimary) {
+            $beforeIcon = $before['icon'] ?? '';
+            $afterIcon = $after['icon'] ?? '';
+            $preserved = ! $overwriteArtwork && is_string($beforeIcon)
+                && $this->isCanonicalHostArtworkUrl($beforeIcon) && $beforeIcon === $afterIcon
+                ? $beforeIcon : '';
+            if ($preserved !== ($before['preserved_primary_url'] ?? '')) {
+                $changes['preserved_primary_url'] = $preserved;
+            }
+        }
+        if (array_key_exists('icon', $before) && ! array_key_exists('icon', $after)) {
+            $changes['icon'] = '';
+        }
         foreach (['title', 'subtitle', 'desc', 'category', 'episode_num', 'episode_nums', 'rating', 'icon', 'new', 'previously_shown', 'premiere', 'production_year'] as $field) {
             if (array_key_exists($field, $after) && ($after[$field] ?? null) !== ($before[$field] ?? null)) {
                 $changes[$field] = $after[$field];

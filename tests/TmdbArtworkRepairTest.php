@@ -818,7 +818,7 @@ namespace Tests {
     $patchAddsPosterMethod = $reflection->getMethod('patchAddsPoster');
     $patchAddsPosterMethod->setAccessible(true);
 
-    $expectedLogicVersion = '2026.10.23-poster-evidence';
+    $expectedLogicVersion = '2026.10.23-preserved-primary';
     $currentLogicVersion = $reflection->getConstant('ENRICHMENT_LOGIC_VERSION');
     assertSameValue($expectedLogicVersion, $currentLogicVersion, 'Poster-primary artwork must bump the enrichment logic version.');
     $settingsHasher = $reflection->getMethod('computeSettingsHash');
