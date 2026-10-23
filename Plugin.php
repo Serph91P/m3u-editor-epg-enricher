@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.10.23-poster-primary';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.10.23-poster-evidence';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -955,7 +955,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Core consumes evidence for those writes and must never receive a reused token.
         $seriesBindings = [];
         $seriesEvidenceToken = null;
-        $stats = ['programmes_processed' => 0, 'programmes_updated' => $bindingStats['programmes_updated'], 'programmes_already_enriched' => 0, 'posters_added' => $bindingStats['posters_added'], 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
+        $stats = ['programmes_processed' => 0, 'programmes_updated' => $bindingStats['programmes_updated'], 'programmes_already_enriched' => 0, 'programmes_unmatched' => 0, 'programmes_missing_artwork' => 0, 'posters_added' => $bindingStats['posters_added'], 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
         $cacheReplayIds = [];
         $afterId = 0;
         $loggedCheckingProgrammeDetails = false;
@@ -991,8 +991,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $cacheReplayIds[(int) ($row['id'] ?? 0)] = true;
                 }
                 $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
+                $published = array_replace($row['programme'], $changes);
+                $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($published))
+                    || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($published));
+                $pageStats['programmes_missing_artwork'] += (int) $missingArtwork;
+                $unmatched = $result['lookup'] && ! $result['provider_match'];
+                $pageStats['programmes_unmatched'] += (int) $unmatched;
+                if (isset($cacheReplayIds[(int) ($row['id'] ?? 0)])) {
+                    $cacheReplayIds[(int) $row['id']] = ['missing_artwork' => $missingArtwork, 'unmatched' => $unmatched];
+                }
                 if ($changes === []) {
-                    $pageStats['programmes_already_enriched']++;
+                    if (! $missingArtwork && ! $unmatched) {
+                        $pageStats['programmes_already_enriched']++;
+                    }
                     continue;
                 }
                 $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
@@ -1017,23 +1028,48 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     if ($context->cancellationRequested()) {
                         return PluginActionResult::cancelled('Enrichment cancelled before checking programme details.', $stats);
                     }
+                    // Without a run-wide generation token a stale later page may
+                    // mean the entire store was rebuilt, including accepted pages.
+                    // Do not claim completion after a page-local retry in that case.
+                    if ($afterId !== 0) {
+                        return PluginActionResult::failure('Programme store changed after earlier pages were processed; retry enrichment from the beginning.', $stats);
+                    }
                     $retry = $service->snapshot($context, $epg, $afterId, 100);
                     if (($retry['status'] ?? null) !== 'ok') {
                         return PluginActionResult::failure('Could not read programme information.', $stats);
                     }
                     $retryPatches = [];
                     $retryPosterAdds = [];
+                    $pageStats = $stats;
+                    $cacheReplayIds = [];
                     foreach (($retry['programmes'] ?? []) as $retryRow) {
                         $retryProgramme = $retryRow['programme'] ?? [];
                         if (! is_array($retryProgramme) || ! in_array($retryProgramme['channel'] ?? null, $targetChannels, true)) {
                             continue;
                         }
-                        $retryChanges = $this->canonicalHostChanges($retryProgramme, $this->enrichCopy($retryProgramme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage), $overwriteArtwork);
+                        $retryBefore = $retryProgramme;
+                        $retryResult = $this->enrichProgrammeWithSettings($retryProgramme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
+                        $retryChanges = $this->canonicalHostChanges($retryBefore, $retryProgramme, $overwriteArtwork);
+                        $retryPublished = array_replace($retryBefore, $retryChanges);
+                        $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($retryPublished))
+                            || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($retryPublished));
+                        $unmatched = $retryResult['lookup'] && ! $retryResult['provider_match'];
+                        $pageStats['programmes_processed']++;
+                        $pageStats['tmdb_lookups'] += (int) $retryResult['lookup'];
+                        $pageStats['tmdb_cache_hits'] += (int) $retryResult['cache_hit'];
+                        $pageStats['programmes_missing_artwork'] += (int) $missingArtwork;
+                        $pageStats['programmes_unmatched'] += (int) $unmatched;
+                        if ($unmatched) {
+                            $cacheReplayIds[(int) $retryRow['id']] = ['missing_artwork' => $missingArtwork, 'unmatched' => true];
+                        }
                         if ($retryChanges === []) {
+                            if (! $missingArtwork && ! $unmatched) {
+                                $pageStats['programmes_already_enriched']++;
+                            }
                             continue;
                         }
                         $retryPatches[] = ['id' => $retryRow['id'] ?? 0, 'hash' => $retryRow['hash'] ?? '', 'changes' => $retryChanges];
-                        $retryPosterAdds[] = $this->patchAddsPoster($retryProgramme, $retryChanges);
+                        $retryPosterAdds[] = $this->patchAddsPoster($retryBefore, $retryChanges);
                     }
                     $appliedPatches = $retryPatches;
                     $appliedPosterAdds = $retryPosterAdds;
@@ -1105,7 +1141,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if (! $result['cache_hit']) {
                     continue;
                 }
+                $replayId = (int) $row['id'];
+                if ($cacheReplayIds[$replayId]['unmatched'] ?? false) {
+                    $stats['programmes_unmatched']--;
+                    $cacheReplayIds[$replayId]['unmatched'] = false;
+                }
                 $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
+                $replayPublished = array_replace($row['programme'], $changes);
+                $cacheReplayIds[$replayId]['replay_complete'] = (! ($settings['enrich_posters'] ?? true) || $this->hasTrustedPoster($replayPublished))
+                    && (! ($settings['enrich_backdrops'] ?? true) || $this->hasTrustedLandscapeIcon($replayPublished));
                 if ($changes === []) {
                     continue;
                 }
@@ -1120,6 +1164,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $stats['programmes_updated'] += count($patches);
                     foreach ($patches as $index => $patch) {
                         $changes = $patch['changes'] ?? [];
+                        // Missing-artwork counters describe the accepted output, not
+                        // the earlier failed lookup repaired by this replay.
+                        if (($cacheReplayIds[(int) $patch['id']]['missing_artwork'] ?? false)
+                            && ($cacheReplayIds[(int) $patch['id']]['replay_complete'] ?? false)) {
+                            $stats['programmes_missing_artwork']--;
+                            $cacheReplayIds[(int) $patch['id']]['missing_artwork'] = false;
+                        }
                         $stats['posters_added'] += (int) ($posterAdds[$index] ?? false);
                         $stats['categories_added'] += (int) array_key_exists('category', $changes);
                         $stats['descriptions_added'] += (int) array_key_exists('desc', $changes);
@@ -1497,7 +1548,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return null;
         }
         $type = match ($image['type'] ?? '') { 'screenshot' => 'still', default => $image['type'] ?? '' };
-        if (! in_array($type, ['poster', 'backdrop', 'still', 'person', 'character'], true)) {
+        if (! in_array($type, ['poster', 'backdrop', 'still', 'person', 'character'], true)
+            || ($type === 'poster' && ! $this->isGenuinePortraitArtwork(['file_path' => $image['url']] + $image))) {
             return null;
         }
 
@@ -1720,21 +1772,25 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $baseExtracted = $this->extractBaseTitle($title);
         $baseTitle = $baseExtracted['title'];
         $year = $baseExtracted['year'];
+        if ($year === null && ! $hasStrongSeriesSignals) {
+            // A host production year describes the work, not an arbitrary date in
+            // its plot. Episode production dates are not series premiere dates.
+            $productionYear = $programme['production_year'] ?? null;
+            if ((is_int($productionYear) || is_string($productionYear))
+                && preg_match('/^(19\d{2}|20\d{2})$/D', (string) $productionYear)) {
+                $year = (int) $productionYear;
+            }
+        }
         if ($year === null) {
             $desc = trim((string) ($programme['desc'] ?? ''));
-            if ($desc !== '') {
-                // Look for a 4-digit year token anywhere in desc.
-                // Use the FIRST occurrence (production year typically appears early
-                // in EPG descriptions: "USA 2010, Action mit ..." / "Spielfilm, 2010").
-                if (preg_match('/\b(19\d{2}|20\d{2})\b/', $desc, $ym)) {
-                    $candidate = (int) $ym[1];
-                    $currentYear = (int) date('Y');
-                    // Sanity bound: do not accept future years beyond current+2.
-                    if ($candidate >= 1900 && $candidate <= $currentYear + 2) {
-                        $year = $candidate;
-                    }
-                }
+            // Only explicit production labels or a conventional country/year
+            // header provide year evidence. Story dates must never filter search.
+            if (preg_match('/(?:\b(?:Produced in|Production year|Produktionsjahr|Herstellungsjahr)\s*:?\s*|^(?:USA|UK|US|GB|DE|FR|IT|ES|CA|AU|Deutschland|Frankreich|Großbritannien)(?:\s*\/\s*[A-Z]{2,3})*\s+|^(?:Spielfilm|Film|Thriller|Drama|Komödie|Dokumentation)\s+)(19\d{2}|20\d{2})\b/iu', $desc, $ym)) {
+                $year = (int) $ym[1];
             }
+        }
+        if ($year !== null && ($year < 1900 || $year > (int) date('Y') + 2)) {
+            $year = null;
         }
         $forcedMediaType = $hasStrongSeriesSignals ? 'tv' : null;
         $description = trim((string) ($programme['desc'] ?? ''));
@@ -1924,37 +1980,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $freshSeriesArtwork = ['poster' => null, 'backdrop' => null];
 
         // Enrich poster/icon
-        $posterUrl = $tmdbData['poster_url'] ?? null;
         $backdropUrl = null;
         $mediaType = $tmdbData['_media_type'] ?? null;
 
-        // Add poster to images array (size=2: portrait for info/details views)
-        if ($enrichPosters && $posterUrl
-            && ($overwriteArtwork || ! $trustedPoster)
-            && ! ($artworkOnlyOverwrite && $trustedPoster)) {
-            $hasTmdbPoster = false;
-            foreach (($programme['images'] ?? []) as $image) {
-                if (($image['url'] ?? null) === $posterUrl
-                    && ($image['type'] ?? null) === 'poster'
-                    && ($image['source'] ?? null) === 'tmdb') {
-                    $hasTmdbPoster = true;
-                    break;
-                }
-            }
-            if (! $hasTmdbPoster) {
-                $programme['images'][] = [
-                    'url' => $posterUrl,
-                    'type' => 'poster',
-                    'width' => 500,
-                    'height' => 750,
-                    'orient' => 'P',
-                    'size' => 2,
-                    'source' => 'tmdb',
-                    'scope' => 'programme',
-                ];
-                $result['changed'] = true;
-            }
-        }
+        // A details URL carries no geometry. Only the images response can qualify
+        // a new poster; inventing 500x750 here bypassed explicit square rejection.
+        // Existing provider/legacy artwork remains subject to Preserve above.
 
         $hasBackdropMetadata = false;
         $backdropRejected = false;
@@ -2157,6 +2188,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $tmdbLanguage,
             );
 
+            // Work identity and episode identity are separate. Provider numbering
+            // can differ; a conflicting typed subtitle cannot authorize episode
+            // text/stills even when the series poster is independently safe.
+            $expectedEpisodeTitle = $this->normalizeIdentityText($episodeIdentity['subtitle']);
+            if ($episodeDetails && $expectedEpisodeTitle !== ''
+                && (! is_string($episodeDetails['name'] ?? null)
+                    || $this->normalizeIdentityText($episodeDetails['name']) !== $expectedEpisodeTitle)) {
+                $episodeDetails = null;
+            }
             if ($episodeDetails) {
                 $episodeOverview = trim((string) ($episodeDetails['overview'] ?? ''));
                 if ($episodeOverview !== '') {
@@ -2717,13 +2757,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 || abs((float) $poster['aspect_ratio'] - $actualAspect) <= 0.02;
         }
 
-        if (! array_key_exists('aspect_ratio', $poster)) {
-            // Legacy host/test facades may omit geometry. Keep ordinary image
-            // enrichment compatible, but geometry_source below prevents reuse.
-            return true;
-        }
-
-        return is_numeric($poster['aspect_ratio'])
+        // Unknown fresh geometry cannot qualify a new poster. Existing legacy
+        // images are preserved separately by isTrustedPortraitImage/Preserve.
+        return is_numeric($poster['aspect_ratio'] ?? null)
             && (float) $poster['aspect_ratio'] > 0
             && (float) $poster['aspect_ratio'] < 1.0;
     }
@@ -2806,7 +2842,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $aspect = (float) $width / (float) $height;
             // Strictly portrait: height must exceed width. Square-ish poster
             // roles (aspect >= 1.0) are treated as geometry-unverified.
-            if ($aspect >= 1.0) {
+            if ($aspect >= 1.0
+                || (is_numeric($image['aspect_ratio'] ?? null)
+                    && abs((float) $image['aspect_ratio'] - $aspect) > 0.02)) {
                 return false;
             }
         }
