@@ -294,6 +294,26 @@ checkGlobal('confirmed TV and ambiguous or faulty TV details cannot be replaced 
         assertGlobal(0,count(array_filter($host->identityRequests,fn ($r) => $r[0] === 'movie')),'No film fallback from a valid TV identity, missing poster, wrong details or ambiguous TV.');
     }
 });
+checkGlobal('validated film identities publish only their qualified portrait as Primary', function () use ($plugin, $enrich) {
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-offline';
+    try {
+        foreach ([997001 => 'Broken Compass', 997002 => 'Hidden Signal'] as $id => $subtitle) {
+            $title = 'Synthetic Ridge - '.$subtitle;
+            $host = new GlobalCandidateTmdbService(movieDetails: [$id => array_replace(Tests\normalizedMovieDetailsFixture($id, $title), ['release_date' => '2022-01-01'])]);
+            $host->identityResponses['movie:'.$title] = ['status' => 'complete', 'candidates' => [['tmdb_id' => $id, 'title' => $title, 'original_title' => $title, 'release_date' => '2022-01-01', 'overview' => '']]];
+            Illuminate\Support\Facades\Http::$responses = [new Illuminate\Support\Facades\FakeHttpResponse(true, ['posters' => [['file_path' => '/synthetic-film-'.$id.'.jpg', 'iso_639_1' => null, 'width' => 1000, 'height' => 1500]], 'backdrops' => [], 'logos' => []])];
+            $programme = ['title' => 'Synthetic Ridge', 'subtitle' => $subtitle, 'episode_num' => 'MV123', 'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.0.']], 'production_year' => 2022];
+            $cache = [];
+            assertGlobal(true, Tests\enrich($plugin, $enrich, $programme, $host, $cache)['provider_match'], 'Confirm the film before fetching artwork.');
+            assertGlobal('https://image.tmdb.org/t/p/w500/synthetic-film-'.$id.'.jpg', $programme['icon'] ?? null, 'Qualified identity-specific portrait must become Primary.');
+            $poster = array_values(array_filter($programme['images'] ?? [], fn ($image) => ($image['type'] ?? null) === 'poster'));
+            assertGlobal(500, $poster[0]['width'] ?? null, 'Selected w500 rendition must retain the proven portrait ratio.');
+            assertGlobal(750, $poster[0]['height'] ?? null, 'Scale the verified source dimensions to the selected rendition.');
+        }
+    } finally {
+        $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
+    }
+});
 if ($failures !== []) {
     exit(1);
 }
