@@ -213,7 +213,7 @@ checkGlobal('movie and special rows resolve separate full-title films only after
     $host = new GlobalCandidateTmdbService(movieDetails: $details);
     $host->identityResponses = $service->identityResponses;
     $cache = [];
-    foreach ([['MV123', 'Broken Compass', 997001], ['SP124', 'Hidden Signal', 997002], ['MV123', 'Broken Compass', 997001]] as [$provider,$subtitle,$id]) {
+    foreach ([['MV123', 'Broken Compass', 997001], ['SP124', 'Hidden Signal', 997002], ['MV123', 'Broken Compass', 997001], ['0.0.', 'Broken Compass', 997001], ['0.0.', 'Hidden Signal', 997002], ['0.0.', 'Broken Compass', 997001]] as [$provider,$subtitle,$id]) {
         $programme = ['title' => $series, 'subtitle' => $subtitle, 'episode_num' => $provider, 'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.0.']], 'desc' => $synopsis, 'production_year' => 2022, 'tmdb_id' => 997999];
         $r = Tests\enrich($plugin, $enrich, $programme, $host, $cache);
         assertGlobal(true, $r['provider_match'], 'A film row needs full work and subtitle plus independent evidence.');
@@ -297,12 +297,12 @@ checkGlobal('confirmed TV and ambiguous or faulty TV details cannot be replaced 
 checkGlobal('validated film identities publish only their qualified portrait as Primary', function () use ($plugin, $enrich) {
     $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-offline';
     try {
-        foreach ([997001 => 'Broken Compass', 997002 => 'Hidden Signal'] as $id => $subtitle) {
+        foreach ([[997001, 'Broken Compass', 'MV123'], [997002, 'Hidden Signal', 'MV123'], [997001, 'Broken Compass', '0.0.'], [997002, 'Hidden Signal', '0.0.']] as [$id, $subtitle, $provider]) {
             $title = 'Synthetic Ridge - '.$subtitle;
             $host = new GlobalCandidateTmdbService(movieDetails: [$id => array_replace(Tests\normalizedMovieDetailsFixture($id, $title), ['release_date' => '2022-01-01'])]);
             $host->identityResponses['movie:'.$title] = ['status' => 'complete', 'candidates' => [['tmdb_id' => $id, 'title' => $title, 'original_title' => $title, 'release_date' => '2022-01-01', 'overview' => '']]];
             Illuminate\Support\Facades\Http::$responses = [new Illuminate\Support\Facades\FakeHttpResponse(true, ['posters' => [['file_path' => '/synthetic-film-'.$id.'.jpg', 'iso_639_1' => null, 'width' => 1000, 'height' => 1500]], 'backdrops' => [], 'logos' => []])];
-            $programme = ['title' => 'Synthetic Ridge', 'subtitle' => $subtitle, 'episode_num' => 'MV123', 'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.0.']], 'production_year' => 2022];
+            $programme = ['title' => 'Synthetic Ridge', 'subtitle' => $subtitle, 'episode_num' => $provider, 'episode_nums' => [['system' => 'xmltv_ns', 'value' => '0.0.']], 'production_year' => 2022];
             $cache = [];
             assertGlobal(true, Tests\enrich($plugin, $enrich, $programme, $host, $cache)['provider_match'], 'Confirm the film before fetching artwork.');
             assertGlobal('https://image.tmdb.org/t/p/w500/synthetic-film-'.$id.'.jpg', $programme['icon'] ?? null, 'Qualified identity-specific portrait must become Primary.');

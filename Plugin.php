@@ -1879,6 +1879,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'episodic' => $isSeriesEpisode,
             'strong_series_signals' => $hasStrongSeriesSignals,
             'episodic_keyword' => $hasEpisodicTitleKeyword,
+            'episodic_provider_id' => $hasEpisodicProviderId,
             'series_confidence' => $seriesSignals['confidence'],
             'season' => $seriesSignals['season'],
             'episode' => $seriesSignals['episode'],
@@ -1984,7 +1985,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             if ($tmdbData === null && $forcedMediaType === 'tv' && $tvAbsence
-                && $lookupEvidence['film_provider_type'] && $episodeIdentity['subtitle'] !== ''
+                && $episodeIdentity['subtitle'] !== ''
                 && ! $hasEpisodicTitleKeyword && ! $hasEpisodicProviderId) {
                 $filmTitle = $title.' - '.$episodeIdentity['subtitle'];
                 $filmYear = $programme['production_year'] ?? null;
@@ -4009,7 +4010,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Hydrate at most two exact-title candidates that would otherwise abstain.
+     * Hydrate at most two exact-title candidates that would otherwise abstain,
+     * or up to two per media type when TV network evidence is available.
      * Search responses omit credits, so the cohort is ranked using only synopsis
      * evidence already present in the bounded response and provider rank. This
      * keeps large remake/name cohorts bounded while allowing strong cast/director
@@ -4045,8 +4047,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (count($eligibleIndexes) < 2) {
             return null;
         }
-        if ($channelNames !== [] && count($eligibleIndexes) > 2) {
-            // A detail budget must not hide a third equally network-bound rival.
+        $tvIndexes = array_values(array_filter($eligibleIndexes, fn (int $index): bool => ($candidates[$index]['_media_type'] ?? null) === 'tv'));
+        if ($channelNames !== [] && count($tvIndexes) > 2) {
+            // Do not hide a third equally network-bound TV rival. Movies do not
+            // consume the separate TV network budget, but remain in comparison.
             return null;
         }
 
@@ -4066,6 +4070,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 <=> ((int) ($candidates[$right]['tmdb_id'] ?? PHP_INT_MAX));
         });
         $hydrateIndexes = array_slice($eligibleIndexes, 0, 2);
+        if ($channelNames !== []) {
+            $movieIndexes = array_values(array_filter($eligibleIndexes, fn (int $index): bool => ($candidates[$index]['_media_type'] ?? null) === 'movie'));
+            $hydrateIndexes = array_merge($tvIndexes, array_slice($movieIndexes, 0, 2));
+        }
 
         foreach ($hydrateIndexes as $index) {
             $candidate = $candidates[$index];
