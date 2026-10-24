@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.10.23-preserved-primary';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.10.24-global-identity';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -1819,11 +1819,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             // its plot. Episode production dates are not series premiere dates.
             $productionYear = $programme['production_year'] ?? null;
             if ((is_int($productionYear) || is_string($productionYear))
-                && preg_match('/^(19\d{2}|20\d{2})$/D', (string) $productionYear)) {
+                && preg_match('/^(19\d{2}|20\d{2})$/D', (string) $productionYear)
+                && (int) $productionYear <= (int) date('Y') + 2) {
                 $year = (int) $productionYear;
             }
         }
-        if ($year === null) {
+        if ($year === null && ! $hasStrongSeriesSignals) {
             $desc = trim((string) ($programme['desc'] ?? ''));
             // Only explicit production labels or a conventional country/year
             // header provide year evidence. Story dates must never filter search.
@@ -1831,10 +1832,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $year = (int) $ym[1];
             }
         }
-        if ($year !== null && ($year < 1900 || $year > (int) date('Y') + 2)) {
+        $filmProviderWithSubtitle = preg_match('/^(MV|SP)\d+/i', trim((string) ($programme['episode_num'] ?? ''))) === 1
+            && is_string($programme['subtitle'] ?? null) && trim($programme['subtitle']) !== '';
+        if ($hasStrongSeriesSignals || $filmProviderWithSubtitle || ($year !== null && ($year < 1900 || $year > (int) date('Y') + 2))) {
             $year = null;
         }
-        $forcedMediaType = $hasStrongSeriesSignals ? 'tv' : null;
+        // Film/special markers are not strong series evidence. Probe TV first
+        // without interpreting an episode/film production year as a TV premiere;
+        // only native confirmed absence can authorize the separate full-film path.
+        $forcedMediaType = ($hasStrongSeriesSignals || $filmProviderWithSubtitle) ? 'tv' : null;
         $description = trim((string) ($programme['desc'] ?? ''));
         $episodeSubtitle = $programme['subtitle'] ?? null;
         $episodeIdentity = [
@@ -1876,6 +1882,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'series_confidence' => $seriesSignals['confidence'],
             'season' => $seriesSignals['season'],
             'episode' => $seriesSignals['episode'],
+            'film_subtitle' => $this->normalizeIdentityText($episodeIdentity['subtitle']),
+            'film_work_year' => $programme['production_year'] ?? null,
+            'film_provider_type' => preg_match('/^(MV|SP)\d+/i', trim((string) ($programme['episode_num'] ?? ''))) === 1,
         ];
         $episodeTitleEvidence = $this->normalizeIdentityText($episodeIdentity['subtitle']);
         $hasEpisodeTitleEvidence = $seriesSignals['season'] !== null
@@ -1950,6 +1959,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $episodeValidationPath,
                 (string) ($lookupContext['tmdb_language'] ?? ''),
                 $channelNames,
+                $tvAbsence,
             );
             $matchedViaBase = false;
 
@@ -1967,8 +1977,33 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $episodeValidationPath,
                     (string) ($lookupContext['tmdb_language'] ?? ''),
                     $channelNames,
+                    $baseTvAbsence,
                 );
+                $tvAbsence = $tvAbsence && $baseTvAbsence;
                 $matchedViaBase = $tmdbData !== null;
+            }
+
+            if ($tmdbData === null && $forcedMediaType === 'tv' && $tvAbsence
+                && $lookupEvidence['film_provider_type'] && $episodeIdentity['subtitle'] !== ''
+                && ! $hasEpisodicTitleKeyword && ! $hasEpisodicProviderId) {
+                $filmTitle = $title.' - '.$episodeIdentity['subtitle'];
+                $filmYear = $programme['production_year'] ?? null;
+                $filmYear = (is_int($filmYear) || is_string($filmYear))
+                    && preg_match('/^(19\d{2}|20\d{2})$/D', (string) $filmYear)
+                    && (int) $filmYear <= (int) date('Y') + 2 ? (int) $filmYear : null;
+                $unusedCompoundIdentity = null;
+                $film = $this->searchTmdbWithValidation($tmdb, $filmTitle, 'movie', $filmYear, $description, $unusedCompoundIdentity);
+                if ($film !== null) {
+                    $titleScore = max(
+                        $this->titleMatchScore($filmTitle, (string) ($film['title'] ?? '')),
+                        $this->titleMatchScore($filmTitle, (string) ($film['original_title'] ?? '')),
+                    );
+                    $date = $film['release_date'] ?? '';
+                    $exactYear = $filmYear !== null && is_string($date) && str_starts_with($date, $filmYear.'-');
+                    if ($titleScore === 1.0 && ($exactYear || $this->descriptionEvidenceScore($description, $film) >= 4)) {
+                        $tmdbData = $film;
+                    }
+                }
             }
 
             // Title equality alone is sufficient for ordinary programme matching, but
@@ -3399,8 +3434,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?array &$episodeValidationPath = null,
         ?string $tmdbLocale = null,
         array $channelNames = [],
+        ?bool &$confirmedAbsence = null,
     ): ?array
     {
+        $confirmedAbsence = false;
         $provisionalCompoundIdentity = null;
         $episodeValidationPath = null;
         $searchTitle = preg_replace('/(?:\s*\((?:19|20)\d{2}\)|\s+[-\x{2013}\x{2014}]\s+(?:19|20)\d{2})\s*$/u', '', $searchTitle);
@@ -3510,6 +3547,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $candidates = $this->mergeTmdbIdentityCandidates($candidates, $fallbackCandidates);
             }
 
+            $nativeAliasesChecked = method_exists($tmdb, 'getIdentityTranslations') && $candidates !== [];
+            if ($nativeAliasesChecked) {
+                $candidates = $this->rescoreCandidatesWithAlternativeTitles($tmdb, $candidates, $searchNorm, $year, $description, $tmdbLocale);
+                if ($candidates === null) {
+                    return null;
+                }
+            }
             $best = $this->selectTmdbIdentityWinner($candidates);
             if ($best === null
                 && (trim($description) !== '' || $channelNames !== [])
@@ -3547,7 +3591,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 );
                 $episodeValidated = $best !== null;
             }
-            if ($best === null && $candidates !== []) {
+            if ($best === null && $candidates !== [] && ! $nativeAliasesChecked) {
                 $candidatesWithAliases = $this->rescoreCandidatesWithAlternativeTitles(
                     $tmdb,
                     $candidates,
@@ -3571,6 +3615,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $episodeValidated = false;
             }
             if ($best === null) {
+                // Only a fully validated native cohort with no viable identity
+                // proves absence. Legacy [] collapses transport failures; a TV
+                // ambiguity or failed details/episode lookup is not absence.
+                $confirmedAbsence = ! $this->hasPotentialTmdbIdentityCandidate($candidates)
+                    && method_exists($tmdb, 'searchIdentityCandidates');
                 $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
 
                 return null;
@@ -3871,9 +3920,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return null;
             }
             try {
-                $rawAlternatives = $mediaType === 'tv'
-                    ? $tmdb->getTvAlternativeTitles($tmdbId)
-                    : $tmdb->getMovieAlternativeTitles($tmdbId);
+                if (method_exists($tmdb, 'getIdentityAlternativeTitles')) {
+                    $response = $tmdb->getIdentityAlternativeTitles($mediaType, $tmdbId);
+                    if (! is_array($response) || ! $this->hasExactKeys($response, ['status', 'titles'])
+                        || $response['status'] !== 'complete' || ! is_array($response['titles'])
+                        || ! array_is_list($response['titles']) || count($response['titles']) > 200) {
+                        return null;
+                    }
+                    $rawAlternatives = $response['titles'];
+                } else {
+                    $rawAlternatives = $mediaType === 'tv'
+                        ? $tmdb->getTvAlternativeTitles($tmdbId)
+                        : $tmdb->getMovieAlternativeTitles($tmdbId);
+                }
             } catch (\Throwable) {
                 return null;
             }
@@ -3882,7 +3941,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             $alternativesByTitle = [];
-            foreach (array_slice($rawAlternatives, 0, 20) as $alternative) {
+            foreach (array_slice($rawAlternatives, 0, method_exists($tmdb, 'getIdentityAlternativeTitles') ? 200 : 20) as $alternative) {
                 if (! is_array($alternative)
                     || ! is_string($alternative['title'] ?? $alternative['name'] ?? null)
                     || ! is_string($alternative['iso_3166_1'] ?? null)) {
@@ -4141,6 +4200,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return null;
         }
 
+        $eligible = array_filter($candidates, fn (array $candidate): bool => ($candidate['_media_type'] ?? null) === 'tv'
+            && ($candidate['_identity_valid'] ?? false) === true
+            && ($candidate['_identity_score'] ?? 0) >= 76.0
+            && ((float) $topScore - (float) $candidate['_identity_score']) < 8.0);
+        if (count($eligible) > 10) {
+            // Never infer uniqueness from only the first part of a season cohort.
+            return null;
+        }
         $matches = [];
         $seasonCompatible = [];
         foreach ($candidates as $candidate) {
@@ -4897,7 +4964,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $hasSubtitle = $subtitle !== '';
         $hasParsedEpisode = $season !== null || $episode !== null;
-        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH|MV|SP)\d+/i', $episodeNum);
+        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH)\d+/i', $episodeNum);
 
         $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
 

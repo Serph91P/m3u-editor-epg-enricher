@@ -49,11 +49,21 @@ Jellyfin, Plex, TiviMate, m3u-tv, and other clients use Standard XMLTV because n
 3. Reads bounded, canonical programme snapshots from the host, but only processes targeted channels
 4. For each programme missing artwork/genres/descriptions:
    - Checks the local TMDB title cache
-   - If not cached, searches TMDB (movie first, then TV series)
+   - If not cached, validates movie/TV identity independently of artwork, with TV-first probing for episodic or film/special-plus-subtitle rows
    - Fetches full details (poster, backdrop, genres, overview)
    - Reads bounded pages using the host's integer cursor and submits conditional `id`/`hash` patches; the host publishes accepted changes
 5. Programmes that already have metadata (e.g. from Schedules Direct / Gracenote) are skipped unless "Overwrite existing" is enabled
 6. Upgrade sequence: deploy the host capability first, then enable this plugin release. The manifest API version is 1.0.0 because the host validator requires an exact match; this does not imply that a pre-#1556 1.0.0 host provides the enrichment service. The plugin fails without that service and never uses direct cache access. This repository does not claim live server, XMLTV-consumer, or Emby validation.
+
+## Identity matching and host compatibility
+
+Matching uses Unicode casefold/NFC without transliteration or accent removal. Only explicit trailing work-year markers are extracted; a valid structured work year takes priority. Episode production years are never TV-premiere filters. The minimum identity score (76) and ordinary winner margin (8) are unchanged. Artwork, popularity and result rank do not break identity ties.
+
+Hosts exposing `searchIdentityCandidates` provide `complete`/`incomplete`/`error` plus canonical candidates. The plugin expands a cached first page to at most four native pages / 80 candidates per media type, query and year; incomplete or failed cohorts abstain. `getIdentityAlternativeTitles` and `getIdentityTranslations` provide ID-bound, validated aliases with explicit failure status, at most 200 names per endpoint, cached for an hour. Native alias checks cover every collected candidate before selection so a later translated rival is not hidden by an earlier exact name. Detail rescoring hydrates at most two namesakes; episode disambiguation refuses cohorts larger than ten rather than inspecting only part of them. EPG-channel display names can add positive network evidence, never a negative veto; their source/channel binding is included in the identity cache.
+
+An MV/SP provider marker with a typed subtitle is not strong TV evidence. After complete TV searches establish no viable TV identity, the plugin may search the **full work title plus subtitle** as a movie, requiring an exact complete title and additional work-year or synopsis evidence. TV ambiguity, failed/partial responses, a missing poster or a stale TV ID cannot authorize this change. A valid TV identity remains TV. Existing hosts retain their bounded top-ten or legacy single-result APIs; without explicit native completeness they do not enable this new media-type fallback. No direct plugin search HTTP client is introduced.
+
+For native cross-repository HTTP regressions, set `EPG_ENRICHER_SOURCE` to the checked-out `Plugin.php` when running Core's `tests/Feature/TmdbIdentitySearchTest.php`; the optional plugin cases otherwise skip, while native host tests still run. Tests use `Http::fake` and reject stray requests.
 
 ## Artwork roles, XMLTV and clients
 

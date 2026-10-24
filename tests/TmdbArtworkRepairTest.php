@@ -818,7 +818,7 @@ namespace Tests {
     $patchAddsPosterMethod = $reflection->getMethod('patchAddsPoster');
     $patchAddsPosterMethod->setAccessible(true);
 
-    $expectedLogicVersion = '2026.10.23-preserved-primary';
+    $expectedLogicVersion = '2026.10.24-global-identity';
     $currentLogicVersion = $reflection->getConstant('ENRICHMENT_LOGIC_VERSION');
     assertSameValue($expectedLogicVersion, $currentLogicVersion, 'Poster-primary artwork must bump the enrichment logic version.');
     $settingsHasher = $reflection->getMethod('computeSettingsHash');
@@ -2831,11 +2831,9 @@ namespace Tests {
 
     $sameNameGhostsCache = [];
     $sameNameGhostsTmdb = new TmdbService('same-name-ghosts');
-    foreach ([2019 => 107, 2021 => 108] as $year => $tmdbId) {
+    foreach ([[2019, 107], [2021, 108], [2019, 107]] as $index => [$year, $tmdbId]) {
         $sameNameGhosts = [
-            'title' => 'Ghosts - Episode '.$year,
-            'desc' => 'Comedy series from '.$year.' about a haunted home.',
-            'episode_num' => '1.1',
+            'title' => 'Ghosts ('.$year.')',
             'category' => 'Series',
         ];
         $sameNameGhostsResult = enrich($plugin, $method, $sameNameGhosts, $sameNameGhostsTmdb, $sameNameGhostsCache);
@@ -2845,7 +2843,8 @@ namespace Tests {
             $sameNameGhosts['icon'] ?? null,
             'Ghosts '.$year.' should use artwork from the series with the matching year.'
         );
-        assertSameValue(true, $sameNameGhostsResult['lookup'], 'Ghosts '.$year.' should validate its year-specific series identity.');
+        assertSameValue($index === 2, $sameNameGhostsResult['cache_hit'], 'Explicit work-year repeat must reuse only its own identity.');
+        assertSameValue($index !== 2, $sameNameGhostsResult['lookup'], 'Only the first lookup for each explicit work year needs validation.');
     }
 
     $germanSeries = [
