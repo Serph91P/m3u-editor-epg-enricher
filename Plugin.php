@@ -923,6 +923,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
         $imagesCache = $this->loadTmdbImagesCache();
+        $settings['_identity_channel_names'] = $this->resolveIdentityChannelNames($epgId, $targetChannels);
         $seriesEvidence = $this->collectFreshSeriesBindings($service, $epg, $epgId, $targetChannels, $context, $settings, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $tmdbLanguage, $progress);
         if ($seriesEvidence instanceof PluginActionResult) {
             return $seriesEvidence;
@@ -1218,12 +1219,40 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $programme;
     }
 
+    /** @return array<string, list<string>> */
+    private function resolveIdentityChannelNames(int $epgId, array $targetChannels): array
+    {
+        $names = [];
+        try {
+            $channels = EpgChannel::query()->where('epg_id', $epgId)->whereIn('channel_id', $targetChannels)
+                ->get(['channel_id', 'display_name', 'additional_display_names']);
+            foreach ($channels as $channel) {
+                if (! is_string($channel->channel_id)) {
+                    continue;
+                }
+                $values = is_array($channel->additional_display_names) ? $channel->additional_display_names : [];
+                $values[] = $channel->display_name;
+                foreach ($values as $name) {
+                    if (is_string($name) && trim($name) !== '') {
+                        $names[$channel->channel_id][] = trim($name);
+                    }
+                }
+            }
+        } catch (\Throwable) {
+            // Older hosts may not expose additional names. Missing sender evidence
+            // is never an identity rejection and must not disable ordinary matching.
+            return [];
+        }
+
+        return $names;
+    }
+
     private function enrichProgrammeWithSettings(array &$programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage, bool $allowProviderLookup = true): array
     {
         $overwriteMetadata = (bool) ($settings['overwrite_existing'] ?? false);
         $overwriteArtwork = $overwriteMetadata || (bool) ($settings['replace_existing_artwork'] ?? false);
 
-        return $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, $overwriteMetadata, (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage], $allowProviderLookup, $overwriteArtwork);
+        return $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, $overwriteMetadata, (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage, 'channel_names' => $settings['_identity_channel_names'][$programme['channel'] ?? ''] ?? []], $allowProviderLookup, $overwriteArtwork);
     }
 
     /** @return array{bindings: array<string, array>, evidence: ?string}|PluginActionResult */
@@ -1785,7 +1814,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $baseExtracted = $this->extractBaseTitle($title);
         $baseTitle = $baseExtracted['title'];
         $year = $baseExtracted['year'];
-        if ($year === null && ! $hasStrongSeriesSignals) {
+        if (! $hasStrongSeriesSignals) {
             // A host production year describes the work, not an arbitrary date in
             // its plot. Episode production dates are not series premiere dates.
             $productionYear = $programme['production_year'] ?? null;
@@ -1815,6 +1844,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             // arbitrary DTO value would let arrays become the literal title "Array".
             'subtitle' => is_string($episodeSubtitle) ? trim($episodeSubtitle) : '',
         ];
+        $channelNames = [];
+        foreach (is_array($lookupContext['channel_names'] ?? null) ? $lookupContext['channel_names'] : [] as $name) {
+            if (is_string($name) && $this->normalizeIdentityText($name) !== '') {
+                $channelNames[$this->normalizeIdentityText($name)] = true;
+            }
+        }
+        $channelNames = array_keys($channelNames);
+        sort($channelNames);
         $existingTmdbId = $programme['tmdb_id'] ?? null;
         $existingTmdbId = is_scalar($existingTmdbId) ? trim((string) $existingTmdbId) : null;
         $cacheScope = [
@@ -1822,6 +1859,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'tmdb_language' => mb_strtolower(trim((string) ($lookupContext['tmdb_language'] ?? ''))),
             'media_type' => $forcedMediaType,
             'tmdb_id' => $existingTmdbId !== '' ? $existingTmdbId : null,
+            'channel' => is_string($programme['channel'] ?? null) ? $programme['channel'] : '',
+            'channel_names' => $channelNames,
         ];
         $lookupEvidence = [
             'logic' => self::ENRICHMENT_LOGIC_VERSION,
@@ -1910,6 +1949,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $episodeIdentity,
                 $episodeValidationPath,
                 (string) ($lookupContext['tmdb_language'] ?? ''),
+                $channelNames,
             );
             $matchedViaBase = false;
 
@@ -1926,6 +1966,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $episodeIdentity,
                     $episodeValidationPath,
                     (string) ($lookupContext['tmdb_language'] ?? ''),
+                    $channelNames,
                 );
                 $matchedViaBase = $tmdbData !== null;
             }
@@ -3149,7 +3190,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function normalizeCacheKey(string $title): string
     {
-        $key = mb_strtolower(trim($title));
+        $key = $this->foldUnicodeText($title);
         // Strip common suffixes like "(2024)", year patterns
         $key = preg_replace('/\s*\(\d{4}\)\s*$/', '', $key);
         // Strip episode numbers like "S01E03", "(12)", "Folge 5"
@@ -3291,12 +3332,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     {
         $title = trim($title);
 
-        // Extract year if present (e.g. "Inception (2010)", "Avatar - 2009").
-        // Use the LAST occurrence so titles containing a year token early
-        // (rare but possible) don't trick us.
+        // A bare year can be the work title. Only an explicit trailing marker
+        // supplies release evidence; programme production_year takes priority.
         $year = null;
-        if (preg_match_all('/\b(19\d{2}|20\d{2})\b/', $title, $yearMatches)) {
-            $year = (int) end($yearMatches[1]);
+        if (preg_match('/(?:\((19\d{2}|20\d{2})\)|\s+[-\x{2013}\x{2014}]\s+(19\d{2}|20\d{2}))\s*$/u', $title, $yearMatches)) {
+            $year = (int) ($yearMatches[1] !== '' ? $yearMatches[1] : $yearMatches[2]);
         }
 
         // Strip a generic rerun-edition label only when the title also has a
@@ -3358,11 +3398,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?array $episodeIdentity = null,
         ?array &$episodeValidationPath = null,
         ?string $tmdbLocale = null,
+        array $channelNames = [],
     ): ?array
     {
         $provisionalCompoundIdentity = null;
         $episodeValidationPath = null;
-        $searchNorm = mb_strtolower(trim($searchTitle));
+        $searchTitle = preg_replace('/(?:\s*\((?:19|20)\d{2}\)|\s+[-\x{2013}\x{2014}]\s+(?:19|20)\d{2})\s*$/u', '', $searchTitle);
+        $searchNorm = $this->foldUnicodeText($searchTitle);
         $candidates = [];
         $hydratedDetails = [];
         $hasTypedEpisodeIdentity = $forceMediaType === 'tv'
@@ -3391,7 +3433,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         // so typed episodes deliberately search TV without that filter.
                         $tvProviderYear = $hasTypedEpisodeIdentity ? null : $providerYear;
                         $tvIdentityYear = $hasTypedEpisodeIdentity ? null : $year;
-                        $tvCandidates = array_slice($tmdb->searchTvSeriesCandidates($searchTitle, $tvProviderYear, 10), 0, 10);
+                        $tvCandidates = $this->identitySearchCandidates($tmdb, 'tv', $searchTitle, $tvProviderYear);
+                        if ($tvCandidates === null) {
+                            return null;
+                        }
                         foreach ($tvCandidates as $providerRank => $candidate) {
                             if (! $this->isValidRawTmdbCandidate($candidate, 'tv')) {
                                 return null;
@@ -3416,7 +3461,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     }
 
                     if ($forceMediaType !== 'tv') {
-                        $movieCandidates = array_slice($tmdb->searchMovieCandidates($searchTitle, $providerYear, 10), 0, 10);
+                        $movieCandidates = $this->identitySearchCandidates($tmdb, 'movie', $searchTitle, $providerYear);
+                        if ($movieCandidates === null) {
+                            return null;
+                        }
                         foreach ($movieCandidates as $providerRank => $candidate) {
                             if (! $this->isValidRawTmdbCandidate($candidate, 'movie')) {
                                 return null;
@@ -3464,7 +3512,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
             $best = $this->selectTmdbIdentityWinner($candidates);
             if ($best === null
-                && trim($description) !== ''
+                && (trim($description) !== '' || $channelNames !== [])
                 && $requiredCompoundIdentity === null
                 && ! ($forceMediaType === 'tv'
                     && is_int($episodeIdentity['season'] ?? null)
@@ -3480,6 +3528,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $year,
                     $description,
                     $hydratedDetails,
+                    $channelNames,
                 );
                 if ($rescored !== null) {
                     $candidates = $rescored;
@@ -3631,6 +3680,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $best['_runtime_trusted_legacy'] = true;
 
         return $best;
+    }
+
+    private function identitySearchCandidates(TmdbService $tmdb, string $mediaType, string $title, ?int $year): ?array
+    {
+        if (! method_exists($tmdb, 'searchIdentityCandidates')) {
+            return array_slice($mediaType === 'tv'
+                ? $tmdb->searchTvSeriesCandidates($title, $year, 10)
+                : $tmdb->searchMovieCandidates($title, $year, 10), 0, 10);
+        }
+        $response = $tmdb->searchIdentityCandidates($mediaType, $title, $year, 1);
+        if (is_array($response) && ($response['status'] ?? null) === 'incomplete') {
+            // The first page is cached by the native host. Never choose a winner
+            // while later competitors remain outside the validated collection.
+            $response = $tmdb->searchIdentityCandidates($mediaType, $title, $year, 4);
+        }
+        if (! is_array($response) || ! $this->hasExactKeys($response, ['status', 'candidates'])
+            || $response['status'] !== 'complete' || ! is_array($response['candidates'])
+            || ! array_is_list($response['candidates']) || count($response['candidates']) > 80) {
+            return null;
+        }
+
+        return $response['candidates'];
     }
 
     private function provisionalCompoundIdentity(array $candidates, string $searchTitle): ?array
@@ -3789,7 +3860,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?string $tmdbLocale,
     ): ?array {
         $region = $this->tmdbRegionFromLocale($tmdbLocale);
-        if ($region === null) {
+        if ($region === null && ! method_exists($tmdb, 'getIdentityTranslations')) {
             return null;
         }
 
@@ -3833,6 +3904,24 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     // The same verified title may be listed for several countries.
                     // Preserve positive effective-run provenance regardless of order.
                     $alternativesByTitle[$titleKey]['_matches_run_region'] = true;
+                }
+            }
+            if (method_exists($tmdb, 'getIdentityTranslations')) {
+                try {
+                    $translations = $tmdb->getIdentityTranslations($mediaType, $tmdbId);
+                } catch (\Throwable) {
+                    return null;
+                }
+                if (! is_array($translations) || ! $this->hasExactKeys($translations, ['status', 'titles'])
+                    || $translations['status'] !== 'complete' || ! is_array($translations['titles'])
+                    || ! array_is_list($translations['titles']) || count($translations['titles']) > 200) {
+                    return null;
+                }
+                foreach ($translations['titles'] as $title) {
+                    if (! is_string($title) || trim($title) === '') {
+                        return null;
+                    }
+                    $alternativesByTitle[$this->normalizeIdentityText($title)] = ['title' => $title, '_matches_run_region' => true];
                 }
             }
             $alternatives = array_values($alternativesByTitle);
@@ -3879,6 +3968,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?int $year,
         string $description,
         array &$hydratedDetails,
+        array $channelNames = [],
     ): ?array {
         // A supplied work year is already identity evidence. Do not replace an
         // unresolved year conflict with extra credit lookups.
@@ -3894,6 +3984,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
         if (count($eligibleIndexes) < 2) {
+            return null;
+        }
+        if ($channelNames !== [] && count($eligibleIndexes) > 2) {
+            // A detail budget must not hide a third equally network-bound rival.
             return null;
         }
 
@@ -3949,6 +4043,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $description,
                 [],
             );
+            if ($mediaType === 'tv' && $channelNames !== []) {
+                foreach ($details['networks'] ?? [] as $network) {
+                    if (in_array($this->normalizeIdentityText($network['name']), $channelNames, true)) {
+                        $candidates[$index]['_identity_score'] += 8.0;
+                        break;
+                    }
+                }
+            }
         }
 
         return $candidates;
@@ -4264,10 +4366,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $this->descriptionEvidenceScore($description, $tmdbData) >= 4;
     }
 
+    private function foldUnicodeText(string $value): string
+    {
+        return \Normalizer::normalize(mb_convert_case(trim($value), MB_CASE_FOLD, 'UTF-8'), \Normalizer::FORM_C);
+    }
+
     private function normalizeIdentityText(string $value): string
     {
-        $normalized = mb_strtolower(trim($value));
-        $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
+        $normalized = $this->foldUnicodeText($value);
+        $normalized = preg_replace('/[^\p{L}\p{M}\p{N}]+/u', ' ', $normalized);
 
         return trim(preg_replace('/\s+/', ' ', $normalized));
     }
@@ -4557,7 +4664,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function titleMatchScore(string $searchNorm, string $tmdbTitle): float
     {
-        $tmdbNorm = mb_strtolower(trim($tmdbTitle));
+        $searchNorm = $this->foldUnicodeText($searchNorm);
+        $tmdbNorm = $this->foldUnicodeText($tmdbTitle);
 
         if ($searchNorm === '' || $tmdbNorm === '') {
             return 0.0;
