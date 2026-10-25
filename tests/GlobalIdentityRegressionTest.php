@@ -167,6 +167,51 @@ checkGlobal('same-channel network evidence resolves namesakes without deciding c
     $cache = [];
     assertGlobal(false, Tests\enrich($plugin, $enrich, $programme, $service, $cache, lookupContext: ['channel_names' => ['Synthetic North']])['provider_match'], 'Shared network does not break a tie.');
 });
+checkGlobal('technical channel quality suffixes preserve network evidence without merging brands', function () use ($plugin, $enrich) {
+    $title = 'Synthetic Observatory';
+    $candidates = [];
+    $details = [];
+    foreach ([995101 => 'Synthetic North', 995102 => 'Synthetic South'] as $id => $network) {
+        $candidates[] = ['tmdb_id' => $id, 'name' => $title, 'original_name' => $title, 'first_air_date' => '2020-01-01', 'overview' => ''];
+        $details[$id] = Tests\normalizedTvDetailsFixture($id, $title) + ['networks' => [['id' => $id, 'name' => $network, 'logo' => null]]];
+    }
+    $movies = [];
+    $movieDetails = [];
+    foreach (range(995111, 995116) as $id) {
+        $movies[] = ['tmdb_id' => $id, 'title' => $title, 'original_title' => $title, 'release_date' => '2020-01-01', 'overview' => ''];
+        $movieDetails[$id] = Tests\normalizedMovieDetailsFixture($id, $title);
+    }
+    $service = new GlobalCandidateTmdbService(tvDetails: $details, movieDetails: $movieDetails);
+    $service->identityResponses['tv:'.$title] = ['status' => 'complete', 'candidates' => $candidates];
+    $service->identityResponses['movie:'.$title] = ['status' => 'complete', 'candidates' => $movies];
+    $cache = [];
+    foreach ([
+        ['Synthetic North HD', 995101],
+        ['Synthetic South UHD', 995102],
+        ['Synthetic North FHD', 995101],
+        ['Synthetic North 4K', 995101],
+        ['Synthetic North 8K', 995101],
+        ['Synthetic North HD UHD', 995101],
+        ['Synthetic North News HD', null],
+        ['Synthetic North US HD', null],
+        ['Synthetic North 2 HD', null],
+        ['Synthetic North HD Archive', null],
+        ['HD', null],
+    ] as [$sender, $expected]) {
+        $programme = ['title' => $title, 'channel' => 'synthetic-channel'];
+        $result = Tests\enrich($plugin, $enrich, $programme, $service, $cache, lookupContext: ['channel_names' => [$sender]]);
+        assertGlobal($expected !== null, $result['provider_match'], 'Only trailing technical quality tokens may supply an additional network name.');
+        if ($expected !== null) {
+            assertGlobal($expected, end($cache)['tmdb_id'], 'Sender evidence remains cache-isolated.');
+        }
+    }
+    $details[995102]['networks'] = [['id' => 995102, 'name' => 'Synthetic North HD', 'logo' => null]];
+    $service = new GlobalCandidateTmdbService(tvDetails: $details);
+    $service->identityResponses['tv:'.$title] = ['status' => 'complete', 'candidates' => $candidates];
+    $programme = ['title' => $title, 'channel' => 'synthetic-channel'];
+    $cache = [];
+    assertGlobal(false, Tests\enrich($plugin, $enrich, $programme, $service, $cache, lookupContext: ['channel_names' => ['Synthetic North HD']])['provider_match'], 'Preserve the literal name too: a quality-equivalent network collision must still abstain.');
+});
 checkGlobal('episode tokens and production years never become series premiere filters on either host', function () use ($plugin, $enrich) {
     $legacy = new class('offline') extends TmdbService
     {

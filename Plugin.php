@@ -1853,7 +1853,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $channelNames = [];
         foreach (is_array($lookupContext['channel_names'] ?? null) ? $lookupContext['channel_names'] : [] as $name) {
             if (is_string($name) && $this->normalizeIdentityText($name) !== '') {
-                $channelNames[$this->normalizeIdentityText($name)] = true;
+                $normalized = $this->normalizeIdentityText($name);
+                $channelNames[$normalized] = true;
+                // Feed quality is not a different network; retain the literal name too.
+                $channelNames[preg_replace('/(?: (?:hd|fhd|uhd|4k|8k))+$/u', '', $normalized)] = true;
             }
         }
         $channelNames = array_keys($channelNames);
