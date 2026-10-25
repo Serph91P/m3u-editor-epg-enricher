@@ -461,10 +461,57 @@ namespace Tests {
         $selected = array_values(array_filter($programme['images'], fn (array $image): bool => ($image['url'] ?? null) === 'https://image.tmdb.org/t/p/w500/selected-101.jpg'))[0] ?? [];
         same([500, 820], [$selected['width'] ?? null, $selected['height'] ?? null], 'Selected image-response geometry must retain its non-standard aspect instead of a fixed 500x750 fallback.');
         same(['Unmatched Episode', 'Keep target description', 'content-keep', 'series-keep'], [$programme['subtitle'], $programme['desc'], $programme['content_id'], $programme['series_id']], 'Binding must preserve target episode, description, content, and grouping fields.');
-        same('https://provider.invalid/trusted-backdrop.jpg', $programme['icon'], 'Binding must preserve independently trusted target artwork.');
+        same('https://image.tmdb.org/t/p/w500/selected-101.jpg', $programme['icon'], 'Explicit overwrite must promote the selected programme poster in the binding path.');
         same(true, count($host->guardedSnapshots) >= 4, 'Both bounded passes must use guarded snapshots when a binding exists.');
         same(true, count($context->messages) >= 4, 'Both passes must emit visible heartbeats.');
     }
+
+    // The same fresh binding must honor preservation mode at the real host boundary.
+    $preserveContext = new PluginExecutionContext();
+    $preserveContext->settings['overwrite_existing'] = false;
+    $cleanSeed = seed(2);
+    unset($cleanSeed['programme']['images'], $cleanSeed['programme']['icon']);
+    [$preserveResult, $preserveHost] = execute([target(1), $cleanSeed], context: $preserveContext);
+    same(true, $preserveResult->success, 'A no-overwrite fresh binding run must complete.');
+    same('https://provider.invalid/trusted-backdrop.jpg', $preserveHost->records[1]['programme']['icon'], 'No-overwrite binding must preserve the existing target Primary.');
+    same(false, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($preserveHost->records[1]['programme']), true), 'No-overwrite binding must not add a competing poster that consumers promote ahead of the protected Primary.');
+
+    foreach ([false, true] as $metadataOverwrite) {
+        foreach ([false, true] as $artworkOverwrite) {
+            $stillTarget = target(1);
+            $stillUrl = 'https://provider.invalid/keep-still.jpg';
+            $stillTarget['programme']['icon'] = $stillUrl;
+            $stillTarget['programme']['images'][0]['url'] = $stillUrl;
+            $stillTarget['programme']['images'][0]['type'] = 'still';
+            $stillBefore = $stillTarget['programme']['images'][0];
+            $stillContext = new PluginExecutionContext();
+            $stillContext->settings['overwrite_existing'] = $metadataOverwrite;
+            $stillContext->settings['replace_existing_artwork'] = $artworkOverwrite;
+            $stillContext->settings['enrich_backdrops'] = true;
+            [$stillResult, $stillHost] = execute([$stillTarget, $cleanSeed], context: $stillContext);
+            same(true, $stillResult->success, 'Fresh binding with a still Primary must succeed for all overwrite settings.');
+            $replace = $metadataOverwrite || $artworkOverwrite;
+            $publishedStill = $stillHost->records[1]['programme'];
+            same($replace ? 'https://image.tmdb.org/t/p/w500/selected-101.jpg' : $stillUrl, $publishedStill['icon'], 'Fresh binding must preserve or replace the visible still Primary according to effective overwrite.');
+            same('Keep target description', $publishedStill['desc'], 'Artwork binding must retain target description.');
+            same(true, in_array($stillUrl, imageUrls($publishedStill), true), 'Fresh binding must preserve the original still role.');
+            if (! $replace) {
+                same(false, array_any($publishedStill['images'], static fn (array $image): bool => in_array($image['type'] ?? '', ['poster', 'backdrop'], true)), 'Fresh binding must not add a competing poster or backdrop ahead of the protected still.');
+                same(true, in_array($stillBefore, $publishedStill['images'], true), 'Fresh preserve binding must keep all source image fields.');
+            }
+            [$replayResult, $replayHost] = execute([$stillTarget, $cleanSeed], context: $stillContext, preserveCache: true);
+            same(true, $replayResult->success, 'Cached host replay must complete.');
+            same($publishedStill, $replayHost->records[1]['programme'], 'A host cache replay must not alter the artwork policy.');
+        }
+    }
+
+    $artworkContext = new PluginExecutionContext();
+    $artworkContext->settings['overwrite_existing'] = false;
+    $artworkContext->settings['replace_existing_artwork'] = true;
+    [$artworkResult, $artworkHost] = execute([target(1), $cleanSeed], context: $artworkContext);
+    same(true, $artworkResult->success, 'An artwork-only fresh binding run must complete.');
+    same('https://image.tmdb.org/t/p/w500/selected-101.jpg', $artworkHost->records[1]['programme']['icon'], 'Artwork-only binding must promote the selected poster at the real host boundary.');
+    same('Keep target description', $artworkHost->records[1]['programme']['desc'], 'Artwork-only binding must preserve provider text.');
 
     $editionTarget = target();
     $editionTarget['programme']['title'] = 'Atlas Weekend Edition';
@@ -496,7 +543,7 @@ namespace Tests {
     same(true, in_array($legacyImage, $untypedHost->records[1]['programme']['images'], true), 'A fresh binding must retain the untyped source object unchanged.');
     same(true, in_array('https://image.tmdb.org/t/p/w500/selected-101.jpg', imageUrls($untypedHost->records[1]['programme']), true), 'A fresh binding must persist validated poster artwork alongside untyped source artwork.');
     same(false, array_any($untypedHost->guardedApplies, static fn (array $apply): bool => array_any($apply['patches'], static fn (array $patch): bool => isset($patch['changes']['images_append']))), 'Fresh bindings must never send the unsupported images_append field to a PR1605 host.');
-    same(true, array_any($untypedHost->guardedApplies, static fn (array $apply): bool => array_any($apply['patches'], static fn (array $patch): bool => ($patch['changes']['images'][0] ?? null) === $legacyImage)), 'Fresh bindings must preserve the original untyped image value-for-value inside the supported images replacement.');
+    same(true, array_any($untypedHost->guardedApplies, static fn (array $apply): bool => array_any($apply['patches'], static fn (array $patch): bool => in_array($legacyImage, $patch['changes']['images'] ?? [], true))), 'Fresh bindings must preserve the original untyped image value-for-value inside the supported images replacement, after the qualified primary poster.');
 
     $backdropOnlyContext = new PluginExecutionContext();
     $backdropOnlyContext->settings['enrich_posters'] = false;

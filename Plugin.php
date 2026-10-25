@@ -42,7 +42,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * Format: 'YYYY.MM.DD-shortlabel'. Date is informational; the comparison is exact-string.
      */
-    private const ENRICHMENT_LOGIC_VERSION = '2026.10.09-horizontal-show-primary';
+    private const ENRICHMENT_LOGIC_VERSION = '2026.10.24-global-identity';
 
     /**
      * Canonical EPG category vocabulary used by major IPTV-style clients.
@@ -914,6 +914,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return PluginActionResult::failure('TMDB API key not configured; no enrichment was applied.');
         }
         $tmdbLanguage = $this->effectiveTmdbLanguage($settings);
+        $overwriteArtwork = (bool) (($settings['overwrite_existing'] ?? false) || ($settings['replace_existing_artwork'] ?? false));
         try {
             $this->setTmdbLanguage($tmdb, $tmdbLanguage);
         } catch (\Throwable) {
@@ -922,6 +923,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $tmdbCache = $this->loadTmdbCache();
         $tmdbSeasonCache = $this->loadTmdbSeasonCache();
         $imagesCache = $this->loadTmdbImagesCache();
+        $settings['_identity_channel_names'] = $this->resolveIdentityChannelNames($epgId, $targetChannels);
         $seriesEvidence = $this->collectFreshSeriesBindings($service, $epg, $epgId, $targetChannels, $context, $settings, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $tmdbLanguage, $progress);
         if ($seriesEvidence instanceof PluginActionResult) {
             return $seriesEvidence;
@@ -954,7 +956,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         // Core consumes evidence for those writes and must never receive a reused token.
         $seriesBindings = [];
         $seriesEvidenceToken = null;
-        $stats = ['programmes_processed' => 0, 'programmes_updated' => $bindingStats['programmes_updated'], 'programmes_already_enriched' => 0, 'posters_added' => $bindingStats['posters_added'], 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
+        $stats = ['programmes_processed' => 0, 'programmes_updated' => $bindingStats['programmes_updated'], 'programmes_already_enriched' => 0, 'programmes_unmatched' => 0, 'programmes_missing_artwork' => 0, 'posters_added' => $bindingStats['posters_added'], 'categories_added' => 0, 'descriptions_added' => 0, 'channels_targeted' => count($targetChannels), 'tmdb_lookups' => 0, 'tmdb_cache_hits' => 0];
         $cacheReplayIds = [];
         $afterId = 0;
         $loggedCheckingProgrammeDetails = false;
@@ -989,9 +991,20 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if ($result['lookup'] && ! $result['cache_hit'] && ! $result['provider_match']) {
                     $cacheReplayIds[(int) ($row['id'] ?? 0)] = true;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme);
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
+                $published = array_replace($row['programme'], $changes);
+                $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($published))
+                    || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($published));
+                $pageStats['programmes_missing_artwork'] += (int) $missingArtwork;
+                $unmatched = $result['lookup'] && ! $result['provider_match'];
+                $pageStats['programmes_unmatched'] += (int) $unmatched;
+                if (isset($cacheReplayIds[(int) ($row['id'] ?? 0)])) {
+                    $cacheReplayIds[(int) $row['id']] = ['missing_artwork' => $missingArtwork, 'unmatched' => $unmatched];
+                }
                 if ($changes === []) {
-                    $pageStats['programmes_already_enriched']++;
+                    if (! $missingArtwork && ! $unmatched) {
+                        $pageStats['programmes_already_enriched']++;
+                    }
                     continue;
                 }
                 $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
@@ -1016,23 +1029,48 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     if ($context->cancellationRequested()) {
                         return PluginActionResult::cancelled('Enrichment cancelled before checking programme details.', $stats);
                     }
+                    // Without a run-wide generation token a stale later page may
+                    // mean the entire store was rebuilt, including accepted pages.
+                    // Do not claim completion after a page-local retry in that case.
+                    if ($afterId !== 0) {
+                        return PluginActionResult::failure('Programme store changed after earlier pages were processed; retry enrichment from the beginning.', $stats);
+                    }
                     $retry = $service->snapshot($context, $epg, $afterId, 100);
                     if (($retry['status'] ?? null) !== 'ok') {
                         return PluginActionResult::failure('Could not read programme information.', $stats);
                     }
                     $retryPatches = [];
                     $retryPosterAdds = [];
+                    $pageStats = $stats;
+                    $cacheReplayIds = [];
                     foreach (($retry['programmes'] ?? []) as $retryRow) {
                         $retryProgramme = $retryRow['programme'] ?? [];
                         if (! is_array($retryProgramme) || ! in_array($retryProgramme['channel'] ?? null, $targetChannels, true)) {
                             continue;
                         }
-                        $retryChanges = $this->canonicalHostChanges($retryProgramme, $this->enrichCopy($retryProgramme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage));
+                        $retryBefore = $retryProgramme;
+                        $retryResult = $this->enrichProgrammeWithSettings($retryProgramme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
+                        $retryChanges = $this->canonicalHostChanges($retryBefore, $retryProgramme, $overwriteArtwork, in_array('preserved_primary_url', $retry['supported_fields'] ?? [], true));
+                        $retryPublished = array_replace($retryBefore, $retryChanges);
+                        $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($retryPublished))
+                            || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($retryPublished));
+                        $unmatched = $retryResult['lookup'] && ! $retryResult['provider_match'];
+                        $pageStats['programmes_processed']++;
+                        $pageStats['tmdb_lookups'] += (int) $retryResult['lookup'];
+                        $pageStats['tmdb_cache_hits'] += (int) $retryResult['cache_hit'];
+                        $pageStats['programmes_missing_artwork'] += (int) $missingArtwork;
+                        $pageStats['programmes_unmatched'] += (int) $unmatched;
+                        if ($unmatched) {
+                            $cacheReplayIds[(int) $retryRow['id']] = ['missing_artwork' => $missingArtwork, 'unmatched' => true];
+                        }
                         if ($retryChanges === []) {
+                            if (! $missingArtwork && ! $unmatched) {
+                                $pageStats['programmes_already_enriched']++;
+                            }
                             continue;
                         }
                         $retryPatches[] = ['id' => $retryRow['id'] ?? 0, 'hash' => $retryRow['hash'] ?? '', 'changes' => $retryChanges];
-                        $retryPosterAdds[] = $this->patchAddsPoster($retryProgramme, $retryChanges);
+                        $retryPosterAdds[] = $this->patchAddsPoster($retryBefore, $retryChanges);
                     }
                     $appliedPatches = $retryPatches;
                     $appliedPosterAdds = $retryPosterAdds;
@@ -1104,7 +1142,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if (! $result['cache_hit']) {
                     continue;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme);
+                $replayId = (int) $row['id'];
+                if ($cacheReplayIds[$replayId]['unmatched'] ?? false) {
+                    $stats['programmes_unmatched']--;
+                    $cacheReplayIds[$replayId]['unmatched'] = false;
+                }
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
+                $replayPublished = array_replace($row['programme'], $changes);
+                $cacheReplayIds[$replayId]['replay_complete'] = (! ($settings['enrich_posters'] ?? true) || $this->hasTrustedPoster($replayPublished))
+                    && (! ($settings['enrich_backdrops'] ?? true) || $this->hasTrustedLandscapeIcon($replayPublished));
                 if ($changes === []) {
                     continue;
                 }
@@ -1119,6 +1165,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $stats['programmes_updated'] += count($patches);
                     foreach ($patches as $index => $patch) {
                         $changes = $patch['changes'] ?? [];
+                        // Missing-artwork counters describe the accepted output, not
+                        // the earlier failed lookup repaired by this replay.
+                        if (($cacheReplayIds[(int) $patch['id']]['missing_artwork'] ?? false)
+                            && ($cacheReplayIds[(int) $patch['id']]['replay_complete'] ?? false)) {
+                            $stats['programmes_missing_artwork']--;
+                            $cacheReplayIds[(int) $patch['id']]['missing_artwork'] = false;
+                        }
                         $stats['posters_added'] += (int) ($posterAdds[$index] ?? false);
                         $stats['categories_added'] += (int) array_key_exists('category', $changes);
                         $stats['descriptions_added'] += (int) array_key_exists('desc', $changes);
@@ -1166,12 +1219,40 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $programme;
     }
 
+    /** @return array<string, list<string>> */
+    private function resolveIdentityChannelNames(int $epgId, array $targetChannels): array
+    {
+        $names = [];
+        try {
+            $channels = EpgChannel::query()->where('epg_id', $epgId)->whereIn('channel_id', $targetChannels)
+                ->get(['channel_id', 'display_name', 'additional_display_names']);
+            foreach ($channels as $channel) {
+                if (! is_string($channel->channel_id)) {
+                    continue;
+                }
+                $values = is_array($channel->additional_display_names) ? $channel->additional_display_names : [];
+                $values[] = $channel->display_name;
+                foreach ($values as $name) {
+                    if (is_string($name) && trim($name) !== '') {
+                        $names[$channel->channel_id][] = trim($name);
+                    }
+                }
+            }
+        } catch (\Throwable) {
+            // Older hosts may not expose additional names. Missing sender evidence
+            // is never an identity rejection and must not disable ordinary matching.
+            return [];
+        }
+
+        return $names;
+    }
+
     private function enrichProgrammeWithSettings(array &$programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage, bool $allowProviderLookup = true): array
     {
         $overwriteMetadata = (bool) ($settings['overwrite_existing'] ?? false);
         $overwriteArtwork = $overwriteMetadata || (bool) ($settings['replace_existing_artwork'] ?? false);
 
-        return $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, $overwriteMetadata, (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage], $allowProviderLookup, $overwriteArtwork);
+        return $this->enrichProgrammeFromTmdb($programme, $tmdb, $tmdbCache, $overwriteMetadata, (bool) ($settings['enrich_categories'] ?? true), (bool) ($settings['enrich_descriptions'] ?? true), (bool) ($settings['enrich_posters'] ?? true), (bool) ($settings['enrich_backdrops'] ?? true), (bool) ($settings['map_genres_to_epg_categories'] ?? $settings['map_emby_genres'] ?? false), (bool) ($settings['map_genres_to_kodi_guide_genres'] ?? false), (bool) ($settings['keyword_category_detection'] ?? true), (bool) ($settings['enrich_episode_details'] ?? true), $tmdbSeasonCache, $imagesCache, ['epg_source_id' => (string) $epgId, 'tmdb_language' => $tmdbLanguage, 'channel_names' => $settings['_identity_channel_names'][$programme['channel'] ?? ''] ?? []], $allowProviderLookup, $overwriteArtwork);
     }
 
     /** @return array{bindings: array<string, array>, evidence: ?string}|PluginActionResult */
@@ -1267,8 +1348,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     || ! $this->applyFreshSeriesArtworkBinding($programme, $bindings[$seriesKey], $enrichPosters, $enrichBackdrops, $overwriteArtwork)) {
                     continue;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme);
-                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images']) !== []) {
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
+                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images', 'preserved_primary_url']) !== []) {
                     continue;
                 }
                 $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
@@ -1369,6 +1450,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return false;
         }
         $changed = false;
+        if (! $overwriteArtwork && trim((string) ($programme['icon'] ?? '')) !== '') {
+            $enrichPosters = false;
+            $enrichBackdrops = $enrichBackdrops && $this->hasTrustedPoster($programme);
+        }
         if ($enrichPosters && ($overwriteArtwork || ! $this->hasTrustedPoster($programme)) && $this->isReusableSeriesArtwork($binding['poster'] ?? null, 'poster')) {
             $programme['images'] = is_array($programme['images'] ?? null) ? $programme['images'] : [];
             if ($overwriteArtwork) {
@@ -1383,8 +1468,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $programme['images'] = $this->withoutArtworkRoles($programme['images'], ['backdrop', 'fanart']);
             }
             $programme['images'][] = $binding['backdrop'];
-            $programme['icon'] = $binding['backdrop']['url'];
             $changed = true;
+        }
+        if ($changed) {
+            $this->finalizeImageSerialization($programme, false, $overwriteArtwork);
         }
         return $changed;
     }
@@ -1410,9 +1497,22 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $role === 'poster' ? $this->isTrustedPortraitImage($image) : $this->isTrustedLandscapeImage($image);
     }
 
-    private function canonicalHostChanges(array $before, array $after): array
+    private function canonicalHostChanges(array $before, array $after, bool $overwriteArtwork = false, bool $supportsPreservedPrimary = false): array
     {
         $changes = [];
+        if ($supportsPreservedPrimary) {
+            $beforeIcon = $before['icon'] ?? '';
+            $afterIcon = $after['icon'] ?? '';
+            $preserved = ! $overwriteArtwork && is_string($beforeIcon)
+                && $this->isCanonicalHostArtworkUrl($beforeIcon) && $beforeIcon === $afterIcon
+                ? $beforeIcon : '';
+            if ($preserved !== ($before['preserved_primary_url'] ?? '')) {
+                $changes['preserved_primary_url'] = $preserved;
+            }
+        }
+        if (array_key_exists('icon', $before) && ! array_key_exists('icon', $after)) {
+            $changes['icon'] = '';
+        }
         foreach (['title', 'subtitle', 'desc', 'category', 'episode_num', 'episode_nums', 'rating', 'icon', 'new', 'previously_shown', 'premiere', 'production_year'] as $field) {
             if (array_key_exists($field, $after) && ($after[$field] ?? null) !== ($before[$field] ?? null)) {
                 $changes[$field] = $after[$field];
@@ -1427,7 +1527,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $beforeImages[] = $canonicalImage;
                 } elseif ($this->isHostValidUntypedImage($image)) {
                     $beforeImages[] = $image;
-                } else {
+                } elseif (! $overwriteArtwork) {
                     $canReplaceImages = false;
                     break;
                 }
@@ -1437,6 +1537,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 foreach ((array) ($after['images'] ?? []) as $image) {
                     $canonicalImage = $this->canonicalHostImage($image);
                     if ($canonicalImage !== null) {
+                        // Legacy first/last serialization can repeat Primary. The
+                        // canonical host must publish that typed poster only once.
+                        if ($canonicalImage['type'] === 'poster' && in_array($canonicalImage, $images, true)) {
+                            continue;
+                        }
                         $images[] = $canonicalImage;
                     } elseif ($this->isHostValidUntypedImage($image)) {
                         $images[] = $image;
@@ -1445,7 +1550,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     }
                 }
             }
-            if ($canReplaceImages && $images !== $beforeImages) {
+            if ($canReplaceImages && $images !== $beforeImages && ($images !== [] || ! $overwriteArtwork)) {
                 $changes['images'] = $images;
             }
         }
@@ -1485,7 +1590,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return null;
         }
         $type = match ($image['type'] ?? '') { 'screenshot' => 'still', default => $image['type'] ?? '' };
-        if (! in_array($type, ['poster', 'backdrop', 'still', 'person', 'character'], true)) {
+        if (! in_array($type, ['poster', 'backdrop', 'still', 'person', 'character'], true)
+            || ($type === 'poster' && ! $this->isGenuinePortraitArtwork(['file_path' => $image['url']] + $image))) {
             return null;
         }
 
@@ -1611,6 +1717,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     ): array {
         $artworkOnlyOverwrite = ! $overwrite && $overwriteArtwork;
         $overwriteArtwork = $overwrite || $overwriteArtwork;
+        $tmdbLanguage = $this->effectiveTmdbLanguage($lookupContext);
         $result = [
             'changed' => false,
             'poster' => false,
@@ -1707,23 +1814,33 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $baseExtracted = $this->extractBaseTitle($title);
         $baseTitle = $baseExtracted['title'];
         $year = $baseExtracted['year'];
-        if ($year === null) {
-            $desc = trim((string) ($programme['desc'] ?? ''));
-            if ($desc !== '') {
-                // Look for a 4-digit year token anywhere in desc.
-                // Use the FIRST occurrence (production year typically appears early
-                // in EPG descriptions: "USA 2010, Action mit ..." / "Spielfilm, 2010").
-                if (preg_match('/\b(19\d{2}|20\d{2})\b/', $desc, $ym)) {
-                    $candidate = (int) $ym[1];
-                    $currentYear = (int) date('Y');
-                    // Sanity bound: do not accept future years beyond current+2.
-                    if ($candidate >= 1900 && $candidate <= $currentYear + 2) {
-                        $year = $candidate;
-                    }
-                }
+        if (! $hasStrongSeriesSignals) {
+            // A host production year describes the work, not an arbitrary date in
+            // its plot. Episode production dates are not series premiere dates.
+            $productionYear = $programme['production_year'] ?? null;
+            if ((is_int($productionYear) || is_string($productionYear))
+                && preg_match('/^(19\d{2}|20\d{2})$/D', (string) $productionYear)
+                && (int) $productionYear <= (int) date('Y') + 2) {
+                $year = (int) $productionYear;
             }
         }
-        $forcedMediaType = $hasStrongSeriesSignals ? 'tv' : null;
+        if ($year === null && ! $hasStrongSeriesSignals) {
+            $desc = trim((string) ($programme['desc'] ?? ''));
+            // Only explicit production labels or a conventional country/year
+            // header provide year evidence. Story dates must never filter search.
+            if (preg_match('/(?:\b(?:Produced in|Production year|Produktionsjahr|Herstellungsjahr)\s*:?\s*|^(?:USA|UK|US|GB|DE|FR|IT|ES|CA|AU|Deutschland|Frankreich|Großbritannien)(?:\s*\/\s*[A-Z]{2,3})*\s+|^(?:Spielfilm|Film|Thriller|Drama|Komödie|Dokumentation)\s+)(19\d{2}|20\d{2})\b/iu', $desc, $ym)) {
+                $year = (int) $ym[1];
+            }
+        }
+        $filmProviderWithSubtitle = preg_match('/^(MV|SP)\d+/i', trim((string) ($programme['episode_num'] ?? ''))) === 1
+            && is_string($programme['subtitle'] ?? null) && trim($programme['subtitle']) !== '';
+        if ($hasStrongSeriesSignals || $filmProviderWithSubtitle || ($year !== null && ($year < 1900 || $year > (int) date('Y') + 2))) {
+            $year = null;
+        }
+        // Film/special markers are not strong series evidence. Probe TV first
+        // without interpreting an episode/film production year as a TV premiere;
+        // only native confirmed absence can authorize the separate full-film path.
+        $forcedMediaType = ($hasStrongSeriesSignals || $filmProviderWithSubtitle) ? 'tv' : null;
         $description = trim((string) ($programme['desc'] ?? ''));
         $episodeSubtitle = $programme['subtitle'] ?? null;
         $episodeIdentity = [
@@ -1733,6 +1850,17 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             // arbitrary DTO value would let arrays become the literal title "Array".
             'subtitle' => is_string($episodeSubtitle) ? trim($episodeSubtitle) : '',
         ];
+        $channelNames = [];
+        foreach (is_array($lookupContext['channel_names'] ?? null) ? $lookupContext['channel_names'] : [] as $name) {
+            if (is_string($name) && $this->normalizeIdentityText($name) !== '') {
+                $normalized = $this->normalizeIdentityText($name);
+                $channelNames[$normalized] = true;
+                // Feed quality is not a different network; retain the literal name too.
+                $channelNames[preg_replace('/(?: (?:hd|fhd|uhd|4k|8k))+$/u', '', $normalized)] = true;
+            }
+        }
+        $channelNames = array_keys($channelNames);
+        sort($channelNames);
         $existingTmdbId = $programme['tmdb_id'] ?? null;
         $existingTmdbId = is_scalar($existingTmdbId) ? trim((string) $existingTmdbId) : null;
         $cacheScope = [
@@ -1740,6 +1868,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'tmdb_language' => mb_strtolower(trim((string) ($lookupContext['tmdb_language'] ?? ''))),
             'media_type' => $forcedMediaType,
             'tmdb_id' => $existingTmdbId !== '' ? $existingTmdbId : null,
+            'channel' => is_string($programme['channel'] ?? null) ? $programme['channel'] : '',
+            'channel_names' => $channelNames,
         ];
         $lookupEvidence = [
             'logic' => self::ENRICHMENT_LOGIC_VERSION,
@@ -1752,9 +1882,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             'episodic' => $isSeriesEpisode,
             'strong_series_signals' => $hasStrongSeriesSignals,
             'episodic_keyword' => $hasEpisodicTitleKeyword,
+            'episodic_provider_id' => $hasEpisodicProviderId,
             'series_confidence' => $seriesSignals['confidence'],
             'season' => $seriesSignals['season'],
             'episode' => $seriesSignals['episode'],
+            'film_subtitle' => $this->normalizeIdentityText($episodeIdentity['subtitle']),
+            'film_work_year' => $programme['production_year'] ?? null,
+            'film_provider_type' => preg_match('/^(MV|SP)\d+/i', trim((string) ($programme['episode_num'] ?? ''))) === 1,
         ];
         $episodeTitleEvidence = $this->normalizeIdentityText($episodeIdentity['subtitle']);
         $hasEpisodeTitleEvidence = $seriesSignals['season'] !== null
@@ -1828,6 +1962,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $episodeIdentity,
                 $episodeValidationPath,
                 (string) ($lookupContext['tmdb_language'] ?? ''),
+                $channelNames,
+                $tvAbsence,
             );
             $matchedViaBase = false;
 
@@ -1844,8 +1980,34 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $episodeIdentity,
                     $episodeValidationPath,
                     (string) ($lookupContext['tmdb_language'] ?? ''),
+                    $channelNames,
+                    $baseTvAbsence,
                 );
+                $tvAbsence = $tvAbsence && $baseTvAbsence;
                 $matchedViaBase = $tmdbData !== null;
+            }
+
+            if ($tmdbData === null && $forcedMediaType === 'tv' && $tvAbsence
+                && $episodeIdentity['subtitle'] !== ''
+                && ! $hasEpisodicTitleKeyword && ! $hasEpisodicProviderId) {
+                $filmTitle = $title.' - '.$episodeIdentity['subtitle'];
+                $filmYear = $programme['production_year'] ?? null;
+                $filmYear = (is_int($filmYear) || is_string($filmYear))
+                    && preg_match('/^(19\d{2}|20\d{2})$/D', (string) $filmYear)
+                    && (int) $filmYear <= (int) date('Y') + 2 ? (int) $filmYear : null;
+                $unusedCompoundIdentity = null;
+                $film = $this->searchTmdbWithValidation($tmdb, $filmTitle, 'movie', $filmYear, $description, $unusedCompoundIdentity);
+                if ($film !== null) {
+                    $titleScore = max(
+                        $this->titleMatchScore($filmTitle, (string) ($film['title'] ?? '')),
+                        $this->titleMatchScore($filmTitle, (string) ($film['original_title'] ?? '')),
+                    );
+                    $date = $film['release_date'] ?? '';
+                    $exactYear = $filmYear !== null && is_string($date) && str_starts_with($date, $filmYear.'-');
+                    if ($titleScore === 1.0 && ($exactYear || $this->descriptionEvidenceScore($description, $film) >= 4)) {
+                        $tmdbData = $film;
+                    }
+                }
             }
 
             // Title equality alone is sufficient for ordinary programme matching, but
@@ -1900,52 +2062,32 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $result['provider_match'] = true;
 
+        if (! $overwriteArtwork && trim((string) ($programme['icon'] ?? '')) !== '') {
+            $enrichPosters = false;
+            $enrichBackdrops = $enrichBackdrops && $trustedPoster;
+        }
+
         // Cross-row artwork may only use records selected from this identity's current
         // TMDB images response; details URL fallbacks and prior programme images lack
         // the required identity and geometry provenance.
         $freshSeriesArtwork = ['poster' => null, 'backdrop' => null];
 
         // Enrich poster/icon
-        $posterUrl = $tmdbData['poster_url'] ?? null;
         $backdropUrl = null;
         $mediaType = $tmdbData['_media_type'] ?? null;
 
-        // Add poster to images array (size=2: portrait for info/details views)
-        if ($enrichPosters && $posterUrl
-            && ($overwriteArtwork || ! $trustedPoster)
-            && ! ($artworkOnlyOverwrite && $trustedPoster)) {
-            $hasTmdbPoster = false;
-            foreach (($programme['images'] ?? []) as $image) {
-                if (($image['url'] ?? null) === $posterUrl
-                    && ($image['type'] ?? null) === 'poster'
-                    && ($image['source'] ?? null) === 'tmdb') {
-                    $hasTmdbPoster = true;
-                    break;
-                }
-            }
-            if (! $hasTmdbPoster) {
-                $programme['images'][] = [
-                    'url' => $posterUrl,
-                    'type' => 'poster',
-                    'width' => 500,
-                    'height' => 750,
-                    'orient' => 'P',
-                    'size' => 2,
-                    'source' => 'tmdb',
-                    'scope' => 'programme',
-                ];
-                $result['changed'] = true;
-            }
-        }
+        // A details URL carries no geometry. Only the images response can qualify
+        // a new poster; inventing 500x750 here bypassed explicit square rejection.
+        // Existing provider/legacy artwork remains subject to Preserve above.
 
         $hasBackdropMetadata = false;
         $backdropRejected = false;
 
         // Erweiterte images-pipeline: hole zusätzliche varianten + logo
         if (($enrichPosters || $enrichBackdrops) && ! empty($tmdbData['tmdb_id']) && ! empty($mediaType)) {
-            $creds = $this->getTmdbCredentials();
+            $creds = $this->getTmdbCredentials($tmdbLanguage);
             if ($creds !== null) {
-                $imageSet = $this->fetchTmdbImages((int) $tmdbData['tmdb_id'], $mediaType, $imagesCache);
+                $imageSet = $this->fetchTmdbImages((int) $tmdbData['tmdb_id'], $mediaType, $imagesCache, $tmdbLanguage);
                 if ($imageSet !== null) {
                     $hasBackdropMetadata = ! empty(array_filter(
                         $imageSet['backdrops'] ?? [],
@@ -2071,16 +2213,6 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $backdropUrl = $tmdbData['backdrop_url'] ?? null;
         }
 
-        // Primary <icon> in XMLTV: prefer the correctly matched series or movie backdrop.
-        // Exact episode stills remain typed secondary artwork for capable clients.
-        if ($enrichBackdrops && $backdropUrl
-            && ($overwriteArtwork || ! $trustedLandscapeIcon || $trustedEpisodeStillIcon)
-            && ($programme['icon'] ?? null) !== $backdropUrl) {
-            $programme['icon'] = $backdropUrl;
-            $result['poster'] = true;
-            $result['changed'] = true;
-        }
-
         // Add a details fallback backdrop only when no images metadata was available.
         if ($enrichBackdrops && $backdropUrl) {
             $hasTmdbBackdrop = false;
@@ -2145,17 +2277,26 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $tmdbSeasonCache,
                 (int) ($tmdbData['tmdb_id'] ?? 0),
                 $seriesSignals['season'],
-                $seriesSignals['episode']
+                $seriesSignals['episode'],
+                $tmdbLanguage,
             );
 
+            // Work identity and episode identity are separate. Provider numbering
+            // can differ; a conflicting typed subtitle cannot authorize episode
+            // text/stills even when the series poster is independently safe.
+            $expectedEpisodeTitle = $this->normalizeIdentityText($episodeIdentity['subtitle']);
+            if ($episodeDetails && $expectedEpisodeTitle !== ''
+                && (! is_string($episodeDetails['name'] ?? null)
+                    || $this->normalizeIdentityText($episodeDetails['name']) !== $expectedEpisodeTitle)) {
+                $episodeDetails = null;
+            }
             if ($episodeDetails) {
                 $episodeOverview = trim((string) ($episodeDetails['overview'] ?? ''));
                 if ($episodeOverview !== '') {
                     // Reject when TMDB returned the original-language fallback instead of
                     // the user-configured locale. Plugin still uses the series overview
                     // (already set above as $overview from $tmdbData) as the de-facto desc.
-                    $userLangFull = (string) (app(GeneralSettings::class)->tmdb_language ?? 'de-DE');
-                    $userIso = strtolower(substr($userLangFull, 0, 2));
+                    $userIso = strtolower(substr($tmdbLanguage, 0, 2));
                     if ($this->looksLikeLanguage($episodeOverview, $userIso)) {
                         $overview = $episodeOverview;
                     } else {
@@ -2168,7 +2309,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
                 $stillUrl = trim((string) ($episodeDetails['still_url'] ?? ''));
                 if ($enrichBackdrops && $stillUrl !== '') {
-                    // Exact episode art outranks series-level art for programme clients.
+                    // Exact episode art remains a separate thumbnail, not the series poster.
                     $hasTmdbEpisodeStill = false;
                     foreach (($programme['images'] ?? []) as $image) {
                         if (($image['url'] ?? null) === $stillUrl
@@ -2205,12 +2346,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $result['changed'] = true;
         }
 
+        $iconBeforeFinalization = $programme['icon'] ?? null;
         if ($this->finalizeImageSerialization(
             $programme,
             $trustedLandscapeIcon,
-            $overwriteArtwork,
+            $overwriteArtwork && (! $artworkOnlyOverwrite || array_filter($freshSeriesArtwork) !== []),
             ! $overwriteArtwork || $overwrite,
         )) {
+            $result['poster'] = ($programme['icon'] ?? null) !== $iconBeforeFinalization;
             $result['changed'] = true;
         }
 
@@ -2352,7 +2495,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function saveTmdbImagesCache(array $cache): void
     {
-        $successfulResponses = array_filter($cache, 'is_array');
+        $successfulResponses = array_filter($cache, static fn ($entry): bool => is_array($entry) && empty($entry['_retry_images']));
         Storage::disk('local')->makeDirectory('plugin-data/epg-enricher');
         Storage::disk('local')->put(
             'plugin-data/epg-enricher/tmdb-images-cache.json',
@@ -2366,14 +2509,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * @return array{posters: array, backdrops: array, logos: array}|null
      */
-    private function fetchTmdbImages(int $tmdbId, string $mediaType, array &$cache): ?array
+    private function fetchTmdbImages(int $tmdbId, string $mediaType, array &$cache, string $language = ''): ?array
     {
-        $creds = $this->getTmdbCredentials();
+        $creds = $this->getTmdbCredentials($language);
         if ($creds === null) {
             return null;
         }
 
-        $cacheKey = "{$mediaType}:{$tmdbId}:".strtolower($creds['language']);
+        $cacheKey = "{$mediaType}:{$tmdbId}:".strtolower($creds['language']).':'.self::ENRICHMENT_LOGIC_VERSION;
         if (isset($cache[$cacheKey])) {
             return $cache[$cacheKey];
         }
@@ -2401,6 +2544,34 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'backdrops' => is_array($data['backdrops'] ?? null) ? $data['backdrops'] : [],
                 'logos' => is_array($data['logos'] ?? null) ? $data['logos'] : [],
             ];
+            $hasPoster = fn (array $images): bool => (bool) array_filter(
+                $images,
+                fn ($image): bool => is_array($image) && $this->isGenuinePortraitArtwork($image),
+            );
+            if (! $hasPoster($result['posters'])) {
+                // Language is a preference, not a reason to lose an available poster.
+                // One unfiltered fallback also covers original languages other than English.
+                try {
+                    $fallback = Http::timeout(15)->get(
+                        "https://api.themoviedb.org/3/{$endpoint}",
+                        ['api_key' => $creds['key']],
+                    );
+                    if ($fallback->successful()) {
+                        $fallbackData = $fallback->json();
+                        foreach (['posters', 'backdrops', 'logos'] as $role) {
+                            if (is_array($fallbackData[$role] ?? null)) {
+                                $result[$role] = array_merge($result[$role], $fallbackData[$role]);
+                            }
+                        }
+                    }
+                } catch (\Throwable) {
+                    // Keep useful localized artwork when the optional fallback fails.
+                }
+                if (! $hasPoster($result['posters'])) {
+                    // Deduplicate within this invocation, but retry missing posters next run.
+                    $result['_retry_images'] = true;
+                }
+            }
             $cache[$cacheKey] = $result;
 
             return $result;
@@ -2679,13 +2850,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 || abs((float) $poster['aspect_ratio'] - $actualAspect) <= 0.02;
         }
 
-        if (! array_key_exists('aspect_ratio', $poster)) {
-            // Legacy host/test facades may omit geometry. Keep ordinary image
-            // enrichment compatible, but geometry_source below prevents reuse.
-            return true;
-        }
-
-        return is_numeric($poster['aspect_ratio'])
+        // Unknown fresh geometry cannot qualify a new poster. Existing legacy
+        // images are preserved separately by isTrustedPortraitImage/Preserve.
+        return is_numeric($poster['aspect_ratio'] ?? null)
             && (float) $poster['aspect_ratio'] > 0
             && (float) $poster['aspect_ratio'] < 1.0;
     }
@@ -2768,7 +2935,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             $aspect = (float) $width / (float) $height;
             // Strictly portrait: height must exceed width. Square-ish poster
             // roles (aspect >= 1.0) are treated as geometry-unverified.
-            if ($aspect >= 1.0) {
+            if ($aspect >= 1.0
+                || (is_numeric($image['aspect_ratio'] ?? null)
+                    && abs((float) $image['aspect_ratio'] - $aspect) > 0.02)) {
                 return false;
             }
         }
@@ -2922,13 +3091,13 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
     /**
      * Sort $programme['images'][] by role, orientation, and width so the
-     * correctly matched series or movie backdrop outranks secondary episode
-     * stills, posters, and logos. Finalization then brackets those secondary
+     * correctly matched series or movie poster outranks secondary backdrops,
+     * episode stills, and logos. Finalization then brackets those secondary
      * images with the selected primary for both first-only and last-wins XMLTV
      * consumers, while attribute-aware clients retain every typed variant.
      *
-     * Type and orientation rank before width, so a large logo or portrait can
-     * never outrank a real landscape image.
+     * Type and orientation rank before width, so a large episode still cannot
+     * outrank a qualified programme poster.
      *
      * @param  array<int, array<string, mixed>>  $images
      * @return array<int, array<string, mixed>>
@@ -2947,7 +3116,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 'screenshot' => $orient === 'L' ? 300 : 130,
                 'backdrop' => $orient === 'L' ? 500 : 150,
                 'fanart' => $orient === 'L' ? 400 : 140,
-                'poster' => 100,
+                'poster' => $orient === 'P' ? 600 : 100,
                 'logo' => 0,
                 default => $orient === 'L' ? 200 : 50,
             };
@@ -3019,7 +3188,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $programme['images'] = $this->prioritizeImages($programme['images']);
         $programme['images'] = $this->dedupeImagesByUrl($programme['images']);
 
-        if ($trustedLandscapeIcon && ! $overwrite) {
+        if (! $overwrite && trim((string) ($programme['icon'] ?? '')) !== '') {
             $trustedUrl = (string) ($programme['icon'] ?? '');
             foreach ($programme['images'] as $index => $image) {
                 if (($image['url'] ?? null) !== $trustedUrl) {
@@ -3032,7 +3201,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         } else {
             foreach ($programme['images'] as $image) {
-                if ($this->isTrustedLandscapeImage($image)) {
+                if ($this->isTrustedPortraitImage($image) || $this->isTrustedLandscapeImage($image)) {
                     $programme['icon'] = $image['url'];
                     break;
                 }
@@ -3040,9 +3209,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         $primaryUrl = trim((string) ($programme['icon'] ?? ''));
-        if ($appendPrimaryBoundary && $primaryUrl !== '') {
+        if ($appendPrimaryBoundary && $primaryUrl !== ''
+            && ($programme['images'][array_key_last($programme['images'])]['url'] ?? null) !== $primaryUrl) {
             foreach ($programme['images'] as $image) {
-                if (($image['url'] ?? null) === $primaryUrl && $this->isTrustedLandscapeImage($image)) {
+                if (($image['url'] ?? null) === $primaryUrl
+                    && ($this->isTrustedPortraitImage($image) || $this->isTrustedLandscapeImage($image))) {
                     $programme['images'][] = $image;
                     break;
                 }
@@ -3058,7 +3229,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function normalizeCacheKey(string $title): string
     {
-        $key = mb_strtolower(trim($title));
+        $key = $this->foldUnicodeText($title);
         // Strip common suffixes like "(2024)", year patterns
         $key = preg_replace('/\s*\(\d{4}\)\s*$/', '', $key);
         // Strip episode numbers like "S01E03", "(12)", "Folge 5"
@@ -3200,12 +3371,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     {
         $title = trim($title);
 
-        // Extract year if present (e.g. "Inception (2010)", "Avatar - 2009").
-        // Use the LAST occurrence so titles containing a year token early
-        // (rare but possible) don't trick us.
+        // A bare year can be the work title. Only an explicit trailing marker
+        // supplies release evidence; programme production_year takes priority.
         $year = null;
-        if (preg_match_all('/\b(19\d{2}|20\d{2})\b/', $title, $yearMatches)) {
-            $year = (int) end($yearMatches[1]);
+        if (preg_match('/(?:\((19\d{2}|20\d{2})\)|\s+[-\x{2013}\x{2014}]\s+(19\d{2}|20\d{2}))\s*$/u', $title, $yearMatches)) {
+            $year = (int) ($yearMatches[1] !== '' ? $yearMatches[1] : $yearMatches[2]);
         }
 
         // Strip a generic rerun-edition label only when the title also has a
@@ -3267,11 +3437,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?array $episodeIdentity = null,
         ?array &$episodeValidationPath = null,
         ?string $tmdbLocale = null,
+        array $channelNames = [],
+        ?bool &$confirmedAbsence = null,
     ): ?array
     {
+        $confirmedAbsence = false;
         $provisionalCompoundIdentity = null;
         $episodeValidationPath = null;
-        $searchNorm = mb_strtolower(trim($searchTitle));
+        $searchTitle = preg_replace('/(?:\s*\((?:19|20)\d{2}\)|\s+[-\x{2013}\x{2014}]\s+(?:19|20)\d{2})\s*$/u', '', $searchTitle);
+        $searchNorm = $this->foldUnicodeText($searchTitle);
         $candidates = [];
         $hydratedDetails = [];
         $hasTypedEpisodeIdentity = $forceMediaType === 'tv'
@@ -3300,7 +3474,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         // so typed episodes deliberately search TV without that filter.
                         $tvProviderYear = $hasTypedEpisodeIdentity ? null : $providerYear;
                         $tvIdentityYear = $hasTypedEpisodeIdentity ? null : $year;
-                        $tvCandidates = array_slice($tmdb->searchTvSeriesCandidates($searchTitle, $tvProviderYear, 10), 0, 10);
+                        $tvCandidates = $this->identitySearchCandidates($tmdb, 'tv', $searchTitle, $tvProviderYear);
+                        if ($tvCandidates === null) {
+                            return null;
+                        }
                         foreach ($tvCandidates as $providerRank => $candidate) {
                             if (! $this->isValidRawTmdbCandidate($candidate, 'tv')) {
                                 return null;
@@ -3325,7 +3502,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     }
 
                     if ($forceMediaType !== 'tv') {
-                        $movieCandidates = array_slice($tmdb->searchMovieCandidates($searchTitle, $providerYear, 10), 0, 10);
+                        $movieCandidates = $this->identitySearchCandidates($tmdb, 'movie', $searchTitle, $providerYear);
+                        if ($movieCandidates === null) {
+                            return null;
+                        }
                         foreach ($movieCandidates as $providerRank => $candidate) {
                             if (! $this->isValidRawTmdbCandidate($candidate, 'movie')) {
                                 return null;
@@ -3371,9 +3551,16 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $candidates = $this->mergeTmdbIdentityCandidates($candidates, $fallbackCandidates);
             }
 
+            $nativeAliasesChecked = method_exists($tmdb, 'getIdentityTranslations') && $candidates !== [];
+            if ($nativeAliasesChecked) {
+                $candidates = $this->rescoreCandidatesWithAlternativeTitles($tmdb, $candidates, $searchNorm, $year, $description, $tmdbLocale);
+                if ($candidates === null) {
+                    return null;
+                }
+            }
             $best = $this->selectTmdbIdentityWinner($candidates);
             if ($best === null
-                && trim($description) !== ''
+                && (trim($description) !== '' || $channelNames !== [])
                 && $requiredCompoundIdentity === null
                 && ! ($forceMediaType === 'tv'
                     && is_int($episodeIdentity['season'] ?? null)
@@ -3389,6 +3576,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $year,
                     $description,
                     $hydratedDetails,
+                    $channelNames,
                 );
                 if ($rescored !== null) {
                     $candidates = $rescored;
@@ -3407,7 +3595,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 );
                 $episodeValidated = $best !== null;
             }
-            if ($best === null && $candidates !== []) {
+            if ($best === null && $candidates !== [] && ! $nativeAliasesChecked) {
                 $candidatesWithAliases = $this->rescoreCandidatesWithAlternativeTitles(
                     $tmdb,
                     $candidates,
@@ -3431,6 +3619,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $episodeValidated = false;
             }
             if ($best === null) {
+                // Only a fully validated native cohort with no viable identity
+                // proves absence. Legacy [] collapses transport failures; a TV
+                // ambiguity or failed details/episode lookup is not absence.
+                $confirmedAbsence = ! $this->hasPotentialTmdbIdentityCandidate($candidates)
+                    && method_exists($tmdb, 'searchIdentityCandidates');
                 $provisionalCompoundIdentity = $this->provisionalCompoundIdentity($candidates, $searchTitle);
 
                 return null;
@@ -3540,6 +3733,28 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $best['_runtime_trusted_legacy'] = true;
 
         return $best;
+    }
+
+    private function identitySearchCandidates(TmdbService $tmdb, string $mediaType, string $title, ?int $year): ?array
+    {
+        if (! method_exists($tmdb, 'searchIdentityCandidates')) {
+            return array_slice($mediaType === 'tv'
+                ? $tmdb->searchTvSeriesCandidates($title, $year, 10)
+                : $tmdb->searchMovieCandidates($title, $year, 10), 0, 10);
+        }
+        $response = $tmdb->searchIdentityCandidates($mediaType, $title, $year, 1);
+        if (is_array($response) && ($response['status'] ?? null) === 'incomplete') {
+            // The first page is cached by the native host. Never choose a winner
+            // while later competitors remain outside the validated collection.
+            $response = $tmdb->searchIdentityCandidates($mediaType, $title, $year, 4);
+        }
+        if (! is_array($response) || ! $this->hasExactKeys($response, ['status', 'candidates'])
+            || $response['status'] !== 'complete' || ! is_array($response['candidates'])
+            || ! array_is_list($response['candidates']) || count($response['candidates']) > 80) {
+            return null;
+        }
+
+        return $response['candidates'];
     }
 
     private function provisionalCompoundIdentity(array $candidates, string $searchTitle): ?array
@@ -3698,7 +3913,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?string $tmdbLocale,
     ): ?array {
         $region = $this->tmdbRegionFromLocale($tmdbLocale);
-        if ($region === null) {
+        if ($region === null && ! method_exists($tmdb, 'getIdentityTranslations')) {
             return null;
         }
 
@@ -3709,9 +3924,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 return null;
             }
             try {
-                $rawAlternatives = $mediaType === 'tv'
-                    ? $tmdb->getTvAlternativeTitles($tmdbId)
-                    : $tmdb->getMovieAlternativeTitles($tmdbId);
+                if (method_exists($tmdb, 'getIdentityAlternativeTitles')) {
+                    $response = $tmdb->getIdentityAlternativeTitles($mediaType, $tmdbId);
+                    if (! is_array($response) || ! $this->hasExactKeys($response, ['status', 'titles'])
+                        || $response['status'] !== 'complete' || ! is_array($response['titles'])
+                        || ! array_is_list($response['titles']) || count($response['titles']) > 200) {
+                        return null;
+                    }
+                    $rawAlternatives = $response['titles'];
+                } else {
+                    $rawAlternatives = $mediaType === 'tv'
+                        ? $tmdb->getTvAlternativeTitles($tmdbId)
+                        : $tmdb->getMovieAlternativeTitles($tmdbId);
+                }
             } catch (\Throwable) {
                 return null;
             }
@@ -3720,7 +3945,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
 
             $alternativesByTitle = [];
-            foreach (array_slice($rawAlternatives, 0, 20) as $alternative) {
+            foreach (array_slice($rawAlternatives, 0, method_exists($tmdb, 'getIdentityAlternativeTitles') ? 200 : 20) as $alternative) {
                 if (! is_array($alternative)
                     || ! is_string($alternative['title'] ?? $alternative['name'] ?? null)
                     || ! is_string($alternative['iso_3166_1'] ?? null)) {
@@ -3742,6 +3967,24 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     // The same verified title may be listed for several countries.
                     // Preserve positive effective-run provenance regardless of order.
                     $alternativesByTitle[$titleKey]['_matches_run_region'] = true;
+                }
+            }
+            if (method_exists($tmdb, 'getIdentityTranslations')) {
+                try {
+                    $translations = $tmdb->getIdentityTranslations($mediaType, $tmdbId);
+                } catch (\Throwable) {
+                    return null;
+                }
+                if (! is_array($translations) || ! $this->hasExactKeys($translations, ['status', 'titles'])
+                    || $translations['status'] !== 'complete' || ! is_array($translations['titles'])
+                    || ! array_is_list($translations['titles']) || count($translations['titles']) > 200) {
+                    return null;
+                }
+                foreach ($translations['titles'] as $title) {
+                    if (! is_string($title) || trim($title) === '') {
+                        return null;
+                    }
+                    $alternativesByTitle[$this->normalizeIdentityText($title)] = ['title' => $title, '_matches_run_region' => true];
                 }
             }
             $alternatives = array_values($alternativesByTitle);
@@ -3770,7 +4013,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
     }
 
     /**
-     * Hydrate at most two exact-title candidates that would otherwise abstain.
+     * Hydrate at most two exact-title candidates that would otherwise abstain,
+     * or up to two per media type when TV network evidence is available.
      * Search responses omit credits, so the cohort is ranked using only synopsis
      * evidence already present in the bounded response and provider rank. This
      * keeps large remake/name cohorts bounded while allowing strong cast/director
@@ -3788,6 +4032,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         ?int $year,
         string $description,
         array &$hydratedDetails,
+        array $channelNames = [],
     ): ?array {
         // A supplied work year is already identity evidence. Do not replace an
         // unresolved year conflict with extra credit lookups.
@@ -3803,6 +4048,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             }
         }
         if (count($eligibleIndexes) < 2) {
+            return null;
+        }
+        $tvIndexes = array_values(array_filter($eligibleIndexes, fn (int $index): bool => ($candidates[$index]['_media_type'] ?? null) === 'tv'));
+        if ($channelNames !== [] && count($tvIndexes) > 2) {
+            // Do not hide a third equally network-bound TV rival. Movies do not
+            // consume the separate TV network budget, but remain in comparison.
             return null;
         }
 
@@ -3822,6 +4073,10 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 <=> ((int) ($candidates[$right]['tmdb_id'] ?? PHP_INT_MAX));
         });
         $hydrateIndexes = array_slice($eligibleIndexes, 0, 2);
+        if ($channelNames !== []) {
+            $movieIndexes = array_values(array_filter($eligibleIndexes, fn (int $index): bool => ($candidates[$index]['_media_type'] ?? null) === 'movie'));
+            $hydrateIndexes = array_merge($tvIndexes, array_slice($movieIndexes, 0, 2));
+        }
 
         foreach ($hydrateIndexes as $index) {
             $candidate = $candidates[$index];
@@ -3858,6 +4113,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $description,
                 [],
             );
+            if ($mediaType === 'tv' && $channelNames !== []) {
+                foreach ($details['networks'] ?? [] as $network) {
+                    if (in_array($this->normalizeIdentityText($network['name']), $channelNames, true)) {
+                        $candidates[$index]['_identity_score'] += 8.0;
+                        break;
+                    }
+                }
+            }
         }
 
         return $candidates;
@@ -3865,15 +4128,19 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
     private function selectTmdbIdentityWinner(array $candidates): ?array
     {
-        usort($candidates, fn (array $a, array $b): int => $b['_identity_score'] <=> $a['_identity_score']);
+        // Raw synopsis overlap only orders capped score ties; it does not add score.
+        usort($candidates, fn (array $a, array $b): int => ($b['_identity_score'] <=> $a['_identity_score'])
+            ?: (($b['_identity_overview_overlap'] ?? 0) <=> ($a['_identity_overview_overlap'] ?? 0)));
         $best = $candidates[0] ?? null;
         if ($best === null || $best['_identity_score'] < 76.0 || ! $best['_identity_valid']) {
             return null;
         }
-        if (isset($candidates[1])) {
-            $runnerUp = $candidates[1];
+        foreach (array_slice($candidates, 1) as $runnerUp) {
             $scoreLead = (float) $best['_identity_score'] - (float) $runnerUp['_identity_score'];
-            if ($scoreLead < 8.0 && ! $this->hasStrongDescriptionIdentityLead($best, $runnerUp, $scoreLead)) {
+            if ($scoreLead >= 8.0) {
+                break;
+            }
+            if (! $this->hasStrongDescriptionIdentityLead($best, $runnerUp, $scoreLead)) {
                 return null;
             }
         }
@@ -3886,11 +4153,12 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      * title with uniquely strong evidence already present in the programme text.
      * Three extra synopsis tokens distinguish a descriptive match; alternatively,
      * two matched people plus a six-point description lead distinguish a credited
-     * remake. Equal evidence and non-exact titles still abstain.
+     * remake. Capped score ties may use synopsis evidence, never credits alone.
+     * Equal evidence and non-exact titles still abstain against every close rival.
      */
     private function hasStrongDescriptionIdentityLead(array $best, array $runnerUp, float $scoreLead): bool
     {
-        if ($scoreLead <= 0.0
+        if ($scoreLead < 0.0
             || (float) ($best['_identity_primary_title_score'] ?? 0.0) !== 1.0
             || (float) ($runnerUp['_identity_primary_title_score'] ?? 0.0) !== 1.0) {
             return false;
@@ -3903,7 +4171,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         $strongSynopsis = $bestDescription >= 6
             && (int) ($best['_identity_overview_overlap'] ?? 0) >= 3
             && $overviewLead >= 3;
-        $strongCredits = (int) ($best['_identity_person_score'] ?? 0) >= 8
+        $strongCredits = $scoreLead > 0.0
+            && (int) ($best['_identity_person_score'] ?? 0) >= 8
             && ($bestDescription - $runnerDescription) >= 6;
 
         return $strongSynopsis || $strongCredits;
@@ -3942,6 +4211,14 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return null;
         }
 
+        $eligible = array_filter($candidates, fn (array $candidate): bool => ($candidate['_media_type'] ?? null) === 'tv'
+            && ($candidate['_identity_valid'] ?? false) === true
+            && ($candidate['_identity_score'] ?? 0) >= 76.0
+            && ((float) $topScore - (float) $candidate['_identity_score']) < 8.0);
+        if (count($eligible) > 10) {
+            // Never infer uniqueness from only the first part of a season cohort.
+            return null;
+        }
         $matches = [];
         $seasonCompatible = [];
         foreach ($candidates as $candidate) {
@@ -4167,10 +4444,15 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $this->descriptionEvidenceScore($description, $tmdbData) >= 4;
     }
 
+    private function foldUnicodeText(string $value): string
+    {
+        return \Normalizer::normalize(mb_convert_case(trim($value), MB_CASE_FOLD, 'UTF-8'), \Normalizer::FORM_C);
+    }
+
     private function normalizeIdentityText(string $value): string
     {
-        $normalized = mb_strtolower(trim($value));
-        $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized);
+        $normalized = $this->foldUnicodeText($value);
+        $normalized = preg_replace('/[^\p{L}\p{M}\p{N}]+/u', ' ', $normalized);
 
         return trim(preg_replace('/\s+/', ' ', $normalized));
     }
@@ -4460,7 +4742,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function titleMatchScore(string $searchNorm, string $tmdbTitle): float
     {
-        $tmdbNorm = mb_strtolower(trim($tmdbTitle));
+        $searchNorm = $this->foldUnicodeText($searchNorm);
+        $tmdbNorm = $this->foldUnicodeText($tmdbTitle);
 
         if ($searchNorm === '' || $tmdbNorm === '') {
             return 0.0;
@@ -4692,7 +4975,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
 
         $hasSubtitle = $subtitle !== '';
         $hasParsedEpisode = $season !== null || $episode !== null;
-        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH|MV|SP)\d+/i', $episodeNum);
+        $hasEpisodicProviderId = (bool) preg_match('/^(EP|SH)\d+/i', $episodeNum);
 
         $isSeriesEpisode = $hasSubtitle || $hasParsedEpisode || $hasEpisodicProviderId;
 
@@ -4871,15 +5154,18 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         int $tmdbId,
         ?int $season,
         ?int $episode,
+        string $language = '',
     ): ?array {
         if ($tmdbId <= 0 || $season === null || $episode === null || $season <= 0 || $episode <= 0) {
             return null;
         }
 
-        $cacheKey = "{$tmdbId}:{$season}";
-        if (array_key_exists($cacheKey, $seasonCache)) {
+        $language = $language !== '' ? $language : $this->effectiveTmdbLanguage([]);
+        $cacheKey = "{$tmdbId}:{$season}:".strtolower($language);
+        if (isset($seasonCache[$cacheKey])) {
             $seasonData = $seasonCache[$cacheKey];
         } else {
+            $this->setTmdbLanguage($tmdb, $language);
             $seasonData = $tmdb->getSeasonDetails($tmdbId, $season);
             $seasonCache[$cacheKey] = $seasonData;
         }
@@ -4912,7 +5198,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      *
      * @return array{key: string, language: string}|null
      */
-    private function getTmdbCredentials(): ?array
+    private function getTmdbCredentials(string $language = ''): ?array
     {
         try {
             $settings = app(GeneralSettings::class);
@@ -4920,7 +5206,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             if ($key === '') {
                 return null;
             }
-            $language = $settings->tmdb_language ?? 'de-DE';
+            $language = trim($language) !== '' ? trim($language) : ($settings->tmdb_language ?? 'de-DE');
 
             return ['key' => $key, 'language' => $language];
         } catch (\Throwable $e) {
