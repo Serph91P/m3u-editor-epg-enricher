@@ -1,15 +1,48 @@
 <?php
 
-use App\Models\{Channel, Epg, EpgChannel, Playlist, Plugin as HostPlugin, PluginRun, User};
-use App\Plugins\Support\PluginExecutionContext;
+use App\Models\Channel;
+use App\Models\CustomPlaylist;
+use App\Models\Epg;
+use App\Models\EpgChannel;
+use App\Models\MergedPlaylist;
+use App\Models\Playlist;
+use App\Models\PlaylistAlias;
+use App\Models\Plugin as HostPlugin;
+use App\Models\PluginRun;
+use App\Models\User;
 use App\Plugins\PluginSchemaManager;
-use App\Services\{EpgProgrammeStore, EpgCacheEnrichmentService};
+use App\Plugins\Support\PluginExecutionContext;
+use App\Services\EpgProgrammeStore;
 use Carbon\CarbonImmutable;
-use Illuminate\Support\Facades\{Storage, Bus};
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 
 function primaryProgramme(array $changes = []): array
 {
     return array_replace(['channel' => 'synthetic', 'start' => '2030-01-01T12:00:00Z', 'stop' => '2030-01-01T13:00:00Z', 'title' => 'Synthetic Harbour', 'icon' => 'https://example.invalid/primary.jpg'], $changes);
+}
+
+function primaryOutputPlaylist(array $fixture, string $kind): object
+{
+    if ($kind === 'custom' || $kind === 'custom-alias') {
+        $out = CustomPlaylist::factory()->create(['user_id' => $fixture['user']->id]);
+        $out->channels()->attach($fixture['channel']->id);
+    } elseif ($kind === 'merged') {
+        $out = MergedPlaylist::factory()->create(['user_id' => $fixture['user']->id]);
+        $out->playlists()->attach($fixture['playlist']->id);
+    } else {
+        $out = $fixture['playlist'];
+    }
+    if (str_contains($kind, 'alias')) {
+        $out = PlaylistAlias::query()->create([
+            'name' => 'Synthetic Alias', 'uuid' => (string) Str::uuid(), 'user_id' => $fixture['user']->id,
+            'playlist_id' => $kind === 'alias' ? $out->id : null,
+            'custom_playlist_id' => $kind === 'custom-alias' ? $out->id : null,
+        ]);
+    }
+
+    return $out;
 }
 
 function primaryNativeSetup(array $settings = []): array
@@ -36,6 +69,7 @@ function primaryNativeSetup(array $settings = []): array
     $run = PluginRun::query()->create(['extension_plugin_id' => $plugin->id, 'user_id' => $user->id,
         'status' => 'running', 'trigger' => 'manual', 'invocation_type' => 'action', 'dry_run' => false, 'payload' => []]);
     $context = new PluginExecutionContext($plugin, $run, 'manual', false, null, $user, $settings);
+
     return compact('user', 'epg', 'playlist', 'raw', 'channel', 'plugin', 'context');
 }
 

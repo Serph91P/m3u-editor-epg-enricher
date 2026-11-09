@@ -1,10 +1,15 @@
 <?php
 
-use AppLocalPlugins\EpgEnricher\Plugin;
-use AppLocalPlugins\EpgEnricher\Services\{IdentityTmdbService, PreservedPrimaryRepository as Repository};
-use App\Settings\GeneralSettings;
+use App\Models\Epg;
+use App\Plugins\Support\PluginExecutionContext;
 use App\Services\EpgCacheEnrichmentService;
-use Illuminate\Support\Facades\{DB, Http};
+use App\Services\EpgCacheService;
+use App\Settings\GeneralSettings;
+use AppLocalPlugins\EpgEnricher\Plugin;
+use AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService;
+use AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryRepository as Repository;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 
 it('protects a canonical scalar on match abstention noop and removes on overwrite replay', function () {
     $fixture = primaryNativeSetup(['enrich_categories' => false, 'enrich_descriptions' => false]);
@@ -22,7 +27,7 @@ it('protects a canonical scalar on match abstention noop and removes on overwrit
     expect((new Repository)->validated($fixture['epg']->id, $current, []))->toBe($p['icon']);
     $method->invoke($plugin, $fixture['epg']->id, [$fixture['playlist']->id], $fixture['context']);
     expect(DB::table(Repository::TABLE)->count())->toBe(1);
-    $context = new \App\Plugins\Support\PluginExecutionContext($fixture['plugin'], $fixture['context']->run, 'manual', false, null, $fixture['user'], ['replace_existing_artwork' => true]);
+    $context = new PluginExecutionContext($fixture['plugin'], $fixture['context']->run, 'manual', false, null, $fixture['user'], ['replace_existing_artwork' => true]);
     $method->invoke($plugin, $fixture['epg']->id, [$fixture['playlist']->id], $context);
     expect(DB::table(Repository::TABLE)->count())->toBe(0);
 });
@@ -34,16 +39,22 @@ it('retries stale writes against fresh canonical scalars without inheriting old 
     $settings = new GeneralSettings;
     $settings->tmdb_api_key = 'offline-synthetic';
     app()->instance(IdentityTmdbService::class, new IdentityTmdbService($settings));
-    $service = new class(app(\App\Services\EpgCacheService::class)) extends EpgCacheEnrichmentService {
+    $service = new class(app(EpgCacheService::class)) extends EpgCacheEnrichmentService
+    {
         public int $calls = 0;
-        public function apply(\App\Plugins\Support\PluginExecutionContext $context, \App\Models\Epg $epg, array $patches): array
+
+        public function apply(PluginExecutionContext $context, Epg $epg, array $patches): array
         {
             $this->calls++;
             if ($this->calls === 1) {
                 parent::apply($context, $epg, [['id' => $patches[0]['id'], 'hash' => $patches[0]['hash'], 'changes' => ['icon' => 'https://example.invalid/fresh.jpg']]]);
+
                 return ['status' => 'stale'];
             }
-            foreach ($patches as $patch) { expect($patch['changes'])->not->toHaveKey('preserved_primary_url'); }
+            foreach ($patches as $patch) {
+                expect($patch['changes'])->not->toHaveKey('preserved_primary_url');
+            }
+
             return parent::apply($context, $epg, $patches);
         }
     };

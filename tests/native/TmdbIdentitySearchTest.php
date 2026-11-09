@@ -2,9 +2,9 @@
 
 use App\Models\Epg;
 use App\Models\EpgChannel;
-use AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService as TmdbService;
 use App\Settings\GeneralSettings;
 use AppLocalPlugins\EpgEnricher\Plugin;
+use AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService as TmdbService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\RateLimiter;

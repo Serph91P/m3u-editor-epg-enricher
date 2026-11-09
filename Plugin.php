@@ -2,10 +2,6 @@
 
 namespace AppLocalPlugins\EpgEnricher;
 
-require_once __DIR__.'/Services/IdentityTmdbService.php';
-require_once __DIR__.'/Services/PreservedPrimaryRepository.php';
-require_once __DIR__.'/Services/PreservedPrimaryProjection.php';
-
 use AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryRepository;
 
 use AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService;
@@ -30,6 +26,27 @@ use ReflectionProperty;
 
 class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, PluginSelectOptionsProviderInterface
 {
+    public function __construct()
+    {
+        // Reviewed hosts forbid executable imports at entrypoint top level.
+        require_once __DIR__.'/Services/IdentityTmdbService.php';
+        require_once __DIR__.'/Services/PreservedPrimaryRepository.php';
+        require_once __DIR__.'/Services/PreservedPrimaryProjection.php';
+        require_once __DIR__.'/Services/PreservedPrimaryQuery.php';
+    }
+
+    public function playlistQueryNames(): array
+    {
+        return ['preserved_primary_v1'];
+    }
+
+    public function queryForPlaylist(string $query, array $payload, object $context): array
+    {
+        if ($query !== 'preserved_primary_v1') { abort(404); }
+        if (! (new PreservedPrimaryRepository)->supported()) { abort(404, 'Primary protection schema is unavailable.'); }
+        return (new \AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryQuery)->execute($payload, $context);
+    }
+
     private const DATE_FILE_HEARTBEAT_INTERVAL_SECONDS = 60;
 
     /**

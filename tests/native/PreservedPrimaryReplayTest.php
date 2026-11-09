@@ -1,10 +1,13 @@
 <?php
 
-use AppLocalPlugins\EpgEnricher\Plugin;
-use AppLocalPlugins\EpgEnricher\Services\{IdentityTmdbService, PreservedPrimaryRepository as Repository};
 use App\Services\EpgCacheEnrichmentService;
 use App\Settings\GeneralSettings;
-use Illuminate\Support\Facades\{DB, Http, Schema};
+use AppLocalPlugins\EpgEnricher\Plugin;
+use AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService;
+use AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryRepository as Repository;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Schema;
 
 it('does not transfer bindings across rebuilds with reused rowids or changed current settings', function () {
     $f = primaryNativeSetup();

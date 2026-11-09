@@ -219,7 +219,7 @@
     "directories": [
       "plugin-data/epg-enricher"
     ],
-    "tables": [],
+    "tables": ["plugin_epg_enricher_preserved_primary"],
     "files": [
       "plugin-data/epg-enricher/tmdb-season-cache.json"
     ],

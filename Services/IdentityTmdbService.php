@@ -2,10 +2,11 @@
 
 namespace AppLocalPlugins\EpgEnricher\Services;
 
+use App\Services\TmdbService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 
-class IdentityTmdbService extends \App\Services\TmdbService
+class IdentityTmdbService extends TmdbService
 {
     /**
      * Complete identity-search evidence, separate from the legacy top-N API.
@@ -171,5 +172,4 @@ class IdentityTmdbService extends \App\Services\TmdbService
             return $error;
         }
     }
-
 }

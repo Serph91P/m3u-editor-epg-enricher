@@ -15,13 +15,17 @@ class PreservedPrimaryRepository
 
     public function supported(): bool
     {
-        if (! class_exists(Schema::class)) { return false; }
+        if (! class_exists(Schema::class)) {
+            return false;
+        }
         if (! Schema::hasTable(self::TABLE)) {
             if (class_exists(Log::class)) {
                 Log::warning('EPG Enricher primary protection unsupported: plugin schema is not installed.');
             }
+
             return false;
         }
+
         return true;
     }
 
@@ -46,7 +50,10 @@ class PreservedPrimaryRepository
         try {
             $start = CarbonImmutable::parse($programme['start'])->timestamp;
             $stop = CarbonImmutable::parse($programme['stop'])->timestamp;
-            if ($start >= $stop) { return null; }
+            if ($start >= $stop) {
+                return null;
+            }
+
             return ['key' => PreservedPrimaryKey::slot($epgId, $programme['channel'], $start, $stop), 'stop' => $stop];
         } catch (\Throwable) {
             return null;
@@ -55,16 +62,21 @@ class PreservedPrimaryRepository
 
     public function reconcile(int $epgId, array $before, array $current, array $settings): string
     {
-        if (! $this->supported()) { return 'unsupported'; }
+        if (! $this->supported()) {
+            return 'unsupported';
+        }
         $old = self::slot($epgId, $before);
         $slot = self::slot($epgId, $current);
         if ($old !== null && ($slot === null || $slot['key'] !== $old['key'])) {
             $this->remove($epgId, $old['key']);
         }
-        if ($slot === null) { return 'unprotected'; }
+        if ($slot === null) {
+            return 'unprotected';
+        }
         $url = $current['icon'] ?? null;
         if (self::overwritten($settings) || ! self::validUrl($url) || $url !== ($before['icon'] ?? null)) {
             $this->remove($epgId, $slot['key']);
+
             return 'unprotected';
         }
         $now = now();
@@ -73,6 +85,7 @@ class PreservedPrimaryRepository
             'identity_hash' => PreservedPrimaryKey::identity($current), 'url' => $url,
             'stop_timestamp' => $slot['stop'], 'created_at' => $now, 'updated_at' => $now,
         ]], ['epg_id', 'programme_key'], ['identity_hash', 'url', 'stop_timestamp', 'updated_at']);
+
         return 'protected';
     }
 
@@ -84,11 +97,16 @@ class PreservedPrimaryRepository
     // Callers must supply freshly read canonical data and current resolved settings.
     public function validated(int $epgId, array $current, array $settings): ?string
     {
-        if (! $this->supported() || self::overwritten($settings)) { return null; }
+        if (! $this->supported() || self::overwritten($settings)) {
+            return null;
+        }
         $slot = self::slot($epgId, $current);
         $url = $current['icon'] ?? null;
-        if ($slot === null || $slot['stop'] <= time() || ! self::validUrl($url)) { return null; }
+        if ($slot === null || $slot['stop'] <= time() || ! self::validUrl($url)) {
+            return null;
+        }
         $row = DB::table(self::TABLE)->where('epg_id', $epgId)->where('programme_key', $slot['key'])->first();
+
         return $row !== null && $row->url === $url && $row->identity_hash === PreservedPrimaryKey::identity($current)
             ? $url : null;
     }
