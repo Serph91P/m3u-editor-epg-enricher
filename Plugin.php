@@ -3,6 +3,9 @@
 namespace AppLocalPlugins\EpgEnricher;
 
 require_once __DIR__.'/Services/IdentityTmdbService.php';
+require_once __DIR__.'/Services/PreservedPrimaryRepository.php';
+
+use AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryRepository;
 
 use AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService;
 

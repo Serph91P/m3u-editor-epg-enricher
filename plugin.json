@@ -16,12 +16,32 @@
   ],
   "permissions": [
     "db_read",
+    "db_write",
+    "schema_manage",
     "filesystem_read",
     "filesystem_write",
     "network_egress",
     "hook_subscriptions",
     "queue_jobs"
   ],
+  "schema": {
+    "tables": [{
+      "name": "plugin_epg_enricher_preserved_primary",
+      "columns": [
+        {"name": "id", "type": "id"},
+        {"name": "epg_id", "type": "bigInteger"},
+        {"name": "programme_key", "type": "string", "length": 64},
+        {"name": "identity_hash", "type": "string", "length": 64},
+        {"name": "url", "type": "text"},
+        {"name": "stop_timestamp", "type": "bigInteger"},
+        {"type": "timestamps"}
+      ],
+      "indexes": [
+        {"name": "epg_enricher_primary_slot_unique", "type": "unique", "columns": ["epg_id", "programme_key"]},
+        {"name": "epg_enricher_primary_stop_index", "columns": ["stop_timestamp"]}
+      ]
+    }]
+  },
   "settings": [
     {
       "id": "tmdb_config",
