@@ -26,6 +26,8 @@ abstract class EnricherNativeTestCase extends \Tests\TestCase
         }
         $app->afterBootstrapping(\Illuminate\Foundation\Bootstrap\LoadConfiguration::class, function ($app) {
             $app['config']->set('broadcasting.default', 'null');
+            $app['config']->set('cache.default', 'array');
+            $app['config']->set('queue.default', 'sync');
         });
         $app->make(\Illuminate\Contracts\Console\Kernel::class)->bootstrap();
         $app['config']->set('database.connections.jobs', $app['config']->get('database.connections.sqlite_testing'));
@@ -37,5 +39,6 @@ abstract class EnricherNativeTestCase extends \Tests\TestCase
     {
         parent::setUp();
         \Illuminate\Support\Facades\Http::preventStrayRequests();
+        \Illuminate\Support\Facades\Queue::fake();
     }
 }

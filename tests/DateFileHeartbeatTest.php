@@ -97,7 +97,7 @@ namespace Tests {
     function run(array $pages, array $outcomes = ['applied'], int $cancelAfter = PHP_INT_MAX, string $tmdbLanguage = ''): array {
         $host = new EpgCacheEnrichmentService(); $host->pages = $pages; $host->outcomes = $outcomes;
         $tmdb = new TmdbService();
-        $GLOBALS['services'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => $tmdb, GeneralSettings::class => new GeneralSettings()];
+        $GLOBALS['services'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), \AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService::class => $tmdb, GeneralSettings::class => new GeneralSettings()];
         $context = new PluginExecutionContext(); $context->cancelAfter = $cancelAfter; $context->settings['tmdb_language'] = $tmdbLanguage;
         $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true);
         return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context, $tmdb];

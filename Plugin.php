@@ -2,6 +2,10 @@
 
 namespace AppLocalPlugins\EpgEnricher;
 
+require_once __DIR__.'/Services/IdentityTmdbService.php';
+
+use AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService;
+
 use App\Models\Channel;
 use App\Models\Epg;
 use App\Models\EpgChannel;
@@ -909,7 +913,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         if (! ($settings['enrich_from_tmdb'] ?? true)) {
             return PluginActionResult::success('TMDB enrichment is disabled - nothing to do.');
         }
-        $tmdb = app(TmdbService::class);
+        $tmdb = app(IdentityTmdbService::class);
         if (! $tmdb->isConfigured()) {
             return PluginActionResult::failure('TMDB API key not configured; no enrichment was applied.');
         }
@@ -2385,7 +2389,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
      */
     private function healthCheck(PluginExecutionContext $context): PluginActionResult
     {
-        $tmdb = app(TmdbService::class);
+        $tmdb = app(IdentityTmdbService::class);
         $tmdbConfigured = $tmdb->isConfigured();
 
         $cacheFile = 'plugin-data/epg-enricher/tmdb-cache.json';

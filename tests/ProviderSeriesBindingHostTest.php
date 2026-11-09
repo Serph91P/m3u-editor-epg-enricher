@@ -437,7 +437,7 @@ namespace Tests {
         $GLOBALS['bindingHostServices'] = [
             EpgCacheService::class => new EpgCacheService(),
             EpgCacheEnrichmentService::class => $host,
-            TmdbService::class => $tmdb,
+            \AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService::class => $tmdb,
             GeneralSettings::class => $settings,
         ];
         if ($configure !== null) { $configure($host, $tmdb, $settings); }
@@ -625,7 +625,7 @@ namespace Tests {
     $legacyHost = new LegacyEpgCacheEnrichmentService([target(1), seed(2)]);
     $GLOBALS['bindingHostServices'] = [
         EpgCacheService::class => new EpgCacheService(), EpgCacheEnrichmentService::class => $legacyHost,
-        TmdbService::class => new TmdbService(), GeneralSettings::class => new GeneralSettings(),
+        \AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService::class => new TmdbService(), GeneralSettings::class => new GeneralSettings(),
     ];
     Storage::$files = [];
     $legacyMethod = new ReflectionMethod(Plugin::class, 'doEnrich');
@@ -696,7 +696,7 @@ namespace Tests {
         return execute($cacheReplayRows, function (EpgCacheEnrichmentService $host) use ($statuses): void {
             $host->forceUnsupportedGuardedSnapshotAt = 1;
             $host->applyStatuses = $statuses;
-            $GLOBALS['bindingHostServices'][TmdbService::class]->atlasSearchMissesRemaining = 1;
+            $GLOBALS['bindingHostServices'][\AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService::class]->atlasSearchMissesRemaining = 1;
         });
     };
 
