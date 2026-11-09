@@ -35,9 +35,18 @@ jobs:
         run: composer install --no-interaction --prefer-dist --no-progress
       - name: Validate, regress and package
         working-directory: enricher
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           php scripts/validate-plugin.php
-          python3 -c 'import pathlib,subprocess; files=sorted(pathlib.Path("tests").glob("*Test.php")); assert files; [subprocess.run(["php",str(p)],check=True) for p in files]'
+          python3 - <<'PY'
+          import os, pathlib, subprocess, tempfile
+          files = sorted(pathlib.Path('tests').glob('*Test.php'))
+          assert files
+          for path in files:
+              with tempfile.TemporaryDirectory(prefix='enricher-script-', dir=os.environ['TMPDIR']) as scratch:
+                  subprocess.run(['php', str(path)], env=dict(os.environ, TMPDIR=scratch), check=True)
+          PY
           python3 tests/release_metadata_test.py
           bash scripts/package-plugin.sh
       - name: Run every native contract, no opt-in or skips

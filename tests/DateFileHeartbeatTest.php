@@ -81,7 +81,7 @@ namespace App\Services {
 
 namespace App\Settings { class GeneralSettings { public string $tmdb_language = ''; } }
 namespace Illuminate\Support\Facades {
-    class Storage { public static function disk(string $name): self { return new self(); } public function makeDirectory(string $path): void {} public function path(string $path): string { return sys_get_temp_dir().'/'.$path; } public function exists(string $path): bool { return false; } public function get(string $path): string { return '{}'; } public function put(string $path, string $contents): bool { return true; } }
+    class Storage { public static function disk(string $name): self { return new self(); } public function makeDirectory(string $path): void { if (!is_dir($this->path($path))) { mkdir($this->path($path), 0700, true); } } public function path(string $path): string { return sys_get_temp_dir().'/'.$path; } public function exists(string $path): bool { return false; } public function get(string $path): string { return '{}'; } public function put(string $path, string $contents): bool { return true; } }
     class Http {} class Log {}
 }
 
