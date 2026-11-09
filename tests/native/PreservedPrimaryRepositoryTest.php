@@ -10,11 +10,6 @@ beforeEach(function () {
     app(PluginSchemaManager::class)->apply($manifest['schema'] ?? []);
 });
 
-function primaryProgramme(array $changes = []): array
-{
-    return array_replace(['channel' => 'synthetic', 'start' => '2030-01-01T12:00:00Z', 'stop' => '2030-01-01T13:00:00Z', 'title' => 'Synthetic Harbour', 'icon' => 'https://example.invalid/primary.jpg'], $changes);
-}
-
 it('creates declared storage and upserts source scoped bindings from canonical readback', function () {
     expect(Schema::hasTable('plugin_epg_enricher_preserved_primary'))->toBeTrue();
     $repo = new Repository;

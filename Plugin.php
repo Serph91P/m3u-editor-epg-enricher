@@ -913,6 +913,11 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
             return PluginActionResult::success('No playlist channels are mapped to this EPG - nothing to enrich.');
         }
         $settings = $context->settings;
+        try {
+            (new PreservedPrimaryRepository)->cleanup();
+        } catch (\Throwable) {
+            return PluginActionResult::failure('Could not clean primary protection storage.');
+        }
         if (! ($settings['enrich_from_tmdb'] ?? true)) {
             return PluginActionResult::success('TMDB enrichment is disabled - nothing to do.');
         }
@@ -998,7 +1003,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 if ($result['lookup'] && ! $result['cache_hit'] && ! $result['provider_match']) {
                     $cacheReplayIds[(int) ($row['id'] ?? 0)] = true;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
                 $published = array_replace($row['programme'], $changes);
                 $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($published))
                     || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($published));
@@ -1017,6 +1022,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
                 $posterAdds[] = $this->patchAddsPoster($row['programme'], $changes);
             }
+            $appliedPatches = [];
             if ($patches !== []) {
                 if ($context->cancellationRequested()) {
                     return PluginActionResult::cancelled('Enrichment cancelled before saving updates.', $stats);
@@ -1057,7 +1063,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                         }
                         $retryBefore = $retryProgramme;
                         $retryResult = $this->enrichProgrammeWithSettings($retryProgramme, $tmdb, $tmdbCache, $tmdbSeasonCache, $imagesCache, $settings, $epgId, $tmdbLanguage);
-                        $retryChanges = $this->canonicalHostChanges($retryBefore, $retryProgramme, $overwriteArtwork, in_array('preserved_primary_url', $retry['supported_fields'] ?? [], true));
+                        $retryChanges = $this->canonicalHostChanges($retryBefore, $retryProgramme, $overwriteArtwork);
                         $retryPublished = array_replace($retryBefore, $retryChanges);
                         $missingArtwork = (($settings['enrich_posters'] ?? true) && ! $this->hasTrustedPoster($retryPublished))
                             || (($settings['enrich_backdrops'] ?? true) && ! $this->hasTrustedLandscapeIcon($retryPublished));
@@ -1099,6 +1105,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                 } elseif ($status !== 'noop') {
                     return PluginActionResult::failure('Could not save programme updates.', $stats);
                 }
+            }
+            if (! $this->reconcilePrimaryPage($service, $epg, $context, $snapshot, $appliedPatches, $targetChannels, $afterId)) {
+                return PluginActionResult::failure('Could not save primary protection.', $stats);
             }
             $stats = $pageStats;
             if ($progress !== null) {
@@ -1154,7 +1163,7 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     $stats['programmes_unmatched']--;
                     $cacheReplayIds[$replayId]['unmatched'] = false;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
                 $replayPublished = array_replace($row['programme'], $changes);
                 $cacheReplayIds[$replayId]['replay_complete'] = (! ($settings['enrich_posters'] ?? true) || $this->hasTrustedPoster($replayPublished))
                     && (! ($settings['enrich_backdrops'] ?? true) || $this->hasTrustedLandscapeIcon($replayPublished));
@@ -1187,6 +1196,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     return PluginActionResult::failure('Could not save cached programme updates.', $stats);
                 }
             }
+            if (! $this->reconcilePrimaryPage($service, $epg, $context, $snapshot, $patches, $targetChannels, $afterId)) {
+                return PluginActionResult::failure('Could not save primary protection.', $stats);
+            }
             $afterId = $snapshot['next'] ?? null;
             if ($afterId === null) {
                 break;
@@ -1218,6 +1230,44 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         }
 
         return max(5, min(99, (int) floor(((int) ($progress['completed'] ?? 0) * 100) / (int) $progress['total'])));
+    }
+
+    private function reconcilePrimaryPage(object $service, Epg $epg, PluginExecutionContext $context, array $snapshot, array $patches, array $targetChannels, int $afterId): bool
+    {
+        $repository = new PreservedPrimaryRepository;
+        try {
+            if (! $repository->supported()) { return true; }
+            $readback = $service->snapshot($context, $epg, $afterId, 100);
+            if (($readback['status'] ?? null) !== 'ok') { return false; }
+            $current = [];
+            foreach ($readback['programmes'] ?? [] as $row) {
+                $programme = $row['programme'] ?? [];
+                $slot = PreservedPrimaryRepository::slot((int) $epg->id, $programme);
+                if ($slot !== null) {
+                    $current[$slot['key']][] = $programme;
+                }
+            }
+            $changes = array_column($patches, 'changes', 'id');
+            foreach ($snapshot['programmes'] ?? [] as $row) {
+                $before = $row['programme'] ?? [];
+                if (! in_array($before['channel'] ?? null, $targetChannels, true)) { continue; }
+                $slot = PreservedPrimaryRepository::slot((int) $epg->id, $before);
+                if ($slot === null) { continue; }
+                $expected = array_replace($before, $changes[$row['id']] ?? []);
+                $matches = $current[$slot['key']] ?? [];
+                if (count($matches) !== 1
+                    || \AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryKey::identity($matches[0]) !== \AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryKey::identity($expected)
+                    || ($matches[0]['icon'] ?? null) !== ($expected['icon'] ?? null)) {
+                    $repository->remove((int) $epg->id, $slot['key']);
+                    continue;
+                }
+                $repository->reconcile((int) $epg->id, $before, $matches[0], $context->settings);
+            }
+            return true;
+        } catch (\Throwable) {
+            Log::warning('EPG Enricher could not persist canonical primary protection.');
+            return false;
+        }
     }
 
     private function enrichCopy(array $programme, TmdbService $tmdb, array &$tmdbCache, array &$tmdbSeasonCache, array &$imagesCache, array $settings, int $epgId, string $tmdbLanguage): array
@@ -1355,8 +1405,8 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     || ! $this->applyFreshSeriesArtworkBinding($programme, $bindings[$seriesKey], $enrichPosters, $enrichBackdrops, $overwriteArtwork)) {
                     continue;
                 }
-                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork, in_array('preserved_primary_url', $snapshot['supported_fields'] ?? [], true));
-                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images', 'preserved_primary_url']) !== []) {
+                $changes = $this->canonicalHostChanges($row['programme'], $programme, $overwriteArtwork);
+                if ($changes === [] || array_diff(array_keys($changes), ['icon', 'images']) !== []) {
                     continue;
                 }
                 $patches[] = ['id' => $row['id'] ?? 0, 'hash' => $row['hash'] ?? '', 'changes' => $changes];
@@ -1379,6 +1429,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
                     foreach ($posterAdds as $posterAdded) {
                         $postersAdded += (int) $posterAdded;
                     }
+                }
+                if (! $this->reconcilePrimaryPage($service, $epg, $context, $snapshot, $patches, $targetChannels, $afterId)) {
+                    return PluginActionResult::failure('Could not save primary protection.', ['programmes_updated' => $updated]);
                 }
                 if (! is_string($apply['evidence'] ?? null) || trim($apply['evidence']) === '') {
                     // The accepted batch consumed the proof. Do not reuse it on another page.
@@ -1504,19 +1557,9 @@ class Plugin implements EpgProcessorPluginInterface, HookablePluginInterface, Pl
         return $role === 'poster' ? $this->isTrustedPortraitImage($image) : $this->isTrustedLandscapeImage($image);
     }
 
-    private function canonicalHostChanges(array $before, array $after, bool $overwriteArtwork = false, bool $supportsPreservedPrimary = false): array
+    private function canonicalHostChanges(array $before, array $after, bool $overwriteArtwork = false): array
     {
         $changes = [];
-        if ($supportsPreservedPrimary) {
-            $beforeIcon = $before['icon'] ?? '';
-            $afterIcon = $after['icon'] ?? '';
-            $preserved = ! $overwriteArtwork && is_string($beforeIcon)
-                && $this->isCanonicalHostArtworkUrl($beforeIcon) && $beforeIcon === $afterIcon
-                ? $beforeIcon : '';
-            if ($preserved !== ($before['preserved_primary_url'] ?? '')) {
-                $changes['preserved_primary_url'] = $preserved;
-            }
-        }
         if (array_key_exists('icon', $before) && ! array_key_exists('icon', $after)) {
             $changes['icon'] = '';
         }

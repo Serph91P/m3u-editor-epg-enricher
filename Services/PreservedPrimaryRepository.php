@@ -15,7 +15,8 @@ class PreservedPrimaryRepository
 
     public function supported(): bool
     {
-        if (! class_exists(Schema::class) || ! Schema::hasTable(self::TABLE)) {
+        if (! class_exists(Schema::class)) { return false; }
+        if (! Schema::hasTable(self::TABLE)) {
             if (class_exists(Log::class)) {
                 Log::warning('EPG Enricher primary protection unsupported: plugin schema is not installed.');
             }
