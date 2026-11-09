@@ -4,6 +4,7 @@ namespace AppLocalPlugins\EpgEnricher;
 
 require_once __DIR__.'/Services/IdentityTmdbService.php';
 require_once __DIR__.'/Services/PreservedPrimaryRepository.php';
+require_once __DIR__.'/Services/PreservedPrimaryProjection.php';
 
 use AppLocalPlugins\EpgEnricher\Services\PreservedPrimaryRepository;
 
