@@ -9,6 +9,43 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 
+it('reconciles protection through a real forward miss later match and cache replay without more provider calls', function () {
+    $f = primaryNativeSetup(['enrich_categories' => true, 'enrich_descriptions' => false, 'enrich_posters' => false, 'enrich_backdrops' => false, 'enrich_episode_details' => false, 'keyword_category_detection' => false]);
+    $p = primaryProgramme(['title' => 'Synthetic Atlas', 'episode_num' => 'EP123']);
+    $later = array_replace($p, ['start' => '2030-01-01T14:00:00Z', 'stop' => '2030-01-01T15:00:00Z']);
+    primarySeed($f['epg'], [$p, $later]);
+    $settings = new GeneralSettings;
+    $settings->tmdb_api_key = 'offline-synthetic';
+    app()->instance(IdentityTmdbService::class, new IdentityTmdbService($settings));
+    $searches = 0;
+    Http::fake(function ($request) use (&$searches) {
+        $path = parse_url($request->url(), PHP_URL_PATH);
+        if (str_ends_with($path, '/search/tv')) {
+            if (++$searches === 1) {
+                return Http::response([], 429);
+            }
+
+            return Http::response(['page' => 1, 'total_pages' => 1, 'total_results' => 1, 'results' => [['id' => 992006, 'name' => 'Synthetic Atlas', 'original_name' => 'Synthetic Atlas', 'first_air_date' => '2020-01-01', 'overview' => '']]]);
+        }
+
+        return Http::response(match (true) {
+            str_ends_with($path, '/alternative_titles') => ['id' => 992006, 'results' => []],
+            str_ends_with($path, '/translations') => ['id' => 992006, 'translations' => []],
+            str_ends_with($path, '/tv/992006') => ['id' => 992006, 'name' => 'Synthetic Atlas', 'original_name' => 'Synthetic Atlas', 'first_air_date' => '2020-01-01', 'genres' => [['id' => 18, 'name' => 'Drama']]],
+            default => throw new RuntimeException('Unexpected synthetic endpoint'),
+        });
+    });
+    $result = (new ReflectionMethod(Plugin::class, 'doEnrich'))->invoke(new Plugin, $f['epg']->id, [$f['playlist']->id], $f['context']);
+    expect($result->status)->toBe('completed')->and($result->data['programmes_updated'])->toBe(2);
+    $rows = app(EpgCacheEnrichmentService::class)->snapshot($f['context'], $f['epg'])['programmes'];
+    foreach ($rows as $row) {
+        expect($row['programme']['category'])->toBe('Drama');
+        expect((new Repository)->validated($f['epg']->id, $row['programme'], []))->toBe($p['icon']);
+    }
+    expect(DB::table(Repository::TABLE)->count())->toBe(2);
+    Http::assertSentCount(5);
+});
+
 it('does not transfer bindings across rebuilds with reused rowids or changed current settings', function () {
     $f = primaryNativeSetup();
     primarySeed($f['epg'], [primaryProgramme()]);
