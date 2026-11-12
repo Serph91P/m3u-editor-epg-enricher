@@ -50,8 +50,9 @@ class PreservedPrimaryProjection
                 continue;
             }
             $shift = (int) ($channel->tvg_shift ?? 0);
-            $from = CarbonImmutable::createFromTimestampUTC($payload['start_timestamp'])->subHours($shift);
-            $to = CarbonImmutable::createFromTimestampUTC($payload['stop_timestamp'])->subHours($shift);
+            // Cache import buckets raw starts by the app's local day, not UTC.
+            $from = CarbonImmutable::createFromTimestampUTC($payload['start_timestamp'])->subHours($shift)->setTimezone(date_default_timezone_get());
+            $to = CarbonImmutable::createFromTimestampUTC($payload['stop_timestamp'])->subHours($shift)->setTimezone(date_default_timezone_get());
             $programmes = $cache->getCachedProgrammesRange($epg, $from->format('Y-m-d'), $to->format('Y-m-d'), [$raw->channel_id]);
             $seen = [];
             foreach ($programmes[$raw->channel_id] ?? [] as $programme) {

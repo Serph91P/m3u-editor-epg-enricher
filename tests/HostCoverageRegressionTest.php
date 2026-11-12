@@ -68,9 +68,10 @@ if ($case === 'stats') {
         }
     };
     $GLOBALS['bindingHostServices'][EpgCacheEnrichmentService::class]=$host;
-    $GLOBALS['bindingHostServices'][App\Services\TmdbService::class]=$tmdb;
+    $GLOBALS['bindingHostServices'][\AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService::class]=$tmdb;
     $progress=null;
     $result=(new ReflectionMethod(Plugin::class,'enrichHostSnapshotPages'))->invokeArgs(new Plugin(),[new App\Models\Epg(1),1,[1],$context,&$progress]);
+    Tests\same([2, 1], array_column(array_merge(...array_column($host->applies, 'patches')), 'id'), 'The first occurrence must initially abstain, then be repaired only after the later match.');
     Tests\same(2,$result->data['programmes_updated'],'A later cache hit repairs the first occurrence.');
     Tests\same(0,$result->data['programmes_unmatched'],'Resolved replay must not remain counted as unmatched.');
     Tests\same(0,$result->data['programmes_missing_artwork'],'Resolved replay must not remain counted as missing requested artwork.');
