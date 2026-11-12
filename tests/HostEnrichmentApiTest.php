@@ -133,7 +133,7 @@ namespace Tests {
         $host->applyStatuses = $statuses;
         $host->snapshotStatuses = $snapshotStatuses;
         $host->pages = $pages;
-        $GLOBALS['hostEnrichmentServices'] = [EpgCacheService::class => new EpgCacheService(), TmdbService::class => new TmdbService(), EpgCacheEnrichmentService::class => $host, GeneralSettings::class => new GeneralSettings()];
+        $GLOBALS['hostEnrichmentServices'] = [EpgCacheService::class => new EpgCacheService(), \AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService::class => new TmdbService(), EpgCacheEnrichmentService::class => $host, GeneralSettings::class => new GeneralSettings()];
         $method = new ReflectionMethod(new Plugin(), 'doEnrich');
         $method->setAccessible(true);
         $context = new PluginExecutionContext();

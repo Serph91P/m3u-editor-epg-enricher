@@ -81,7 +81,7 @@ namespace App\Services {
 
 namespace App\Settings { class GeneralSettings { public string $tmdb_language = ''; } }
 namespace Illuminate\Support\Facades {
-    class Storage { public static function disk(string $name): self { return new self(); } public function makeDirectory(string $path): void {} public function path(string $path): string { return sys_get_temp_dir().'/'.$path; } public function exists(string $path): bool { return false; } public function get(string $path): string { return '{}'; } public function put(string $path, string $contents): bool { return true; } }
+    class Storage { public static function disk(string $name): self { return new self(); } public function makeDirectory(string $path): void { if (!is_dir($this->path($path))) { mkdir($this->path($path), 0700, true); } } public function path(string $path): string { return sys_get_temp_dir().'/'.$path; } public function exists(string $path): bool { return false; } public function get(string $path): string { return '{}'; } public function put(string $path, string $contents): bool { return true; } }
     class Http {} class Log {}
 }
 
@@ -97,7 +97,7 @@ namespace Tests {
     function run(array $pages, array $outcomes = ['applied'], int $cancelAfter = PHP_INT_MAX, string $tmdbLanguage = ''): array {
         $host = new EpgCacheEnrichmentService(); $host->pages = $pages; $host->outcomes = $outcomes;
         $tmdb = new TmdbService();
-        $GLOBALS['services'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), TmdbService::class => $tmdb, GeneralSettings::class => new GeneralSettings()];
+        $GLOBALS['services'] = [EpgCacheEnrichmentService::class => $host, EpgCacheService::class => new EpgCacheService(), \AppLocalPlugins\EpgEnricher\Services\IdentityTmdbService::class => $tmdb, GeneralSettings::class => new GeneralSettings()];
         $context = new PluginExecutionContext(); $context->cancelAfter = $cancelAfter; $context->settings['tmdb_language'] = $tmdbLanguage;
         $method = new ReflectionMethod(new Plugin(), 'doEnrich'); $method->setAccessible(true);
         return [$method->invoke(new Plugin(), 1, [1], $context), $host, $context, $tmdb];

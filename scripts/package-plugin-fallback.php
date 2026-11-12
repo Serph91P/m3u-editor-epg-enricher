@@ -6,48 +6,17 @@ if ($argc !== 2) {
     fwrite(STDERR, "Usage: php package-plugin-fallback.php <archive-path>\n");
     exit(2);
 }
-
-$root = realpath(dirname(__DIR__));
-if ($root === false) {
-    fwrite(STDERR, "Could not resolve plugin root.\n");
-    exit(1);
-}
-
-$archivePath = $argv[1];
+$root = dirname(__DIR__);
 $archive = new ZipArchive;
-if ($archive->open($archivePath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-    fwrite(STDERR, "Could not create {$archivePath}.\n");
-    exit(1);
+if ($archive->open($argv[1], ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+    throw new RuntimeException('Could not create plugin archive.');
 }
-
-$excludedDirectories = ['.git', '.github', '.hermes', '.serena', 'dist', 'tests', 'scripts'];
-$excludedRootFiles = ['.gitignore', 'README.md', 'AGENTS.md', 'CLAUDE.md', '.DS_Store'];
-$iterator = new RecursiveIteratorIterator(
-    new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
-    RecursiveIteratorIterator::LEAVES_ONLY,
-);
-
-foreach ($iterator as $file) {
-    if (! $file->isFile() || $file->isLink()) {
-        continue;
-    }
-
-    $relative = str_replace(DIRECTORY_SEPARATOR, '/', substr($file->getPathname(), strlen($root) + 1));
-    $segments = explode('/', $relative);
-    if (in_array($segments[0], $excludedDirectories, true)
-        || (count($segments) === 1 && in_array($relative, $excludedRootFiles, true))
-        || str_starts_with($file->getFilename(), '._')) {
-        continue;
-    }
-
-    if (! $archive->addFile($file->getPathname(), $relative)) {
-        $archive->close();
-        fwrite(STDERR, "Could not add {$relative}.\n");
-        exit(1);
+$files = [$root.'/Plugin.php', $root.'/plugin.json', $root.'/README.md', ...glob($root.'/Services/*.php')];
+foreach ($files as $file) {
+    if (! is_file($file) || is_link($file) || ! $archive->addFile($file, substr($file, strlen($root) + 1))) {
+        throw new RuntimeException('Could not add runtime file.');
     }
 }
-
 if (! $archive->close()) {
-    fwrite(STDERR, "Could not finalize {$archivePath}.\n");
-    exit(1);
+    throw new RuntimeException('Could not finalize plugin archive.');
 }

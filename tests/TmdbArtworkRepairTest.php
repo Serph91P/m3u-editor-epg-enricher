@@ -61,6 +61,26 @@ namespace App\Settings {
 }
 
 namespace Illuminate\Support\Facades {
+    // In-memory persistence boundary for image-cache regression tests; no disk IO.
+    class Storage
+    {
+        public static array $writes = [];
+
+        public static function disk(string $name): self
+        {
+            return new self();
+        }
+
+        public function makeDirectory(string $path): void {}
+
+        public function put(string $path, string $contents): bool
+        {
+            self::$writes[$path] = $contents;
+
+            return true;
+        }
+    }
+
     class FakeHttpResponse
     {
         public function __construct(private bool $successful, private array $data = []) {}
@@ -103,6 +123,7 @@ namespace Illuminate\Support\Facades {
 namespace App\Services {
     class TmdbService
     {
+        protected string $language = 'de-DE';
         public int $tvSearches = 0;
         public int $movieSearches = 0;
         public int $tvDetailsRequests = 0;
@@ -797,9 +818,9 @@ namespace Tests {
     $patchAddsPosterMethod = $reflection->getMethod('patchAddsPoster');
     $patchAddsPosterMethod->setAccessible(true);
 
-    $expectedLogicVersion = '2026.10.09-horizontal-show-primary';
+    $expectedLogicVersion = '2026.10.24-global-identity';
     $currentLogicVersion = $reflection->getConstant('ENRICHMENT_LOGIC_VERSION');
-    assertSameValue($expectedLogicVersion, $currentLogicVersion, 'Horizontal show-primary artwork must bump the enrichment logic version.');
+    assertSameValue($expectedLogicVersion, $currentLogicVersion, 'Poster-primary artwork must bump the enrichment logic version.');
     $settingsHasher = $reflection->getMethod('computeSettingsHash');
     $settingsHasher->setAccessible(true);
     $legacySettingsHash = md5(json_encode([
@@ -853,7 +874,8 @@ namespace Tests {
     $yearFallbackCache = [];
     $yearFallbackResult = enrich($plugin, $method, $yearFallbackProgramme, $yearFallbackTmdb, $yearFallbackCache, enrichBackdrops: false);
     assertSameValue(true, $yearFallbackResult['provider_match'] ?? null, 'An empty year-filtered search must retry without the provider year and retain the original year for scoring.');
-    assertSameValue('https://image.tmdb.org/t/p/w500/synthetic-harbor.jpg', $yearFallbackProgramme['images'][0]['url'] ?? null, 'The original product path must persist the conservatively matched poster.');
+    assertSameValue(690, array_values($yearFallbackCache)[0]['tmdb_id'] ?? null, 'The original product path must persist the conservatively matched identity.');
+    assertSameValue(null, $yearFallbackProgramme['images'] ?? null, 'A details URL without image geometry must not invent a qualified poster.');
     assertSameValue([2020, null], $yearFallbackTmdb->tvYears, 'TV fallback must be bounded to one no-year retry.');
     assertSameValue([2020, null], $yearFallbackTmdb->movieYears, 'Movie fallback must be bounded to one no-year retry.');
     $cachedYearProgramme = [
@@ -1328,7 +1350,7 @@ namespace Tests {
     assertSameValue(
         'https://image.tmdb.org/t/p/original/harbor-news-backdrop.jpg',
         $keywordNewsProgramme['icon'] ?? null,
-        'A news keyword must not suppress a separately validated artwork match when requested roles are missing.'
+        'A news keyword must not suppress validated artwork, but a details-only poster URL cannot invent portrait geometry.'
     );
     assertSameValue(true, $keywordNewsResult['lookup'] ?? null, 'Missing news artwork should make one bounded validated lookup.');
     assertSameValue([1, 1], [$keywordNewsTmdb->tvCandidateSearches, $keywordNewsTmdb->movieCandidateSearches], 'News artwork matching must retain one bounded search per eligible media type.');
@@ -1416,7 +1438,7 @@ namespace Tests {
     assertSameValue('News', $posterMissingProgramme['category'] ?? null, 'Poster-only repair must retain the detected news category.');
     assertSameValue($sourceBackdrop['url'], $posterMissingProgramme['icon'] ?? null, 'Poster-only repair must preserve the source-owned backdrop.');
     assertTrueValue(in_array($sourceBackdrop['url'], array_column($posterMissingProgramme['images'] ?? [], 'url'), true), 'Poster-only repair must preserve the source-owned backdrop image.');
-    assertTrueValue(in_array('https://image.tmdb.org/t/p/w500/harbor-news-poster.jpg', array_column($posterMissingProgramme['images'] ?? [], 'url'), true), 'Poster-only repair must add the validated missing poster.');
+    assertSameValue(false, in_array('https://image.tmdb.org/t/p/w500/harbor-news-poster.jpg', array_column($posterMissingProgramme['images'] ?? [], 'url'), true), 'Preserve must not add a poster competing with the existing source Primary.');
     assertSameValue(true, $posterMissingResult['lookup'] ?? null, 'Poster-only repair should use one bounded lookup.');
     assertSameValue([1, 1], [$posterMissingTmdb->tvCandidateSearches, $posterMissingTmdb->movieCandidateSearches], 'Poster-only repair must add exactly one bounded search per eligible media type.');
 
@@ -1432,7 +1454,8 @@ namespace Tests {
     $backdropMissingResult = enrich($plugin, $method, $backdropMissingProgramme, $backdropMissingTmdb, $backdropMissingCache, mapGenresToEpgCategories: true, keywordDetection: true);
     assertSameValue('News', $backdropMissingProgramme['category'] ?? null, 'Backdrop-only repair must retain the detected news category.');
     assertTrueValue(in_array($sourcePoster['url'], array_column($backdropMissingProgramme['images'] ?? [], 'url'), true), 'Backdrop-only repair must preserve the source-owned poster.');
-    assertSameValue('https://image.tmdb.org/t/p/original/harbor-news-backdrop.jpg', $backdropMissingProgramme['icon'] ?? null, 'Backdrop-only repair must add the validated missing backdrop.');
+    assertSameValue($sourcePoster['url'], $backdropMissingProgramme['icon'] ?? null, 'A source-owned qualified poster must be Primary when repairing a missing backdrop.');
+    assertTrueValue(in_array('https://image.tmdb.org/t/p/original/harbor-news-backdrop.jpg', array_column($backdropMissingProgramme['images'] ?? [], 'url'), true), 'Backdrop-only repair must add the validated missing backdrop as secondary artwork.');
     assertSameValue(true, $backdropMissingResult['lookup'] ?? null, 'Backdrop-only repair should use one bounded lookup.');
     assertSameValue([1, 1], [$backdropMissingTmdb->tvCandidateSearches, $backdropMissingTmdb->movieCandidateSearches], 'Backdrop-only repair must add exactly one bounded search per eligible media type.');
 
@@ -1566,7 +1589,7 @@ namespace Tests {
     assertSameValue(
         'https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg',
         $genericClassicProgramme['icon'] ?? null,
-        'Any episodic Classics title should retry the generic base series and select a validated TMDB candidate.'
+        'Any episodic Classics title should select the validated work without fabricating details-poster geometry.'
     );
     assertSameValue(['Beacon Vale Classics (12)', 'Beacon Vale'], $genericClassicTmdb->tvQueries, 'Generic edition matching must search the full TV title before the derived base title.');
     assertSameValue(['Beacon Vale Classics (12)', 'Beacon Vale'], $genericClassicTmdb->movieQueries, 'Generic edition matching must search the full movie title before the derived base title.');
@@ -1612,7 +1635,7 @@ namespace Tests {
         $episodeProgramme = ['title' => $episodeTitle];
         $episodeCache = [];
         enrich($plugin, $method, $episodeProgramme, $episodeTmdb, $episodeCache);
-        assertSameValue('https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg', $episodeProgramme['icon'] ?? null, $episodeTitle.' should resolve through the same generic base-title pipeline.');
+        assertSameValue('https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg', $episodeProgramme['icon'] ?? null, $episodeTitle.' should resolve through the same generic base-title pipeline without inventing poster geometry.');
         assertSameValue([$episodeTitle, 'Beacon Vale'], $episodeTmdb->tvQueries, $episodeTitle.' should search the full TV title before the derived base title.');
         assertSameValue([$episodeTitle, 'Beacon Vale'], $episodeTmdb->movieQueries, $episodeTitle.' should search the full movie title before the derived base title.');
         assertSameValue([1, 0], [$episodeTmdb->tvDetailsRequests, $episodeTmdb->movieDetailsRequests], $episodeTitle.' should load only the globally validated TV winner.');
@@ -1632,7 +1655,7 @@ namespace Tests {
     $normalizedEditionProgramme = ['title' => '  BEACON-VALE,   CLASSICS Folge 9  '];
     $normalizedEditionCache = [];
     enrich($plugin, $method, $normalizedEditionProgramme, $normalizedEditionTmdb, $normalizedEditionCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg', $normalizedEditionProgramme['icon'] ?? null, 'Case, whitespace, and punctuation variants should use generic normalized candidate matching.');
+    assertSameValue('https://image.tmdb.org/t/p/original/beacon-vale-backdrop.jpg', $normalizedEditionProgramme['icon'] ?? null, 'Case, whitespace, and punctuation variants should use generic normalized candidate matching without inventing poster geometry.');
     assertSameValue(['  BEACON-VALE,   CLASSICS Folge 9  ', 'BEACON-VALE,'], $normalizedEditionTmdb->tvQueries, 'Normalized title variants must preserve the full-then-base TV query order.');
     assertSameValue(['  BEACON-VALE,   CLASSICS Folge 9  ', 'BEACON-VALE,'], $normalizedEditionTmdb->movieQueries, 'Normalized title variants must preserve the full-then-base movie query order.');
 
@@ -1656,7 +1679,7 @@ namespace Tests {
     $globalMovieProgramme = ['title' => 'Kestrel Ridge - A Winter Chronicle'];
     $globalMovieCache = [];
     enrich($plugin, $method, $globalMovieProgramme, $globalMovieTmdb, $globalMovieCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/kestrel-ridge-backdrop.jpg', $globalMovieProgramme['icon'] ?? null, 'A unique compound-title variant with the same substantial base should resolve globally.');
+    assertSameValue('https://image.tmdb.org/t/p/original/kestrel-ridge-backdrop.jpg', $globalMovieProgramme['icon'] ?? null, 'A unique compound-title variant with the same substantial base should resolve globally without inventing poster geometry.');
     assertSameValue([2, 2], [$globalMovieTmdb->tvCandidateSearches, $globalMovieTmdb->movieCandidateSearches], 'A weak compound-title identity must be confirmed by full and base TV/movie searches.');
     assertSameValue(['Kestrel Ridge - A Winter Chronicle', 'Kestrel Ridge'], $globalMovieTmdb->tvQueries, 'Compound confirmation must search the full then base TV title.');
     assertSameValue(['Kestrel Ridge - A Winter Chronicle', 'Kestrel Ridge'], $globalMovieTmdb->movieQueries, 'Compound confirmation must search the full then base movie title.');
@@ -2024,7 +2047,7 @@ namespace Tests {
     ];
     $episodeValidatedCache = [];
     enrich($plugin, $method, $episodeValidatedProgramme, $episodeValidatedTmdb, $episodeValidatedCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $episodeValidatedProgramme['icon'] ?? null, 'A unique matching typed episode must resolve an otherwise tied TV identity.');
+    assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $episodeValidatedProgramme['icon'] ?? null, 'A unique matching typed episode resolves TV identity, without inventing poster geometry.');
     assertSameValue(1, $episodeValidatedTmdb->tvDetailsRequests, 'Only the episode-validated TV candidate may load series details.');
     assertSameValue(2, $episodeValidatedTmdb->seasonRequests, 'Episode validation must inspect every tied candidate exactly once.');
     $episodeValidatedReplay = [
@@ -2034,7 +2057,7 @@ namespace Tests {
     ];
     $episodeValidatedReplayTmdb = new CandidateTmdbService();
     enrich($plugin, $method, $episodeValidatedReplay, $episodeValidatedReplayTmdb, $episodeValidatedCache);
-    assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $episodeValidatedReplay['icon'] ?? null, 'An exact episode-validated replay should retain the validated artwork.');
+    assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $episodeValidatedReplay['icon'] ?? null, 'An exact episode-validated replay should retain the validated artwork without inventing poster geometry.');
     assertSameValue([0, 0, 0], [$episodeValidatedReplayTmdb->tvCandidateSearches, $episodeValidatedReplayTmdb->tvDetailsRequests, $episodeValidatedReplayTmdb->seasonRequests], 'An exact episode-validated cache hit must not amplify TMDB requests.');
 
     // A base-title cache entry validated for S01E05 must not leak to S02E05 merely
@@ -2171,7 +2194,7 @@ namespace Tests {
     $verifiedMissingSeasonCache = [];
     enrich($plugin, $method, $verifiedMissingSeasonProgramme, $verifiedMissingSeasonTmdb, $verifiedMissingSeasonCache);
     assertSameValue('https://image.tmdb.org/t/p/original/twin-horizon-backdrop.jpg', $verifiedMissingSeasonProgramme['icon'] ?? null, 'A verified missing competing season may resolve one exact-title season-compatible series despite provider episode-number drift.');
-    assertTrueValue(in_array('https://image.tmdb.org/t/p/w500/twin-horizon-poster.jpg', array_column($verifiedMissingSeasonProgramme['images'] ?? [], 'url'), true), 'The safely season-resolved series must expose its qualified poster.');
+    assertSameValue(false, in_array('poster', array_column($verifiedMissingSeasonProgramme['images'] ?? [], 'type'), true), 'A safely resolved series still cannot invent poster geometry from a details URL.');
 
     foreach ([
         'provider error' => ['status' => 'error'],
@@ -2426,23 +2449,14 @@ namespace Tests {
     $longWalkTmdb = new TmdbService('long-walk');
     $longWalkResult = enrich($plugin, $method, $longWalk, $longWalkTmdb, $longWalkCache);
 
-    assertSameValue('https://fixture.invalid/movie-backdrop.jpg', $longWalk['icon'], 'Movie backdrop should repair an untrusted provider icon.');
-    assertSameValue(
-        [
-            'https://fixture.invalid/movie-backdrop.jpg',
-            'https://fixture.invalid/movie-poster.jpg',
-            'https://provider.invalid/unknown.jpg',
-            'https://provider.invalid/logo.png',
-            'https://fixture.invalid/movie-backdrop.jpg',
-        ],
-        array_column($longWalk['images'], 'url'),
-        'A movie primary should bracket secondary artwork for first- and last-icon consumers.'
-    );
-    assertSameValue('backdrop', $longWalk['images'][0]['type'], 'Primary image should be a landscape backdrop.');
-    assertSameValue('tmdb', $longWalk['images'][0]['source'] ?? null, 'TMDB provenance should win deduplication over an unprovenanced record with the same URL and role.');
-    assertSameValue($longWalk['icon'], $longWalk['images'][array_key_last($longWalk['images'])]['url'], 'The terminal movie image should duplicate the selected primary URL.');
-    assertSameValue('backdrop', $longWalk['images'][array_key_last($longWalk['images'])]['type'], 'The terminal movie primary duplicate should retain its image type.');
-    assertTrueValue(in_array('https://fixture.invalid/movie-poster.jpg', array_column($longWalk['images'], 'url'), true), 'Portrait poster should remain in images.');
+    assertSameValue('https://provider.invalid/unknown.jpg', $longWalk['icon'], 'Without overwrite, movie enrichment must preserve the existing Primary.');
+    assertTrueValue(in_array('https://provider.invalid/unknown.jpg', array_column($longWalk['images'], 'url'), true), 'Preserved source Primary must retain its source image evidence.');
+    assertTrueValue(in_array('https://provider.invalid/logo.png', array_column($longWalk['images'], 'url'), true), 'Changing Primary policy must not discard unrelated provider logos.');
+    $longWalkBackdrops = array_values(array_filter($longWalk['images'], static fn (array $image): bool => ($image['type'] ?? null) === 'backdrop'));
+    assertSameValue(null, $longWalkBackdrops[0]['source'] ?? null, 'Preserve must not replace source image metadata with a new TMDB competitor.');
+    $longWalkSourceImages = array_values(array_filter($longWalk['images'], static fn (array $image): bool => ($image['url'] ?? null) === 'https://provider.invalid/unknown.jpg'));
+    assertSameValue(null, $longWalkSourceImages[0]['type'] ?? null, 'The preserved unknown source must not be relabelled as a backdrop.');
+    assertSameValue(false, in_array('https://fixture.invalid/movie-poster.jpg', array_column($longWalk['images'], 'url'), true), 'Preserve must not add a competing poster ahead of the protected unknown Primary.');
     assertTrueValue($longWalkResult['changed'], 'Artwork repair should report a changed programme.');
 
     $stableLongWalk = json_encode($longWalk, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -2474,9 +2488,9 @@ namespace Tests {
         enrich($plugin, $method, $conflictingArtwork, $conflictingTmdb, $conflictingCache);
 
         assertSameValue(
-            'https://fixture.invalid/movie-backdrop.jpg',
+            'https://provider.invalid/'.$geometry.'-fanart.jpg',
             $conflictingArtwork['icon'],
-            ucfirst($geometry).' fanart with conflicting geometry should be repaired by the TMDB backdrop.'
+            ucfirst($geometry).' source Primary must survive without overwrite, independently of geometry validation.'
         );
         assertTrueValue(
             $conflictingTmdb->tvSearches + $conflictingTmdb->movieSearches > 0,
@@ -2492,8 +2506,10 @@ namespace Tests {
         'category' => 'Movie',
         'icon' => 'https://provider.invalid/illuminati-unknown.jpg',
     ];
-    enrich($plugin, $method, $illuminati, $illuminatiTmdb, $illuminatiCache);
-    assertSameValue('https://fixture.invalid/illuminati-backdrop.jpg', $illuminati['icon'], 'Strong German alternative-title evidence should match Angels & Demons.');
+    $illuminatiResult = enrich($plugin, $method, $illuminati, $illuminatiTmdb, $illuminatiCache);
+    assertSameValue('https://provider.invalid/illuminati-unknown.jpg', $illuminati['icon'], 'A validated alternative-title match must preserve the existing Primary without overwrite.');
+    assertSameValue(true, $illuminatiResult['provider_match'], 'Strong German alternative-title evidence should still match Angels & Demons in preserve mode.');
+    assertSameValue(false, in_array('https://fixture.invalid/illuminati-poster.jpg', array_column($illuminati['images'] ?? [], 'url'), true), 'A matched identity must not bypass protected Primary artwork.');
 
     $weakIlluminati = [
         'title' => 'Illuminati',
@@ -2587,11 +2603,9 @@ namespace Tests {
     $baresCache = [];
     $baresTmdb = new TmdbService('bares');
     enrich($plugin, $method, $bares, $baresTmdb, $baresCache);
-    assertSameValue('https://fixture.invalid/bares-backdrop.jpg', $bares['icon'], 'Episodic signals should force the TV landscape backdrop.');
-    assertTrueValue(in_array('https://fixture.invalid/bares-poster.jpg', array_column($bares['images'], 'url'), true), 'TV portrait poster should remain in images.');
-    assertSameValue($bares['icon'], $bares['images'][0]['url'], 'The selected series landscape should remain the first image.');
-    assertSameValue($bares['icon'], $bares['images'][array_key_last($bares['images'])]['url'], 'The selected series landscape should also be the final image.');
-    assertSameValue('backdrop', $bares['images'][array_key_last($bares['images'])]['type'], 'The terminal series primary duplicate should retain its image type.');
+    assertSameValue('https://provider.invalid/bares-unknown.jpg', $bares['icon'], 'Episode evidence must not authorize replacing an existing Primary without overwrite.');
+    assertSameValue(false, in_array('https://fixture.invalid/bares-poster.jpg', array_column($bares['images'] ?? [], 'url'), true), 'Preserve must not introduce a competing TV poster.');
+    assertSameValue(false, in_array('https://fixture.invalid/bares-backdrop.jpg', array_column($bares['images'] ?? [], 'url'), true), 'Preserve must not introduce a competing TV backdrop ahead of the protected fallback.');
     assertSameValue(1, $baresTmdb->tvSearches, 'The exact Unicode title should resolve through the TV artwork path.');
     assertSameValue(0, $baresTmdb->movieSearches, 'Strong episodic evidence should not search movies.');
 
@@ -2646,7 +2660,7 @@ namespace Tests {
         ];
         $ghostsResult = enrich($plugin, $method, $ghosts, $ghostsTmdb, $ghostsCache);
 
-        assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $ghosts['icon'] ?? null, $episodeTitle.' should reuse the validated Ghosts series artwork.');
+        assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $ghosts['icon'] ?? null, $episodeTitle.' should reuse the validated series artwork without inventing poster geometry.');
         assertSameValue($index === 0, $ghostsResult['lookup'], $episodeTitle.' should only search TMDB when validating the shared base series.');
         assertSameValue($index > 0, $ghostsResult['cache_hit'], $episodeTitle.' should report reuse of the validated base-series cache.');
     }
@@ -2701,12 +2715,12 @@ namespace Tests {
         'A correctly matched series backdrop should remain the programme icon when an exact episode still exists.'
     );
     assertSameValue(
-        ['backdrop', 'screenshot', 'poster', 'backdrop'],
+        ['backdrop', 'screenshot', 'backdrop'],
         array_column($episodeStill['images'] ?? [], 'type'),
-        'The series backdrop should bracket the typed episode still and poster alternatives.'
+        'The protected series backdrop should bracket the typed episode still without a competing poster.'
     );
-    assertSameValue('tmdb', $episodeStill['images'][1]['source'] ?? null, 'The exact episode still should retain its TMDB provenance as secondary artwork.');
-    assertSameValue('episode', $episodeStill['images'][1]['scope'] ?? null, 'The exact episode still should remain explicitly episode-scoped.');
+    assertSameValue(null, $episodeStill['images'][1]['source'] ?? null, 'Preserve must retain the existing screenshot provenance unchanged.');
+    assertSameValue(null, $episodeStill['images'][1]['scope'] ?? null, 'Preserve must not rewrite existing screenshot scope.');
     assertSameValue($episodeStill['icon'], $episodeStill['images'][array_key_last($episodeStill['images'])]['url'], 'The terminal image should duplicate the series-backdrop primary.');
     assertSameValue('backdrop', $episodeStill['images'][array_key_last($episodeStill['images'])]['type'], 'The terminal primary duplicate should retain its backdrop type.');
 
@@ -2727,7 +2741,7 @@ namespace Tests {
         $episodeImagesCache,
         true,
     );
-    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode should keep the correctly matched series backdrop primary.');
+    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $nextEpisodeStill['icon'] ?? null, 'A second episode reuses matched artwork but cannot invent poster geometry.');
     assertTrueValue(
         in_array('https://image.tmdb.org/t/p/original/ghosts-s01e07.jpg', array_column($nextEpisodeStill['images'] ?? [], 'url'), true),
         'A second episode should retain its exact still as secondary artwork.'
@@ -2776,19 +2790,19 @@ namespace Tests {
         true,
     );
     assertSameValue(
-        'https://fixture.invalid/ghosts-backdrop.jpg',
+        'https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg',
         $persistedEpisodePrimary['icon'] ?? null,
-        'A rerun should replace a persisted episode-still primary with the correctly matched series backdrop.'
+        'Without overwrite a rerun must preserve an existing episode-still Primary.'
     );
     assertSameValue(
         $persistedEpisodePrimary['icon'],
         $persistedEpisodePrimary['images'][0]['url'] ?? null,
-        'The repaired series backdrop should be the first XMLTV image.'
+        'The preserved episode Primary should be the first XMLTV image.'
     );
     assertSameValue(
         $persistedEpisodePrimary['icon'],
         $persistedEpisodePrimary['images'][array_key_last($persistedEpisodePrimary['images'])]['url'] ?? null,
-        'The repaired series backdrop should be the final XMLTV image.'
+        'The preserved episode Primary should be the final XMLTV image.'
     );
     assertTrueValue(
         in_array('https://image.tmdb.org/t/p/original/ghosts-s01e06.jpg', array_column($persistedEpisodePrimary['images'] ?? [], 'url'), true),
@@ -2812,16 +2826,14 @@ namespace Tests {
         $episodeImagesCache,
         true,
     );
-    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $episodeWithoutStill['icon'] ?? null, 'An episode without a still should deterministically fall back to the series backdrop.');
+    assertSameValue('https://fixture.invalid/ghosts-backdrop.jpg', $episodeWithoutStill['icon'] ?? null, 'An episode without a still uses available series artwork, not an unqualified details poster.');
     assertSameValue(1, $episodeTmdb->seasonRequests, 'A missing episode still should reuse the cached season payload.');
 
     $sameNameGhostsCache = [];
     $sameNameGhostsTmdb = new TmdbService('same-name-ghosts');
-    foreach ([2019 => 107, 2021 => 108] as $year => $tmdbId) {
+    foreach ([[2019, 107], [2021, 108], [2019, 107]] as $index => [$year, $tmdbId]) {
         $sameNameGhosts = [
-            'title' => 'Ghosts - Episode '.$year,
-            'desc' => 'Comedy series from '.$year.' about a haunted home.',
-            'episode_num' => '1.1',
+            'title' => 'Ghosts ('.$year.')',
             'category' => 'Series',
         ];
         $sameNameGhostsResult = enrich($plugin, $method, $sameNameGhosts, $sameNameGhostsTmdb, $sameNameGhostsCache);
@@ -2831,7 +2843,8 @@ namespace Tests {
             $sameNameGhosts['icon'] ?? null,
             'Ghosts '.$year.' should use artwork from the series with the matching year.'
         );
-        assertSameValue(true, $sameNameGhostsResult['lookup'], 'Ghosts '.$year.' should validate its year-specific series identity.');
+        assertSameValue($index === 2, $sameNameGhostsResult['cache_hit'], 'Explicit work-year repeat must reuse only its own identity.');
+        assertSameValue($index !== 2, $sameNameGhostsResult['lookup'], 'Only the first lookup for each explicit work year needs validation.');
     }
 
     $germanSeries = [
@@ -2843,7 +2856,7 @@ namespace Tests {
     ];
     $germanSeriesCache = [];
     enrich($plugin, $method, $germanSeries, new TmdbService('german-series'), $germanSeriesCache);
-    assertSameValue('https://fixture.invalid/landarztpraxis-backdrop.jpg', $germanSeries['icon'] ?? null, 'An exact German series title should use its TV backdrop.');
+    assertSameValue('https://fixture.invalid/landarztpraxis-backdrop.jpg', $germanSeries['icon'] ?? null, 'An exact series title may use its artwork but cannot invent poster geometry.');
 
     $provider = [
         'title' => 'The Long Walk - Der Todesmarsch',
@@ -2863,9 +2876,9 @@ namespace Tests {
     $providerCache = [];
     $providerTmdb = new TmdbService('long-walk');
     $providerResult = enrich($plugin, $method, $provider, $providerTmdb, $providerCache);
-    assertSameValue('https://fixture.invalid/movie-backdrop.jpg', $provider['icon'], 'Unscoped landscape branding should be repaired by validated TMDB artwork.');
+    assertSameValue('https://provider.invalid/trusted-landscape.jpg', $provider['icon'], 'Without overwrite, unscoped source branding must remain Primary.');
     assertTrueValue($providerTmdb->tvSearches + $providerTmdb->movieSearches > 0, 'Unscoped complete metadata should not retain the no-op fast path.');
-    assertSameValue(true, $providerResult['changed'], 'Unscoped artwork repair should report a change.');
+    assertSameValue(false, $providerResult['changed'], 'Protected unscoped artwork must not gain competing artwork.');
 
     $scopedProvider = [
         'title' => 'Provider Programme',
@@ -2890,7 +2903,7 @@ namespace Tests {
     assertSameValue($scopedProvider['icon'], $scopedProvider['images'][array_key_last($scopedProvider['images'])]['url'], 'Explicitly programme-scoped artwork should also be the final image.');
     assertSameValue('fanart', $scopedProvider['images'][array_key_last($scopedProvider['images'])]['type'], 'The source primary duplicate should retain its image type.');
     assertTrueValue($scopedProviderTmdb->tvSearches + $scopedProviderTmdb->movieSearches > 0, 'Explicit programme provenance should still evaluate TMDB identity.');
-    assertSameValue(true, $scopedProviderResult['changed'], 'Trusted source artwork should report its serialization repair.');
+    assertSameValue(false, $scopedProviderResult['changed'], 'An already sole source Primary needs no redundant terminal duplicate or serialization repair.');
 
     $ambiguous = [
         'title' => 'Crossroads',
@@ -2929,8 +2942,8 @@ namespace Tests {
     ];
     $bostonCache = [];
     enrich($plugin, $method, $boston, new TmdbService('boston'), $bostonCache);
-    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $boston['icon'], 'Boston should replace a portrait-only icon with the validated landscape backdrop.');
-    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $boston['images'][0]['url'] ?? null, 'Boston landscape artwork should be the first images entry.');
+    assertSameValue('https://provider.invalid/boston-portrait.jpg', $boston['icon'], 'An existing portrait Primary must not be replaced by landscape artwork without overwrite.');
+    assertSameValue($boston['icon'], $boston['images'][0]['url'] ?? null, 'Preserved portrait Primary should remain the first images entry.');
     assertTrueValue(in_array('https://provider.invalid/boston-portrait.jpg', array_column($boston['images'], 'url'), true), 'Boston source portrait artwork should remain available after the backdrop.');
 
     // Regression: a source image labelled poster/orient=P but actually square
@@ -2951,9 +2964,13 @@ namespace Tests {
         ]],
     ];
     $squarePosterCache = [];
+    unset($squarePoster['icon']);
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-image-key';
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/qualified-recovery.jpg', 'width' => 800, 'height' => 1200]], 'backdrops' => [], 'logos' => []]);
     enrich($plugin, $method, $squarePoster, new TmdbService('boston'), $squarePosterCache);
-    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $squarePoster['icon'], 'A square source poster must not block a confident TMDB landscape primary.');
-    $recoveredSquarePoster = array_values(array_filter($squarePoster['images'], static fn (array $image): bool => ($image['url'] ?? null) === 'https://fixture.invalid/boston-poster.jpg'))[0] ?? [];
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
+    assertSameValue('https://image.tmdb.org/t/p/w500/qualified-recovery.jpg', $squarePoster['icon'], 'An empty Primary may receive a qualified portrait after rejecting square evidence.');
+    $recoveredSquarePoster = array_values(array_filter($squarePoster['images'], static fn (array $image): bool => ($image['url'] ?? null) === 'https://image.tmdb.org/t/p/w500/qualified-recovery.jpg'))[0] ?? [];
     assertSameValue('poster', $recoveredSquarePoster['type'] ?? null, 'A recovered TMDB portrait must use the canonical poster role.');
     assertSameValue('P', $recoveredSquarePoster['orient'] ?? null, 'A recovered TMDB portrait must use portrait orientation.');
     assertTrueValue(($recoveredSquarePoster['width'] ?? 0) < ($recoveredSquarePoster['height'] ?? 0), 'A recovered TMDB poster must have strictly portrait geometry.');
@@ -2976,9 +2993,13 @@ namespace Tests {
         ]],
     ];
     $landscapePosterCache = [];
+    unset($landscapePoster['icon']);
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-image-key';
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/qualified-recovery.jpg', 'width' => 800, 'height' => 1200]], 'backdrops' => [], 'logos' => []]);
     enrich($plugin, $method, $landscapePoster, new TmdbService('boston'), $landscapePosterCache);
-    assertSameValue('https://fixture.invalid/boston-backdrop.jpg', $landscapePoster['icon'], 'A landscape source poster must not block a confident TMDB landscape primary.');
-    $recoveredLandscapePoster = array_values(array_filter($landscapePoster['images'], static fn (array $image): bool => ($image['url'] ?? null) === 'https://fixture.invalid/boston-poster.jpg'))[0] ?? [];
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
+    assertSameValue('https://image.tmdb.org/t/p/w500/qualified-recovery.jpg', $landscapePoster['icon'], 'An empty Primary may receive a qualified portrait after rejecting landscape evidence.');
+    $recoveredLandscapePoster = array_values(array_filter($landscapePoster['images'], static fn (array $image): bool => ($image['url'] ?? null) === 'https://image.tmdb.org/t/p/w500/qualified-recovery.jpg'))[0] ?? [];
     assertSameValue('poster', $recoveredLandscapePoster['type'] ?? null, 'A recovered TMDB portrait must use the canonical poster role after landscape rejection.');
     assertSameValue('P', $recoveredLandscapePoster['orient'] ?? null, 'A recovered TMDB portrait must use portrait orientation after landscape rejection.');
     assertTrueValue(($recoveredLandscapePoster['width'] ?? 0) < ($recoveredLandscapePoster['height'] ?? 0), 'A recovered TMDB poster must retain strictly portrait geometry after landscape rejection.');
@@ -3084,9 +3105,15 @@ namespace Tests {
         ]],
     ];
     $posterOnlyCache = [];
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
+    Http::$responses[] = new FakeHttpResponse(true, [
+        'posters' => [['file_path' => '/poster-only-qualified.jpg', 'iso_639_1' => 'de', 'width' => 1000, 'height' => 1500]],
+        'backdrops' => [],
+        'logos' => [],
+    ]);
     enrich($plugin, $method, $posterOnly, new TmdbService('poster-only'), $posterOnlyCache);
-    assertSameValue(null, $posterOnly['icon'] ?? null, 'Portrait posters and logos should not be promoted when no landscape programme artwork exists.');
-    assertSameValue(['poster', 'logo'], array_column($posterOnly['images'] ?? [], 'type'), 'Poster and logo roles should remain ordered without a landscape primary.');
+    assertSameValue('https://image.tmdb.org/t/p/w500/poster-only-qualified.jpg', $posterOnly['icon'] ?? null, 'A qualified portrait must become Primary even without landscape artwork.');
+    assertTrueValue(in_array('logo', array_column($posterOnly['images'] ?? [], 'type'), true), 'Unrelated source logos must remain available beside portrait Primary.');
 
     $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'fixture-key';
     $GLOBALS['tmdbTestSettings']->tmdb_language = 'de-DE';
@@ -3163,7 +3190,7 @@ namespace Tests {
         false,
         false,
     );
-    assertSameValue('https://image.tmdb.org/t/p/w1280/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg', $roteRosenNoOverwrite['icon'] ?? null, 'A missing backdrop role must be filled by a geometrically valid unvoted image even when overwrite is disabled.');
+    assertSameValue('https://image.tmdb.org/t/p/w500/rote-rosen-poster.jpg', $roteRosenNoOverwrite['icon'] ?? null, 'A programme without Primary must prefer the qualified portrait poster over an unvoted backdrop.');
 
     $roteRosenOverwrite = [
         'title' => 'Rote Rosen',
@@ -3186,13 +3213,14 @@ namespace Tests {
         true,
     );
     $roteRosenBackdrop = 'https://image.tmdb.org/t/p/w1280/qZ1odCAlNZhUIeLXZXU06JxRqjo.jpg';
-    assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['icon'] ?? null, 'Overwrite mode should select the exact validated Rote Rosen details backdrop.');
-    assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['images'][0]['url'] ?? null, 'The unrated Rote Rosen primary must be the first image.');
-    assertSameValue($roteRosenBackdrop, $roteRosenOverwrite['images'][array_key_last($roteRosenOverwrite['images'])]['url'] ?? null, 'The unrated Rote Rosen primary must also be the last image.');
+    assertSameValue('https://image.tmdb.org/t/p/w500/rote-rosen-poster.jpg', $roteRosenOverwrite['icon'] ?? null, 'Overwrite must prefer a qualified portrait poster over the details backdrop.');
+    assertSameValue($roteRosenOverwrite['icon'], $roteRosenOverwrite['images'][0]['url'] ?? null, 'The portrait Primary must be the first image.');
+    assertSameValue($roteRosenOverwrite['icon'], $roteRosenOverwrite['images'][array_key_last($roteRosenOverwrite['images'])]['url'] ?? null, 'The portrait Primary must also be the last image.');
     assertSameValue('tmdb', $roteRosenOverwrite['images'][0]['source'] ?? null, 'The unrated fallback must retain TMDB provenance.');
     assertSameValue('programme', $roteRosenOverwrite['images'][0]['scope'] ?? null, 'The unrated fallback must retain programme scope.');
-    assertSameValue('tmdb_metadata_unrated', $roteRosenOverwrite['images'][0]['artwork_quality'] ?? null, 'An unvoted image-endpoint backdrop must retain explicit non-vote provenance.');
-    assertTrueValue(in_array('poster', array_column($roteRosenOverwrite['images'], 'type'), true), 'The Rote Rosen poster must remain secondary artwork.');
+    $roteRosenSelectedBackdrop = array_values(array_filter($roteRosenOverwrite['images'], static fn (array $image): bool => ($image['type'] ?? null) === 'backdrop'))[0] ?? [];
+    assertSameValue('tmdb_metadata_unrated', $roteRosenSelectedBackdrop['artwork_quality'] ?? null, 'An unvoted secondary backdrop must retain explicit non-vote provenance.');
+    assertTrueValue(in_array('backdrop', array_column($roteRosenOverwrite['images'], 'type'), true), 'The backdrop must remain secondary to the qualified poster Primary.');
 
     $roteRosenCategory = [
         'title' => 'Rote Rosen',
@@ -3307,7 +3335,13 @@ namespace Tests {
         $localizedPoster['images'] ?? [],
         fn (array $image): bool => ($image['type'] ?? null) === 'poster'
     ));
-    assertSameValue(1, count($localizedPosters), 'Only the deterministic poster winner may cross the host boundary because the exact Emby consumer fails closed on multiple typed posters.');
+    $localizedHostChanges = $canonicalHostChangesMethod->invoke($plugin, [], $localizedPoster);
+    $localizedHostPosters = array_values(array_filter(
+        $localizedHostChanges['images'] ?? [],
+        fn (array $image): bool => ($image['type'] ?? null) === 'poster'
+    ));
+    assertSameValue(1, count($localizedHostPosters), 'Exactly one deterministic typed poster may cross the canonical host boundary, including after legacy terminal finalization.');
+    assertSameValue($localizedPoster['icon'], $localizedPoster['images'][array_key_last($localizedPoster['images'])]['url'], 'The legacy last-wins boundary must repeat the selected poster, not a different artwork candidate.');
     assertSameValue('https://image.tmdb.org/t/p/w500/german-poster.jpg', $localizedPosters[0]['url'] ?? null, 'Configured base language should outrank an unverified default poster.');
     assertSameValue('de', $localizedPosters[0]['language'] ?? null, 'The poster winner should retain its TMDB language metadata.');
     assertSameValue(
@@ -3503,8 +3537,9 @@ namespace Tests {
         [],
         $sourceLandscapeSeasonCache,
         $sourceLandscapeImagesCache,
+        overwriteArtwork: true,
     );
-    assertSameValue($sourcePrimary, $sourceLandscape['icon'], 'A trusted non-TMDB source landscape must remain primary without overwrite.');
+    assertSameValue('https://image.tmdb.org/t/p/w1280/german-higher-vote-backdrop.jpg', $sourceLandscape['icon'], 'Explicit overwrite may select the ranked TMDB backdrop.');
     assertSameValue(true, $sourceLandscapeResult['lookup'], 'A trusted non-TMDB source landscape must not bypass TMDB identity evaluation.');
     assertSameValue('tmdb_ranked_backdrop_selected', $sourceLandscape['artwork_decision']['reason'] ?? null, 'Artwork provenance must record the best-effort language-ranked decision.');
     assertSameValue(210, $sourceLandscape['artwork_decision']['tmdb_id'] ?? null, 'Artwork provenance must record the selected TMDB identity.');
@@ -3539,6 +3574,7 @@ namespace Tests {
         [],
         $sourceLandscapeSeasonCache,
         $sourceLandscapeImagesCache,
+        overwriteArtwork: true,
     );
     assertSameValue(true, $sourceLandscapeReplayResult['cache_hit'], 'The repeated programme should reuse its validated identity cache entry.');
     assertSameValue(false, array_key_exists('cache_hit', $sourceLandscape['artwork_decision'] ?? []), 'Persisted artwork decisions must not contain volatile cache provenance.');
@@ -3848,7 +3884,7 @@ namespace Tests {
         enrichPosters: false,
         overwriteArtwork: true,
     );
-    assertSameValue('https://image.tmdb.org/t/p/w1280/alternate-series-backdrop.jpg', $seriesProgramme['icon'] ?? null, 'Artwork-only series replacement must prefer the selected-language horizontal show image.');
+    assertSameValue('https://provider.invalid/existing-series-poster.jpg', $seriesProgramme['icon'] ?? null, 'A retained qualified series poster must outrank newly replaced backdrops.');
     assertSameValue('Provider series description.', $seriesProgramme['desc'] ?? null, 'Artwork-only series replacement must preserve the provider description.');
     assertSameValue(true, in_array('https://provider.invalid/existing-episode-still.jpg', array_column($seriesProgramme['images'] ?? [], 'url'), true), 'Artwork-only series replacement must preserve an existing episode still role.');
     assertSameValue(true, in_array('https://image.tmdb.org/t/p/original/synthetic-series-s01e02.jpg', array_column($seriesProgramme['images'] ?? [], 'url'), true), 'Artwork-only series replacement must retain the validated TMDB episode still as secondary artwork.');
@@ -3857,19 +3893,19 @@ namespace Tests {
         array_slice(array_column(array_values(array_filter($seriesProgramme['images'] ?? [], fn (array $image): bool => ($image['type'] ?? null) === 'backdrop')), 'url'), 0, 2),
         'Series backdrop serialization must preserve show-main-first ordering ahead of the generic alternative and episode stills.'
     );
-    assertSameValue(true, in_array('https://provider.invalid/existing-series-poster.jpg', array_column($seriesProgramme['images'] ?? [], 'url'), true), 'Artwork-only series replacement must retain a source poster as compatibility evidence without making it primary.');
+    assertSameValue(true, in_array('https://provider.invalid/existing-series-poster.jpg', array_column($seriesProgramme['images'] ?? [], 'url'), true), 'Artwork-only series replacement must retain the source poster when poster fetching is disabled.');
 
     $crossRepoOutputPath = getenv('CROSS_REPO_ENRICHER_OUTPUT');
     if (is_string($crossRepoOutputPath) && $crossRepoOutputPath !== '') {
-        $crossRepoHostChanges = $canonicalHostChangesMethod->invoke($plugin, $seriesProgrammeBefore, $seriesProgramme);
+        $crossRepoHostChanges = $canonicalHostChangesMethod->invoke($plugin, $seriesProgrammeBefore, $seriesProgramme, true);
         $crossRepoImages = $crossRepoHostChanges['images'] ?? $crossRepoHostChanges['images_append'] ?? [];
         assertSameValue(
-            ['backdrop', 'backdrop'],
-            array_slice(array_column($crossRepoImages, 'type'), 0, 2),
-            'The real cross-repository producer artifact must begin with the horizontal show-main and secondary backdrop.'
+            ['poster', 'backdrop', 'backdrop'],
+            array_slice(array_column($crossRepoImages, 'type'), 0, 3),
+            'The real cross-repository producer artifact must begin with the retained qualified poster, followed by the horizontal show-main and secondary backdrop.'
         );
         assertSameValue(true, in_array('still', array_column($crossRepoImages, 'type'), true), 'The real cross-repository producer artifact must include a qualified episode still.');
-        assertSameValue(true, in_array('poster', array_column($crossRepoImages, 'type'), true), 'The real cross-repository producer artifact must include portrait compatibility evidence for still-before-poster verification.');
+        assertSameValue($seriesProgramme['icon'], $crossRepoImages[0]['url'], 'The real cross-repository producer artifact must publish the programme poster as Primary ahead of episode thumbnails.');
 
         $serializedOutput = json_encode([
             'schema_version' => 1,
@@ -3919,6 +3955,7 @@ namespace Tests {
         $stillOnlySeasonCache = [];
         $stillOnlyImagesCache = [];
         Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+        Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
         enrich(
             $plugin,
             $method,
@@ -3931,9 +3968,9 @@ namespace Tests {
             enrichPosters: false,
             overwriteArtwork: true,
         );
-        $stillOnlyHostChanges = $canonicalHostChangesMethod->invoke($plugin, $stillOnlyBefore, $stillOnlyProgramme);
+        $stillOnlyHostChanges = $canonicalHostChangesMethod->invoke($plugin, $stillOnlyBefore, $stillOnlyProgramme, true);
         $stillOnlyImages = $stillOnlyHostChanges['images'] ?? $stillOnlyHostChanges['images_append'] ?? [];
-        assertSameValue(['still', 'poster'], array_column($stillOnlyImages, 'type'), 'The real still-fallback producer artifact must retain a qualified episode still ahead of portrait compatibility evidence.');
+        assertSameValue(['poster', 'still'], array_column($stillOnlyImages, 'type'), 'The real still-fallback producer artifact must retain a qualified programme poster ahead of the separate episode still.');
 
         $serializedStillOutput = json_encode([
             'schema_version' => 1,
@@ -3985,7 +4022,7 @@ namespace Tests {
         $serializedReplacement = json_encode([
             'schema_version' => 1,
             'programme_before' => $replacementInput,
-            'host_changes' => $canonicalHostChangesMethod->invoke($plugin, $replacementInput, $artworkOnly),
+            'host_changes' => $canonicalHostChangesMethod->invoke($plugin, $replacementInput, $artworkOnly, true),
             'programme_after' => $artworkOnly,
         ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n";
         assertSameValue(
@@ -3997,9 +4034,9 @@ namespace Tests {
 
     $languagePriority = $selectImages->invoke($plugin, [
         'posters' => [
-            ['file_path' => '/english.jpg', 'iso_639_1' => 'en', 'vote_average' => 10.0],
-            ['file_path' => '/neutral.jpg', 'iso_639_1' => null, 'vote_average' => 1.0],
-            ['file_path' => '/german.jpg', 'iso_639_1' => 'de', 'vote_average' => 1.0],
+            ['file_path' => '/english.jpg', 'iso_639_1' => 'en', 'vote_average' => 10.0, 'width' => 800, 'height' => 1200],
+            ['file_path' => '/neutral.jpg', 'iso_639_1' => null, 'vote_average' => 1.0, 'width' => 800, 'height' => 1200],
+            ['file_path' => '/german.jpg', 'iso_639_1' => 'de', 'vote_average' => 1.0, 'width' => 800, 'height' => 1200],
         ],
         'backdrops' => [],
         'logos' => [],
@@ -4036,20 +4073,20 @@ namespace Tests {
     assertSameValue(null, $failedFetch, 'Transient image failures should return null.');
     assertSameValue([], $imageCache, 'Transient null image responses should not be cached.');
 
-    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/cache-qualified-poster.jpg', 'width' => 500, 'height' => 750]], 'backdrops' => [], 'logos' => []]);
     $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
     $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
     assertSameValue(2, count(Http::$calls), 'A successful images payload should be reused for the same media identity and language.');
 
-    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/cache-qualified-poster.jpg', 'width' => 500, 'height' => 750]], 'backdrops' => [], 'logos' => []]);
     $fetchImages->invokeArgs($plugin, [99, 'tv', &$imageCache]);
     $GLOBALS['tmdbTestSettings']->tmdb_language = 'en-US';
-    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/cache-qualified-poster.jpg', 'width' => 500, 'height' => 750]], 'backdrops' => [], 'logos' => []]);
     $fetchImages->invokeArgs($plugin, [99, 'movie', &$imageCache]);
-    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [], 'backdrops' => [], 'logos' => []]);
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/cache-qualified-poster.jpg', 'width' => 500, 'height' => 750]], 'backdrops' => [], 'logos' => []]);
     $fetchImages->invokeArgs($plugin, [100, 'movie', &$imageCache]);
     assertSameValue(
-        ['movie:99:de-de', 'tv:99:de-de', 'movie:99:en-us', 'movie:100:en-us'],
+        array_map(static fn (string $key): string => $key.':'.$currentLogicVersion, ['movie:99:de-de', 'tv:99:de-de', 'movie:99:en-us', 'movie:100:en-us']),
         array_keys($imageCache),
         'Image cache identity should isolate media type, TMDB ID, and selected language.'
     );
@@ -4162,7 +4199,11 @@ namespace Tests {
     ];
     $identityProgrammeBefore = $identityProgramme;
     $identityCache = [];
-    $identityEnrichmentResult = enrich($plugin, $method, $identityProgramme, $identityEnrichmentTmdb, $identityCache);
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-image-key';
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/synthetic-remake-poster.jpg', 'width' => 800, 'height' => 1200]], 'backdrops' => [], 'logos' => []]);
+    $identityImagesCache = [];
+    $identityEnrichmentResult = enrich($plugin, $method, $identityProgramme, $identityEnrichmentTmdb, $identityCache, imagesCache: $identityImagesCache);
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
     assertSameValue(true, $identityEnrichmentResult['lookup'] ?? null, 'The details-backed identity repair must run through the real programme enrichment path.');
     assertSameValue('poster', $identityProgramme['images'][0]['type'] ?? null, 'The repaired identity must emit a typed poster through the real enrichment path.');
     assertSameValue('https://image.tmdb.org/t/p/w500/synthetic-remake-poster.jpg', $identityProgramme['images'][0]['url'] ?? null, 'The repaired identity must emit the validated winner poster.');
@@ -4200,7 +4241,10 @@ namespace Tests {
         'desc' => 'Child psychologist Rowan helps the young Milo after he sees hidden visitors.',
     ];
     $synopsisCache = [];
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-image-key';
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/silent-visitor.jpg', 'width' => 800, 'height' => 1200]], 'backdrops' => [], 'logos' => []]);
     $synopsisResult = enrich($plugin, $method, $synopsisProgramme, $synopsisTmdb, $synopsisCache, enrichBackdrops: false);
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
     assertSameValue(true, $synopsisResult['provider_match'] ?? null, 'Strong synopsis evidence must resolve an exact cross-media namesake through the full envelope.');
     assertSameValue('https://image.tmdb.org/t/p/w500/silent-visitor.jpg', $synopsisProgramme['images'][0]['url'] ?? null, 'The synopsis-backed movie identity must emit its typed poster.');
     assertSameValue([0, 1], [$synopsisTmdb->tvDetailsRequests, $synopsisTmdb->movieDetailsRequests], 'Synopsis disambiguation must load only the selected identity details.');
@@ -4226,7 +4270,10 @@ namespace Tests {
     );
     $creditProgramme = ['title' => $creditTitle, 'desc' => $creditDescription, 'category' => 'Movie'];
     $creditCache = [];
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-image-key';
+    Http::$responses[] = new FakeHttpResponse(true, ['posters' => [['file_path' => '/forest-guardian.jpg', 'width' => 800, 'height' => 1200]], 'backdrops' => [], 'logos' => []]);
     $creditResult = enrich($plugin, $method, $creditProgramme, $creditTmdb, $creditCache, enrichBackdrops: false);
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
     assertSameValue(true, $creditResult['provider_match'] ?? null, 'Strong credit evidence must resolve a bounded cohort larger than three through the full envelope.');
     assertSameValue('https://image.tmdb.org/t/p/w500/forest-guardian.jpg', $creditProgramme['images'][0]['url'] ?? null, 'The credit-backed identity must emit the selected poster.');
     assertSameValue([841, 842], $creditTmdb->movieDetailIds, 'Large exact-title cohorts must hydrate only the two strongest synopsis candidates and reuse winner details.');
@@ -4255,14 +4302,17 @@ namespace Tests {
 
     $cachedReplayTmdb = new CandidateTmdbService(throwOnMovieCandidates: true);
     $cachedReplayProgramme = $identityProgrammeBefore;
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = 'synthetic-image-key';
     $cachedReplayResult = enrich(
         $plugin,
         $method,
         $cachedReplayProgramme,
         $cachedReplayTmdb,
         $identityCache,
+        imagesCache: $identityImagesCache,
         allowProviderLookup: false,
     );
+    $GLOBALS['tmdbTestSettings']->tmdb_api_key = '';
     assertSameValue(true, $cachedReplayResult['cache_hit'] ?? null, 'A later exact cache entry must repair an earlier occurrence during the no-provider replay pass.');
     assertSameValue('poster', $cachedReplayProgramme['images'][0]['type'] ?? null, 'The no-provider replay must emit the cached poster.');
     assertSameValue([0, 0], [$cachedReplayTmdb->tvCandidateSearches, $cachedReplayTmdb->movieCandidateSearches], 'The cache replay pass must never amplify provider candidate requests.');
@@ -4352,9 +4402,9 @@ namespace Tests {
     assertSameValue($targetBeforeBinding['desc'], $bindingTarget['desc'], 'Series artwork binding must not copy the seed description.');
     assertSameValue($targetBeforeBinding['episode_num'], $bindingTarget['episode_num'], 'Series artwork binding must not copy episode numbering.');
     assertSameValue($targetBeforeBinding['episode_nums'], $bindingTarget['episode_nums'], 'Series artwork binding must preserve content and series identifiers.');
-    assertSameValue('https://fixture.invalid/trusted-backdrop.jpg', $bindingTarget['images'][0]['url'], 'Series artwork binding must retain trusted target backdrops.');
-    assertSameValue('poster', $bindingTarget['images'][1]['type'] ?? null, 'Series artwork binding must add a typed portrait poster atomically.');
-    assertSameValue([640, 1000], [$bindingTarget['images'][1]['width'] ?? null, $bindingTarget['images'][1]['height'] ?? null], 'Series poster must preserve its verified source geometry atomically.');
+    assertTrueValue(in_array($targetBeforeBinding['images'][0], $bindingTarget['images'], true), 'Series artwork binding must retain trusted target backdrops value-for-value as secondary artwork.');
+    assertSameValue('poster', $bindingTarget['images'][0]['type'] ?? null, 'Series artwork binding must promote a typed portrait poster atomically when no Primary existed.');
+    assertSameValue([640, 1000], [$bindingTarget['images'][0]['width'] ?? null, $bindingTarget['images'][0]['height'] ?? null], 'Series poster must preserve its verified source geometry atomically.');
     $squareBinding = $bindings[$bindingKey];
     $squareBinding['poster']['width'] = 1000;
     $squareBinding['poster']['height'] = 1000;

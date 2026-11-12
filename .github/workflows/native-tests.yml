@@ -1,0 +1,61 @@
+name: Native Enricher Contracts
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [fix/issue-55-poster-contract, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: enricher
+      # Reviewed Core #1825 / PR #1829 head; hook is not yet merged into upstream dev.
+      - name: Checkout explicit generic-hook host candidate
+        uses: actions/checkout@v4
+        with:
+          repository: Serph91P/m3u-editor
+          ref: bb0c19a3da30cade88e41ed4c2e57017c581512c
+          path: host
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: bcmath, curl, dom, fileinfo, intl, mbstring, pdo_sqlite, sqlite3, xml, zip
+          tools: composer:2
+          coverage: none
+      - name: Install the host lockfile
+        working-directory: host
+        run: composer install --no-interaction --prefer-dist --no-progress
+      - name: Validate, regress and package
+        working-directory: enricher
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          php scripts/validate-plugin.php
+          python3 - <<'PY'
+          import os, pathlib, subprocess, tempfile
+          files = sorted(pathlib.Path('tests').glob('*Test.php'))
+          assert files
+          for path in files:
+              with tempfile.TemporaryDirectory(prefix='enricher-script-', dir=os.environ['TMPDIR']) as scratch:
+                  subprocess.run(['php', str(path)], env=dict(os.environ, TMPDIR=scratch), check=True)
+          PY
+          python3 tests/release_metadata_test.py
+          bash scripts/package-plugin.sh
+      - name: Run every native contract, no opt-in or skips
+        working-directory: enricher
+        env:
+          ENRICHER_HOST_ROOT: ${{ github.workspace }}/host
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/test-native.sh --fail-on-all-issues
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epg-enricher-tested-package
+          path: enricher/dist/epg-enricher.zip*

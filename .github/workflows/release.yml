@@ -3,7 +3,7 @@ name: Release Plugin
 on:
   push:
     branches: [main]
-    paths: ['Plugin.php', 'plugin.json']
+    paths: ['Plugin.php', 'plugin.json', 'Services/**', 'scripts/package-plugin*']
   workflow_dispatch:
     inputs:
       bump:
@@ -156,14 +156,9 @@ jobs:
       - name: Package plugin
         if: steps.bump.outputs.type != 'none'
         run: |
-          PLUGIN_ID=$(jq -r '.id' plugin.json)
-          WORK_DIR=$(mktemp -d)
-          mkdir -p "$WORK_DIR/$PLUGIN_ID"
-          cp Plugin.php plugin.json README.md "$WORK_DIR/$PLUGIN_ID/"
-          cd "$WORK_DIR"
-          zip -r "$PLUGIN_ID.zip" "$PLUGIN_ID/"
-          sha256sum "$PLUGIN_ID.zip" | awk '{print $1}' > "$PLUGIN_ID.zip.sha256"
-          mv "$PLUGIN_ID.zip" "$PLUGIN_ID.zip.sha256" "$GITHUB_WORKSPACE/"
+          bash scripts/package-plugin.sh
+          php tests/PackageRuntimeFilesTest.php
+          cp dist/epg-enricher.zip dist/epg-enricher.zip.sha256 "$GITHUB_WORKSPACE/"
 
       - name: Create GitHub Release
         if: steps.bump.outputs.type != 'none'
