@@ -17,12 +17,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: enricher
-      # Published Core #1825 candidate; requires independent Core review/CI before final compatibility approval.
+      # Reviewed Core #1825 / PR #1829 head; hook is not yet merged into upstream dev.
       - name: Checkout explicit generic-hook host candidate
         uses: actions/checkout@v4
         with:
           repository: Serph91P/m3u-editor
-          ref: a551cfaaf4b3ae8ba2827e911cb6d44a18f2a639
+          ref: bb0c19a3da30cade88e41ed4c2e57017c581512c
           path: host
       - uses: shivammathur/setup-php@v2
         with:
